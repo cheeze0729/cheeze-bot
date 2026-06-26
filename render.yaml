@@ -2,7 +2,7 @@ services:
   - type: web
     name: cheeze-store-bot
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install --prefer-binary -r requirements.txt
     startCommand: python main.py
     healthCheckPath: /health
     envVars:
