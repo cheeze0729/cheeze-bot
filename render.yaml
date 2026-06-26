@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: cheeze-store-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
