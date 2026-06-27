@@ -310,6 +310,29 @@ async def db_init() -> None:
                 created_at    TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                code          TEXT    UNIQUE NOT NULL COLLATE NOCASE,
+                game          TEXT    NOT NULL,
+                product_title TEXT    NOT NULL,
+                promo_price   INTEGER NOT NULL,
+                starts_at     TEXT,
+                expires_at    TEXT,
+                is_active     INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT    NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_promos (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id      INTEGER NOT NULL,
+                promo_id   INTEGER NOT NULL,
+                claimed_at TEXT    NOT NULL,
+                used_at    TEXT,
+                UNIQUE(tg_id, promo_id)
+            )
+        """)
         cur = await db.execute("PRAGMA table_info(orders)")
         cols = [r[1] for r in await cur.fetchall()]
         if "login_data" not in cols:
@@ -588,6 +611,128 @@ async def db_list_users(limit: int, offset: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+async def db_create_promo(
+    code: str,
+    game: str,
+    product_title: str,
+    promo_price: int,
+    starts_at: str | None = None,
+    expires_at: str | None = None,
+) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO promo_codes (code, game, product_title, promo_price, starts_at, expires_at, is_active, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (code.upper(), game, product_title, promo_price, starts_at, expires_at, now),
+        )
+        await db.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+async def db_get_promo_by_code(code: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM promo_codes WHERE code = ? COLLATE NOCASE",
+            (code.strip(),),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def db_get_promo_by_id(promo_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM promo_codes WHERE id = ?", (promo_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def db_list_promos() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM promo_codes ORDER BY id DESC")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_delete_promo(promo_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM promo_codes WHERE id = ?", (promo_id,))
+        await db.execute("DELETE FROM user_promos WHERE promo_id = ?", (promo_id,))
+        await db.commit()
+
+
+async def db_toggle_promo(promo_id: int, is_active: bool) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE promo_codes SET is_active = ? WHERE id = ?",
+            (1 if is_active else 0, promo_id),
+        )
+        await db.commit()
+
+
+async def db_claim_promo(tg_id: int, promo_id: int) -> bool:
+    """Добавляет промокод в список пользователя. False — уже есть."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO user_promos (tg_id, promo_id, claimed_at) VALUES (?, ?, ?)",
+                (tg_id, promo_id, now),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def db_use_promo(tg_id: int, promo_id: int) -> bool:
+    """Помечает промокод как использованный. False — уже использован."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT used_at FROM user_promos WHERE tg_id = ? AND promo_id = ?",
+            (tg_id, promo_id),
+        )
+        row = await cur.fetchone()
+        if not row or row[0] is not None:
+            return False
+        await db.execute(
+            "UPDATE user_promos SET used_at = ? WHERE tg_id = ? AND promo_id = ?",
+            (now, tg_id, promo_id),
+        )
+        await db.commit()
+        return True
+
+
+async def db_get_user_promos(tg_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT up.id, up.tg_id, up.promo_id, up.claimed_at, up.used_at, "
+            "pc.code, pc.game, pc.product_title, pc.promo_price, "
+            "pc.expires_at, pc.starts_at, pc.is_active "
+            "FROM user_promos up "
+            "JOIN promo_codes pc ON pc.id = up.promo_id "
+            "WHERE up.tg_id = ? ORDER BY up.id DESC",
+            (tg_id,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_promo_usage_count(promo_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM user_promos WHERE promo_id = ? AND used_at IS NOT NULL",
+            (promo_id,),
+        )
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+
 # =====================================================================
 # Состояния FSM (для ввода чисел и почты)
 # =====================================================================
@@ -601,6 +746,7 @@ class ShopStates(StatesGroup):
     waiting_email = State()
     waiting_login_data = State()
     waiting_login_code = State()
+    waiting_promo_input = State()
     waiting_review_photo = State()
     waiting_review_text = State()
 
@@ -613,6 +759,13 @@ class AdminStates(StatesGroup):
     waiting_block_reason = State()
     waiting_unblock_reason = State()
     waiting_gp_price = State()
+
+
+class PromoStates(StatesGroup):
+    waiting_code_input = State()
+    waiting_product = State()
+    waiting_price = State()
+    waiting_dates = State()
 
 
 # =====================================================================
@@ -816,6 +969,14 @@ def kb_profile() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="📜 История транзакций", callback_data="transactions"
                 )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎟️ Мои промокоды", callback_data="my_promos"
+                ),
+                InlineKeyboardButton(
+                    text="✏️ Ввести промокод", callback_data="enter_promo"
+                ),
             ],
             [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
         ]
@@ -1151,13 +1312,12 @@ async def cb_roblox_instant_card(call: CallbackQuery) -> None:
 async def cb_roblox_gamepass(call: CallbackQuery, state: FSMContext) -> None:
     text = (
         "<b>Roblox — геймпассом (до 5 дней)</b>\n\n"
-        f"Курс оплаты: 1 робукс = {ROBUX_GAMEPASS_RATE}₽\n"
-        f"Цена геймпасса рассчитывается как: кол-во ÷ {ROBUX_GAMEPASS_PASS_PRICE_RATE}\n"
-        "Срок выдачи: до 5 дней\n\n"
-        "Введите количество робуксов одним сообщением (например: 1500):"
+        "⚠️ <b>Данный способ покупки временно недоступен.</b>\n\n"
+        "На данный момент покупка робуксов через геймпасс невозможна "
+        "в связи с ограничениями на платформе Roblox.\n\n"
+        "Воспользуйтесь покупкой <b>моментально</b> — она работает в штатном режиме."
     )
     await show_section(call, "roblox_gamepass", text, kb_back_main("shop"))
-    await state.set_state(ShopStates.waiting_robux_amount)
     await call.answer()
 
 
@@ -2519,6 +2679,7 @@ def kb_admin_main() -> InlineKeyboardMarkup:
                     text="👥 Список пользователей", callback_data="adm:users:0"
                 )
             ],
+            [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="adm:promos")],
             [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
         ]
     )
@@ -2984,6 +3145,758 @@ async def cb_adm_back(call: CallbackQuery, state: FSMContext) -> None:
     except (ValueError, IndexError):
         return
     await _send_admin_user_card(call, target_id, state)
+
+
+# =====================================================================
+# Промокоды — вспомогательные функции
+# =====================================================================
+
+
+def _promo_is_valid_now(promo: dict) -> bool:
+    """Проверяет, активен ли промокод в данный момент."""
+    if not promo.get("is_active"):
+        return False
+    now = datetime.now(timezone.utc)
+    starts = promo.get("starts_at")
+    expires = promo.get("expires_at")
+    if starts:
+        try:
+            if now < datetime.fromisoformat(starts):
+                return False
+        except ValueError:
+            pass
+    if expires:
+        try:
+            if now > datetime.fromisoformat(expires):
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def _fmt_promo_dates(promo: dict) -> str:
+    starts = promo.get("starts_at")
+    expires = promo.get("expires_at")
+    if not starts and not expires:
+        return "Бессрочно"
+    parts = []
+    if starts:
+        try:
+            dt = datetime.fromisoformat(starts)
+            parts.append(f"с {dt.strftime('%d.%m.%Y')}")
+        except ValueError:
+            parts.append(f"с {starts}")
+    if expires:
+        try:
+            dt = datetime.fromisoformat(expires)
+            parts.append(f"по {dt.strftime('%d.%m.%Y')}")
+        except ValueError:
+            parts.append(f"по {expires}")
+    return " ".join(parts)
+
+
+def _parse_date_iso(date_str: str) -> str | None:
+    try:
+        d = datetime.strptime(date_str.strip(), "%d.%m.%Y")
+        return d.replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
+# =====================================================================
+# Промокоды — Административная панель
+# =====================================================================
+
+
+def kb_admin_promos(promos: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in promos:
+        icon = "✅" if p["is_active"] else "🔴"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{icon} {p['code']} — {p['product_title']} ({p['promo_price']}₽)",
+                callback_data=f"adm:promo:{p['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="adm:promo_create")])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_promo_game_select() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟦 Roblox", callback_data="adm:promo_game:Roblox")],
+        [InlineKeyboardButton(text="⭐ Brawl Stars", callback_data="adm:promo_game:Brawl Stars")],
+        [InlineKeyboardButton(text="✨ Telegram Stars", callback_data="adm:promo_game:Telegram Stars")],
+        [InlineKeyboardButton(text="📦 Другое", callback_data="adm:promo_game:Другое")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+    ])
+
+
+@dp.callback_query(F.data == "adm:panel")
+async def cb_adm_panel(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    await send_or_edit(
+        call,
+        "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
+        kb_admin_main(),
+    )
+
+
+@dp.callback_query(F.data == "adm:promos")
+async def cb_adm_promos(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    promos = await db_list_promos()
+    text = "<b>🎟️ Промокоды</b>\n\n"
+    if promos:
+        text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления."
+    else:
+        text += "Промокодов пока нет. Создайте первый!"
+    await send_or_edit(call, text, kb_admin_promos(promos))
+
+
+@dp.callback_query(F.data == "adm:promo_create")
+async def cb_adm_promo_create(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.set_state(PromoStates.waiting_code_input)
+    await send_or_edit(
+        call,
+        "📝 <b>Создание промокода</b>\n\n"
+        "Введите <b>код промокода</b> (только латинские буквы, цифры и знак «_», без пробелов).\n\n"
+        "Например: <code>SALE20</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+        ])
+    )
+
+
+@dp.message(PromoStates.waiting_code_input)
+async def msg_promo_code_input(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    code = (message.text or "").strip().upper()
+    if not code or not code.replace("_", "").isalnum():
+        await message.answer(
+            "⚠️ Код может содержать только латинские буквы, цифры и «_». Попробуйте ещё раз.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+            ])
+        )
+        return
+    existing = await db_get_promo_by_code(code)
+    if existing:
+        await message.answer(
+            f"⚠️ Промокод <code>{escape(code)}</code> уже существует. Введите другой.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+            ])
+        )
+        return
+    await state.update_data(promo_code=code)
+    await state.set_state(None)
+    await message.answer(
+        f"Код: <code>{escape(code)}</code>\n\n"
+        "🎮 Выберите <b>игру</b>, для которой действует промокод:",
+        parse_mode="HTML",
+        reply_markup=kb_promo_game_select()
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:promo_game:"))
+async def cb_adm_promo_game(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    game = call.data.split(":", 2)[2]
+    await state.update_data(promo_game=game)
+    await state.set_state(PromoStates.waiting_product)
+    data = await state.get_data()
+    code = data.get("promo_code", "?")
+    await send_or_edit(
+        call,
+        f"Код: <code>{escape(code)}</code>  |  Игра: <b>{escape(game)}</b>\n\n"
+        "📦 Введите <b>название товара</b>\n"
+        "Например: <code>800 Robux</code> или <code>Brawl Pass Plus</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+        ])
+    )
+
+
+@dp.message(PromoStates.waiting_product)
+async def msg_promo_product(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    product = (message.text or "").strip()
+    if not product:
+        await message.answer("⚠️ Название товара не может быть пустым. Введите ещё раз.")
+        return
+    await state.update_data(promo_product=product)
+    await state.set_state(PromoStates.waiting_price)
+    data = await state.get_data()
+    code = data.get("promo_code", "?")
+    game = data.get("promo_game", "?")
+    await message.answer(
+        f"Код: <code>{escape(code)}</code>  |  Игра: <b>{escape(game)}</b>\n"
+        f"Товар: <b>{escape(product)}</b>\n\n"
+        "💰 Введите <b>цену по промокоду</b> (целое число в рублях, например: <code>150</code>):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+        ])
+    )
+
+
+@dp.message(PromoStates.waiting_price)
+async def msg_promo_price_input(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    price = parse_positive_int(message.text)
+    if price is None:
+        await message.answer("⚠️ Введите корректную сумму (целое число больше 0).")
+        return
+    await state.update_data(promo_price=price)
+    await state.set_state(PromoStates.waiting_dates)
+    await message.answer(
+        "📅 Введите <b>срок действия</b> промокода:\n\n"
+        "• Дата окончания: <code>31.12.2026</code>\n"
+        "• Диапазон дат: <code>01.07.2026 - 31.12.2026</code>\n"
+        "• Или нажмите кнопку ниже, если промокод бессрочный:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♾️ Бессрочно", callback_data="adm:promo_dates:forever")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ])
+    )
+
+
+@dp.callback_query(F.data == "adm:promo_dates:forever")
+async def cb_adm_promo_dates_forever(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    data = await state.get_data()
+    await state.clear()
+    await _save_promo_and_confirm(call, data, starts_at=None, expires_at=None)
+
+
+@dp.message(PromoStates.waiting_dates)
+async def msg_promo_dates(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    starts_at = None
+    expires_at = None
+    separators = [" - ", "–", "—", " — "]
+    sep_found = next((s for s in separators if s in text), None)
+    if sep_found:
+        parts = text.split(sep_found, 1)
+        starts_at = _parse_date_iso(parts[0])
+        expires_at = _parse_date_iso(parts[1])
+        if not starts_at or not expires_at:
+            await message.answer(
+                "⚠️ Не удалось распознать даты. Используйте формат:\n"
+                "<code>01.07.2026 - 31.12.2026</code>",
+                parse_mode="HTML"
+            )
+            return
+    else:
+        expires_at = _parse_date_iso(text)
+        if not expires_at:
+            await message.answer(
+                "⚠️ Не удалось распознать дату. Введите в формате <code>31.12.2026</code>.",
+                parse_mode="HTML"
+            )
+            return
+    data = await state.get_data()
+    await state.clear()
+    await _save_promo_and_confirm_msg(message, data, starts_at=starts_at, expires_at=expires_at)
+
+
+async def _save_promo_and_confirm(
+    call: CallbackQuery,
+    data: dict,
+    starts_at: str | None,
+    expires_at: str | None,
+) -> None:
+    code = data.get("promo_code")
+    game = data.get("promo_game")
+    product = data.get("promo_product")
+    price = data.get("promo_price")
+    if not all([code, game, product, price]):
+        await send_or_edit(call, "❌ Ошибка: данные утеряны. Начните заново.", kb_admin_promos([]))
+        return
+    promo_id = await db_create_promo(code, game, product, int(price), starts_at, expires_at)
+    dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    text = (
+        "✅ <b>Промокод создан!</b>\n\n"
+        f"🎟️ Код: <code>{escape(code)}</code>\n"
+        f"🎮 Игра: {escape(game)}\n"
+        f"📦 Товар: {escape(product)}\n"
+        f"💰 Цена: <b>{price}₽</b>\n"
+        f"📅 Срок: {dates_str}\n"
+        f"🆔 ID: {promo_id}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Все промокоды", callback_data="adm:promos")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+async def _save_promo_and_confirm_msg(
+    message: Message,
+    data: dict,
+    starts_at: str | None,
+    expires_at: str | None,
+) -> None:
+    code = data.get("promo_code")
+    game = data.get("promo_game")
+    product = data.get("promo_product")
+    price = data.get("promo_price")
+    if not all([code, game, product, price]):
+        await message.answer("❌ Ошибка: данные утеряны. Начните заново.")
+        return
+    promo_id = await db_create_promo(code, game, product, int(price), starts_at, expires_at)
+    dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    text = (
+        "✅ <b>Промокод создан!</b>\n\n"
+        f"🎟️ Код: <code>{escape(code)}</code>\n"
+        f"🎮 Игра: {escape(game)}\n"
+        f"📦 Товар: {escape(product)}\n"
+        f"💰 Цена: <b>{price}₽</b>\n"
+        f"📅 Срок: {dates_str}\n"
+        f"🆔 ID: {promo_id}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Все промокоды", callback_data="adm:promos")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")],
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm:promo:"))
+async def cb_adm_promo_detail(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    parts = call.data.split(":")
+    if len(parts) < 3:
+        return
+    try:
+        promo_id = int(parts[2])
+    except ValueError:
+        return
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+    usage_cnt = await db_promo_usage_count(promo_id)
+    status_text = "✅ Активен" if promo["is_active"] else "🔴 Отключён"
+    toggle_text = "🔴 Отключить" if promo["is_active"] else "✅ Включить"
+    dates_str = _fmt_promo_dates(promo)
+    valid_now = _promo_is_valid_now(promo)
+    text = (
+        f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Цена: <b>{promo['promo_price']}₽</b>\n"
+        f"📅 Срок: {dates_str}\n"
+        f"📊 Статус: {status_text}  |  Сейчас: {'🟢 работает' if valid_now else '🔴 не работает'}\n"
+        f"🛒 Использовано: <b>{usage_cnt}</b> раз"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"adm:promo_toggle:{promo_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"adm:promo_del:{promo_id}")],
+        [InlineKeyboardButton(text="⬅️ К промокодам", callback_data="adm:promos")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:promo_toggle:"))
+async def cb_adm_promo_toggle(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        promo_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+    new_state = not bool(promo["is_active"])
+    await db_toggle_promo(promo_id, new_state)
+    status_word = "включён" if new_state else "отключён"
+    await call.answer(f"Промокод {status_word}.", show_alert=True)
+    promo["is_active"] = int(new_state)
+    usage_cnt = await db_promo_usage_count(promo_id)
+    toggle_text = "🔴 Отключить" if new_state else "✅ Включить"
+    dates_str = _fmt_promo_dates(promo)
+    valid_now = _promo_is_valid_now(promo)
+    status_text = "✅ Активен" if new_state else "🔴 Отключён"
+    text = (
+        f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Цена: <b>{promo['promo_price']}₽</b>\n"
+        f"📅 Срок: {dates_str}\n"
+        f"📊 Статус: {status_text}  |  Сейчас: {'🟢 работает' if valid_now else '🔴 не работает'}\n"
+        f"🛒 Использовано: <b>{usage_cnt}</b> раз"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"adm:promo_toggle:{promo_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"adm:promo_del:{promo_id}")],
+        [InlineKeyboardButton(text="⬅️ К промокодам", callback_data="adm:promos")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:promo_del:"))
+async def cb_adm_promo_del(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        promo_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+    text = (
+        f"❓ Удалить промокод <code>{escape(promo['code'])}</code>?\n\n"
+        "Все данные об использовании тоже будут удалены."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Да, удалить", callback_data=f"adm:promo_del_yes:{promo_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:promo:{promo_id}")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:promo_del_yes:"))
+async def cb_adm_promo_del_yes(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        promo_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    await db_delete_promo(promo_id)
+    await call.answer("Промокод удалён.", show_alert=True)
+    promos = await db_list_promos()
+    text = "<b>🎟️ Промокоды</b>\n\n"
+    text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления." if promos else "Промокодов пока нет."
+    await send_or_edit(call, text, kb_admin_promos(promos))
+
+
+# =====================================================================
+# Промокоды — Покупатель
+# =====================================================================
+
+
+@dp.callback_query(F.data == "enter_promo")
+async def cb_enter_promo(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(ShopStates.waiting_promo_input)
+    await send_or_edit(
+        call,
+        "✏️ <b>Ввести промокод</b>\n\n"
+        "Отправьте код промокода одним сообщением.\n"
+        "Промокод появится в разделе «Мои промокоды».",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")]
+        ])
+    )
+
+
+@dp.message(ShopStates.waiting_promo_input)
+async def msg_promo_input(message: Message, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    if not code:
+        await message.answer("Введите код промокода.")
+        return
+
+    promo = await db_get_promo_by_code(code)
+    kb_back = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")]
+    ])
+
+    if not promo:
+        await message.answer(
+            "❌ Промокод не найден. Проверьте правильность написания.",
+            reply_markup=kb_back
+        )
+        return
+
+    if not _promo_is_valid_now(promo):
+        await message.answer(
+            "❌ Этот промокод недействителен или истёк.",
+            reply_markup=kb_back
+        )
+        return
+
+    claimed = await db_claim_promo(message.from_user.id, promo["id"])
+    await state.clear()
+
+    if not claimed:
+        await message.answer(
+            f"ℹ️ Промокод <code>{escape(promo['code'])}</code> уже есть в вашем профиле.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎟️ Мои промокоды", callback_data="my_promos")],
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+            ])
+        )
+        return
+
+    await message.answer(
+        f"✅ Промокод <code>{escape(promo['code'])}</code> добавлен!\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Цена по промокоду: <b>{promo['promo_price']}₽</b>\n"
+        f"📅 Срок: {_fmt_promo_dates(promo)}\n\n"
+        "Найдите его в разделе <b>«Мои промокоды»</b> и воспользуйтесь предложением!",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎟️ Мои промокоды", callback_data="my_promos")],
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+        ])
+    )
+
+
+@dp.callback_query(F.data == "my_promos")
+async def cb_my_promos(call: CallbackQuery) -> None:
+    await call.answer()
+    user_promos = await db_get_user_promos(call.from_user.id)
+
+    if not user_promos:
+        await send_or_edit(
+            call,
+            "🎟️ <b>Мои промокоды</b>\n\n"
+            "У вас пока нет промокодов.\n"
+            "Нажмите «Ввести промокод», чтобы добавить.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")],
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+            ])
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for up in user_promos:
+        used = up.get("used_at") is not None
+        valid = _promo_is_valid_now(up) and not used
+        if used:
+            icon = "✔️"
+        elif valid:
+            icon = "✅"
+        else:
+            icon = "🔴"
+        label = f"{icon} {up['code']} — {up['product_title']} ({up['promo_price']}₽)"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"promo_detail:{up['promo_id']}")])
+
+    rows.append([InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")])
+    rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")])
+
+    await send_or_edit(
+        call,
+        "🎟️ <b>Мои промокоды</b>\n\n"
+        "✅ — доступен  |  ✔️ — использован  |  🔴 — недействителен\n\n"
+        "Нажмите на промокод, чтобы посмотреть детали.",
+        InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+@dp.callback_query(F.data.startswith("promo_detail:"))
+async def cb_promo_detail(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+
+    if not user_promo:
+        await call.answer("Этот промокод не принадлежит вам.", show_alert=True)
+        return
+
+    used = user_promo.get("used_at") is not None
+    valid_now = _promo_is_valid_now(promo)
+    dates_str = _fmt_promo_dates(promo)
+
+    text = (
+        f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Цена по промокоду: <b>{promo['promo_price']}₽</b>\n"
+        f"📅 Срок: {dates_str}\n\n"
+    )
+
+    if used:
+        text += "✔️ <b>Промокод уже использован.</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+        ])
+    elif not valid_now:
+        text += "🔴 <b>Промокод недействителен или истёк.</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+        ])
+    else:
+        text += "✅ <b>Промокод активен!</b> Воспользуйтесь предложением ниже."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Воспользоваться предложением", callback_data=f"use_promo_confirm:{promo_id}")],
+            [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+        ])
+
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("use_promo_confirm:"))
+async def cb_use_promo_confirm(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+
+    if not user_promo or user_promo.get("used_at") is not None:
+        await call.answer("Промокод уже использован или недоступен.", show_alert=True)
+        return
+
+    if not _promo_is_valid_now(promo):
+        await call.answer("Промокод недействителен или истёк.", show_alert=True)
+        return
+
+    balance = await db_get_balance(call.from_user.id)
+    price = promo["promo_price"]
+
+    text = (
+        "<b>🛒 Подтверждение покупки по промокоду</b>\n\n"
+        f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Сумма: <b>{price}₽</b>\n"
+        f"💼 Ваш баланс: <b>{balance}₽</b>\n\n"
+        "Оплата спишется с внутреннего баланса бота.\n"
+        "Подтвердите покупку:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Оплатить", callback_data=f"use_promo_go:{promo_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"promo_detail:{promo_id}")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("use_promo_go:"))
+async def cb_use_promo_go(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+
+    if not user_promo or user_promo.get("used_at") is not None:
+        await call.answer("Промокод уже использован или недоступен.", show_alert=True)
+        return
+
+    if not _promo_is_valid_now(promo):
+        await call.answer("Промокод недействителен или истёк.", show_alert=True)
+        return
+
+    user = call.from_user
+    price = promo["promo_price"]
+    title = f"[Промокод {promo['code']}] {promo['game']} — {promo['product_title']}"
+
+    ok = await db_try_charge(user.id, price)
+    if not ok:
+        balance = await db_get_balance(user.id)
+        text = (
+            "❌ <b>Недостаточно средств на балансе.</b>\n\n"
+            f"Сумма заказа: {price}₽\n"
+            f"Ваш баланс: {balance}₽\n\n"
+            "Пополните баланс и повторите попытку."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await send_or_edit(call, text, kb)
+        return
+
+    order_id = await db_create_order(user.id, title, price, status="Оплачен", category="promo")
+    await db_add_transaction(user.id, -price, kind="purchase", reason=f"Заказ #{order_id}: {title}")
+    await db_use_promo(user.id, promo_id)
+    new_balance = await db_get_balance(user.id)
+
+    text = (
+        "✅ <b>Оплата прошла успешно. Заказ принят в обработку.</b>\n\n"
+        f"🧾 Номер заказа: <code>#{order_id}</code>\n"
+        f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Сумма: <b>{price}₽</b>\n"
+        f"💼 Остаток на балансе: <b>{new_balance}₽</b>\n\n"
+        "С вами свяжется модератор. Вы также можете написать первым."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Связаться с модератором", callback_data=f"contact_mod:{order_id}")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(call, text, kb)
+
+    username = f"@{user.username}" if user.username else "—"
+    admin_text = (
+        f"🎟️ <b>Новый заказ по промокоду!</b>\n\n"
+        f"👤 {escape(user.first_name or '?')} ({username})\n"
+        f"🆔 TG ID: <code>{user.id}</code>\n"
+        f"🧾 Заказ: <code>#{order_id}</code>\n"
+        f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Сумма: <b>{price}₽</b>"
+    )
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Выполнен #{order_id}", callback_data=f"mod:done:{order_id}")],
+    ])
+    await notify_moderator(admin_text, reply_markup=admin_kb)
 
 
 # =====================================================================
