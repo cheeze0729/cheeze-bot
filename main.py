@@ -2560,13 +2560,16 @@ async def msg_review_photo(message: Message, state: FSMContext) -> None:
 
 @dp.message(ShopStates.waiting_review_text)
 async def msg_review_text(message: Message, state: FSMContext) -> None:
-    await _try_delete(message)
+    # НЕ удаляем сообщение здесь — оно нужно для forward_message модератору.
+    # Для ошибочных случаев удаляем вручную перед возвратом.
     comment = (message.text or "").strip()
     if not comment:
+        await _try_delete(message)
         await _edit_prompt(state, "⚠️ Пустое сообщение. Напишите текст отзыва.",
                            kb_review_cancel())
         return
     if len(comment) > 2000:
+        await _try_delete(message)
         await _edit_prompt(state, "⚠️ Комментарий слишком длинный (макс. 2000 символов).\n"
                            "Напишите покороче:",
                            kb_review_cancel())
