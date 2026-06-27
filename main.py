@@ -88,6 +88,8 @@ CARD_DETAILS = (
 
 # Ссылка на отзывы (канал, чат или страница с отзывами клиентов)
 REVIEWS_URL = "https://t.me/cheezereviews"
+# Username канала для публикации отзывов (бот должен быть администратором канала)
+REVIEWS_CHANNEL = "@cheezereviews"
 
 # =====================================================================
 # КАРТИНКИ ДЛЯ КАЖДОГО РАЗДЕЛА
@@ -255,7 +257,8 @@ class BlacklistMiddleware(BaseMiddleware):
 dp.message.middleware(BlacklistMiddleware())
 dp.callback_query.middleware(BlacklistMiddleware())
 
-DB_PATH = "shop.db"
+# База данных хранится ВНЕ git-репозитория — данные не сбрасываются при правках кода.
+DB_PATH = "/home/runner/shop_data/shop.db"
 
 
 # =====================================================================
@@ -264,7 +267,8 @@ DB_PATH = "shop.db"
 
 
 async def db_init() -> None:
-    """Создаёт таблицы, если их ещё нет."""
+    """Создаёт таблицы, если их ещё нет. Папка для БД создаётся автоматически."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -1093,8 +1097,54 @@ def order_needs_code(category: str | None) -> bool:
     return category in ("roblox_instant", "brawl")
 
 
-async def send_or_edit(target, text: str, kb: InlineKeyboardMarkup) -> None:
-    """Для CallbackQuery удаляет старое сообщение и отправляет новое."""
+async def _try_delete(msg: Message) -> None:
+    """Тихо удаляет сообщение, игнорируя ошибки."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _edit_prompt(state: FSMContext, text: str,
+                       kb: InlineKeyboardMarkup) -> None:
+    """Редактирует сохранённое в FSM сообщение-подсказку бота.
+
+    Если редактирование невозможно (фото, устарело и т.д.) — отправляет новое.
+    Перед этим обновляет сохранённый msg_id на новый.
+    """
+    data = await state.get_data()
+    chat_id: int | None = data.get("_prompt_chat_id")
+    msg_id: int | None = data.get("_prompt_msg_id")
+    if chat_id and msg_id:
+        try:
+            edited = await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await state.update_data(_prompt_msg_id=edited.message_id)
+            return
+        except Exception:
+            pass
+    # Если не получилось отредактировать — шлём новым сообщением
+    sent = await bot.send_message(
+        chat_id or 0,
+        text,
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
+
+
+async def send_or_edit(target, text: str,
+                       kb: InlineKeyboardMarkup) -> Message:
+    """Для CallbackQuery удаляет старое сообщение и отправляет новое.
+    Возвращает отправленное/отредактированное сообщение."""
     try:
         if isinstance(target, CallbackQuery):
             chat_id = target.message.chat.id
@@ -1102,8 +1152,7 @@ async def send_or_edit(target, text: str, kb: InlineKeyboardMarkup) -> None:
                 await target.message.delete()
             except Exception:
                 pass
-
-            await bot.send_message(
+            return await bot.send_message(
                 chat_id,
                 text,
                 reply_markup=kb,
@@ -1111,7 +1160,7 @@ async def send_or_edit(target, text: str, kb: InlineKeyboardMarkup) -> None:
                 disable_web_page_preview=True,
             )
         else:
-            await target.answer(
+            return await target.answer(
                 text,
                 reply_markup=kb,
                 parse_mode="HTML",
@@ -1123,7 +1172,7 @@ async def send_or_edit(target, text: str, kb: InlineKeyboardMarkup) -> None:
             if isinstance(target, CallbackQuery)
             else target.chat.id
         )
-        await bot.send_message(
+        return await bot.send_message(
             chat_id,
             text,
             reply_markup=kb,
@@ -1134,8 +1183,8 @@ async def send_or_edit(target, text: str, kb: InlineKeyboardMarkup) -> None:
 
 async def show_section(
     call: CallbackQuery, key: str, text: str, kb: InlineKeyboardMarkup
-) -> None:
-    """Всегда удаляет старое сообщение и открывает новое."""
+) -> Message:
+    """Всегда удаляет старое сообщение и открывает новое. Возвращает Message."""
     image = SECTION_IMAGES.get(key)
 
     if image and len(text) <= 1024:
@@ -1160,18 +1209,18 @@ async def show_section(
             pass
 
         try:
-            await bot.send_photo(
+            sent = await bot.send_photo(
                 chat_id,
                 photo=photo,
                 caption=text,
                 reply_markup=kb,
                 parse_mode="HTML",
             )
-            return
+            return sent
         except Exception as e:
             logging.warning(f"Не удалось отправить картинку '{key}': {e}")
 
-    await send_or_edit(call, text, kb)
+    return await send_or_edit(call, text, kb)
 
 
 async def notify_moderator(
@@ -1422,28 +1471,28 @@ async def cb_tgstars(call: CallbackQuery, state: FSMContext) -> None:
         f"Курс: 1 звезда = {TG_STARS_RATE}₽\n\n"
         "Введите количество звёзд одним сообщением (например: 100):"
     )
-    await show_section(call, "tgstars", text, kb_back_main("shop"))
+    sent = await show_section(call, "tgstars", text, kb_back_main("shop"))
     await state.set_state(ShopStates.waiting_stars_amount)
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
 @dp.message(ShopStates.waiting_stars_amount)
 async def msg_stars_amount(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
     qty = parse_positive_int(message.text)
     if qty is None:
-        await message.answer(
-            "Введите положительное число звёзд (например: 100).",
-            reply_markup=kb_back_main("shop"),
-        )
+        await _edit_prompt(state,
+                           "⚠️ Введите положительное число звёзд (например: 100).",
+                           kb_back_main("shop"))
         return
-
     if qty < MIN_TG_STARS:
-        await message.answer(
-            f"Минимальное количество для покупки — {MIN_TG_STARS} звёзд.",
-            reply_markup=kb_back_main("shop"),
-        )
+        await _edit_prompt(state,
+                           f"⚠️ Минимальное количество — {MIN_TG_STARS} звёзд.\n"
+                           "Попробуйте ещё раз:",
+                           kb_back_main("shop"))
         return
-
     price = max(1, round(qty * TG_STARS_RATE))
     await state.update_data(stars_qty=qty, stars_price=price)
     text = (
@@ -1455,11 +1504,7 @@ async def msg_stars_amount(message: Message, state: FSMContext) -> None:
         "Способ выдачи: моментально\n"
         "Способ оплаты: Оплата с внутреннего баланса бота"
     )
-    await message.answer(
-        text,
-        reply_markup=kb_calc_actions("buy:stars", "cat:tgstars"),
-        parse_mode="HTML",
-    )
+    await _edit_prompt(state, text, kb_calc_actions("buy:stars", "cat:tgstars"))
 
 
 # --- Другие приложения ---
@@ -1647,26 +1692,29 @@ async def cb_send_login(call: CallbackQuery, state: FSMContext) -> None:
     order_id = int(parts[1])
     needs_code = len(parts) > 2 and parts[2] == "1"
     await state.set_state(ShopStates.waiting_login_data)
-    await state.update_data(login_order_id=order_id, login_needs_code=needs_code)
     text = (
         f"🔐 Отправьте данные для входа по заказу <b>#{order_id}</b> "
         "одним сообщением.\n\n"
         "Например: логин/пароль, ссылка на геймпасс, Supercell ID, "
         "@username и т.д."
     )
-    await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    sent = await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    await state.update_data(login_order_id=order_id, login_needs_code=needs_code,
+                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
 @dp.message(ShopStates.waiting_login_data)
 async def msg_login_data(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
     payload = (message.text or "").strip()
-    if not payload:
-        await message.answer("Пустое сообщение. Пришлите данные текстом.")
-        return
     data = await state.get_data()
     order_id = int(data.get("login_order_id", 0))
     needs_code = bool(data.get("login_needs_code", False))
+    if not payload:
+        await _edit_prompt(state, "⚠️ Пустое сообщение. Пришлите данные текстом.",
+                           kb_back_main(f"order_actions:{order_id}"))
+        return
     await state.clear()
 
     if order_id:
@@ -1704,25 +1752,28 @@ async def msg_login_data(message: Message, state: FSMContext) -> None:
 async def cb_send_code(call: CallbackQuery, state: FSMContext) -> None:
     order_id = int(call.data.split(":", 1)[1])
     await state.set_state(ShopStates.waiting_login_code)
-    await state.update_data(code_order_id=order_id)
     text = (
         f"📨 Пришлите код для входа по заказу <b>#{order_id}</b> "
         "одним сообщением.\n\n"
         "Это код, который пришёл вам на почту, когда модератор "
         "заходил на аккаунт."
     )
-    await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    sent = await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    await state.update_data(code_order_id=order_id,
+                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
 @dp.message(ShopStates.waiting_login_code)
 async def msg_login_code(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
     code = (message.text or "").strip()
-    if not code:
-        await message.answer("Пустое сообщение. Пришлите код текстом.")
-        return
     data = await state.get_data()
     order_id = int(data.get("code_order_id", 0))
+    if not code:
+        await _edit_prompt(state, "⚠️ Пустое сообщение. Пришлите код текстом.",
+                           kb_back_main(f"order_actions:{order_id}"))
+        return
     await state.clear()
 
     if order_id:
@@ -1854,27 +1905,29 @@ async def cb_contact_mod(call: CallbackQuery) -> None:
 async def cb_contact_email(call: CallbackQuery, state: FSMContext) -> None:
     order_id = int(call.data.split(":", 1)[1])
     await state.set_state(ShopStates.waiting_email)
-    await state.update_data(order_id=order_id)
     text = (
         f"Введите вашу почту для связи по заказу <b>#{order_id}</b> "
         "одним сообщением.\n\n"
         "Например: <code>example@mail.ru</code>"
     )
-    await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    sent = await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    await state.update_data(order_id=order_id,
+                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
 @dp.message(ShopStates.waiting_email)
 async def msg_email(message: Message, state: FSMContext) -> None:
-    if not is_valid_email(message.text or ""):
-        await message.answer(
-            "Неверный формат почты. Введите корректный адрес, "
-            "например: example@mail.ru",
-        )
-        return
-    email = message.text.strip()
+    await _try_delete(message)
     data = await state.get_data()
     order_id = int(data.get("order_id", 0))
+    if not is_valid_email(message.text or ""):
+        await _edit_prompt(state,
+                           "⚠️ Неверный формат почты. Введите корректный адрес, "
+                           "например: <code>example@mail.ru</code>",
+                           kb_back_main(f"order_actions:{order_id}"))
+        return
+    email = message.text.strip()
     await state.clear()
 
     if order_id:
@@ -2088,23 +2141,32 @@ async def cb_topup(call: CallbackQuery, state: FSMContext) -> None:
         f"Введите сумму пополнения в рублях (минимум {MIN_TOPUP}₽).\n"
         "Например: 500"
     )
-    await show_section(call, "topup", text, kb_back_main("profile"))
+    sent = await show_section(call, "topup", text, kb_back_main("profile"))
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
 @dp.message(ShopStates.waiting_topup_amount)
 async def msg_topup_amount(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
     amount = parse_positive_int(message.text)
     if amount is None:
-        await message.answer("Введите положительное число рублей, например: 500.")
+        await _edit_prompt(state,
+                           "⚠️ Введите положительное число рублей, например: 500.",
+                           kb_back_main("profile"))
         return
     if amount < MIN_TOPUP:
-        await message.answer(f"Минимальная сумма пополнения — {MIN_TOPUP}₽")
+        await _edit_prompt(state,
+                           f"⚠️ Минимальная сумма пополнения — {MIN_TOPUP}₽\n"
+                           "Попробуйте ещё раз:",
+                           kb_back_main("profile"))
         return
     await state.update_data(topup_amount=amount)
     await state.set_state(ShopStates.waiting_topup_confirm)
-    text = f"Вы хотите пополнить баланс на <b>{amount}₽</b>?"
-    await message.answer(text, reply_markup=kb_topup_confirm(), parse_mode="HTML")
+    await _edit_prompt(state,
+                       f"Вы хотите пополнить баланс на <b>{amount}₽</b>?",
+                       kb_topup_confirm())
 
 
 @dp.callback_query(F.data == "topup_go")
@@ -2362,6 +2424,30 @@ def kb_review_cancel() -> InlineKeyboardMarkup:
     )
 
 
+def kb_review_mod(order_id: int, *msg_ids: int) -> InlineKeyboardMarkup:
+    """Клавиатура модератора.
+    msg_ids — id пересланных сообщений в чате модератора (1 или 2 штуки).
+    Они передаются в callback_data через ':' для последующего форварда в канал.
+    """
+    ids_str = ":".join(str(m) for m in msg_ids)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Опубликовать в канал",
+                    callback_data=f"pub_review:{order_id}:{ids_str}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"rej_review:{order_id}",
+                ),
+            ],
+        ]
+    )
+
+
 @dp.callback_query(F.data.startswith("review:"))
 async def cb_review_start(call: CallbackQuery, state: FSMContext) -> None:
     try:
@@ -2386,14 +2472,15 @@ async def cb_review_start(call: CallbackQuery, state: FSMContext) -> None:
 
     await state.clear()
     await state.set_state(ShopStates.waiting_review_photo)
-    await state.update_data(review_order_id=order_id)
     text = (
         f"⭐ <b>Отзыв по заказу #{order_id}</b>\n\n"
         "📷 Пришлите <b>фото</b> выполненного заказа одним сообщением "
         "(скриншот зачисления, скриншот игры и т.п.).\n\n"
         "Если фото нет — нажмите «Без фото»."
     )
-    await send_or_edit(call, text, kb_review_skip_photo(order_id))
+    sent = await send_or_edit(call, text, kb_review_skip_photo(order_id))
+    await state.update_data(review_order_id=order_id,
+                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
@@ -2432,6 +2519,8 @@ async def cb_review_cancel(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(ShopStates.waiting_review_photo)
 async def msg_review_photo(message: Message, state: FSMContext) -> None:
+    # Фото НЕ удаляем здесь — оно нужно для copy_message модератору.
+    # Удалим его позже, в msg_review_text, после пересылки.
     file_id: str | None = None
     is_document = False
     if message.photo:
@@ -2440,44 +2529,54 @@ async def msg_review_photo(message: Message, state: FSMContext) -> None:
         file_id = message.document.file_id
         is_document = True
 
-    if not file_id:
-        await message.answer(
-            "Пришлите изображение (фото или картинку файлом). "
-            "Если фото нет — нажмите «Без фото» в сообщении выше.",
-            parse_mode="HTML",
-        )
-        return
-
     data = await state.get_data()
     order_id = int(data.get("review_order_id", 0))
+
+    if not file_id:
+        await _try_delete(message)
+        await _edit_prompt(state,
+                           "⚠️ Пришлите изображение (фото или картинку файлом). "
+                           "Если фото нет — нажмите «Без фото».",
+                           kb_review_skip_photo(order_id))
+        return
+
     await state.update_data(
         review_photo_id=file_id,
         review_photo_is_document=is_document,
+        # Сохраняем координаты фото для copy_message
+        review_photo_msg_id=message.message_id,
+        review_photo_chat_id=message.chat.id,
     )
     await state.set_state(ShopStates.waiting_review_text)
-    await message.answer(
+    sent = await message.answer(
         f"✅ Фото получено.\n\n"
         f"✍️ Теперь напишите комментарий к отзыву по заказу <b>#{order_id}</b> "
         "одним сообщением.",
         parse_mode="HTML",
         reply_markup=kb_review_cancel(),
     )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
 
 
 @dp.message(ShopStates.waiting_review_text)
 async def msg_review_text(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
     comment = (message.text or "").strip()
     if not comment:
-        await message.answer("Пустое сообщение. Напишите текст отзыва.")
+        await _edit_prompt(state, "⚠️ Пустое сообщение. Напишите текст отзыва.",
+                           kb_review_cancel())
         return
     if len(comment) > 2000:
-        await message.answer("Комментарий слишком длинный (макс. 2000 символов).")
+        await _edit_prompt(state, "⚠️ Комментарий слишком длинный (макс. 2000 символов).\n"
+                           "Напишите покороче:",
+                           kb_review_cancel())
         return
 
     data = await state.get_data()
     order_id = int(data.get("review_order_id", 0))
     photo_id = data.get("review_photo_id")
-    photo_is_doc = bool(data.get("review_photo_is_document"))
+    photo_msg_id = data.get("review_photo_msg_id")
+    photo_chat_id = data.get("review_photo_chat_id")
     await state.clear()
 
     if not order_id:
@@ -2486,38 +2585,57 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
 
     await db_add_review(order_id, message.from_user.id, photo_id, comment)
 
-    user = message.from_user
-    username = f"@{user.username}" if user.username else "—"
     order = await db_get_order(order_id)
     title = order["title"] if order else "—"
-    caption = (
-        f"⭐ <b>Новый отзыв по заказу #{order_id}</b>\n\n"
-        f"🎁 Товар: {escape(str(title))}\n"
-        f"👤 Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
-        f"🆔 Telegram ID: <code>{user.id}</code>\n\n"
-        f"💬 <b>Комментарий:</b>\n{escape(comment)}"
-    )
+
+    # ----------------------------------------------------------------
+    # Пересылаем отзыв модератору через forward_message ("Forwarded from").
+    # forward_message не поддерживает reply_markup, поэтому кнопки
+    # публикации отправляем отдельным управляющим сообщением после форварда.
+    # ID пересланных сообщений сохраняем в callback_data для последующего
+    # форварда в канал при нажатии «Опубликовать».
+    # ----------------------------------------------------------------
     try:
-        if photo_id and photo_is_doc:
-            await bot.send_document(
-                MODERATOR_CHAT_ID,
-                document=photo_id,
-                caption=caption,
-                parse_mode="HTML",
+        header = (
+            f"⭐ <b>Новый отзыв</b>\n"
+            f"🎁 Товар: <b>{escape(str(title))}</b>"
+        )
+        await bot.send_message(MODERATOR_CHAT_ID, header, parse_mode="HTML")
+
+        if photo_id and photo_msg_id and photo_chat_id:
+            # Сначала форвардим — потом удаляем оригиналы
+            photo_fwd = await bot.forward_message(
+                chat_id=MODERATOR_CHAT_ID,
+                from_chat_id=photo_chat_id,
+                message_id=photo_msg_id,
             )
-        elif photo_id:
-            await bot.send_photo(
+            text_fwd = await bot.forward_message(
+                chat_id=MODERATOR_CHAT_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            await bot.delete_message(photo_chat_id, photo_msg_id)
+            await _try_delete(message)
+            await bot.send_message(
                 MODERATOR_CHAT_ID,
-                photo=photo_id,
-                caption=caption,
-                parse_mode="HTML",
+                "⬆️ Управление отзывом:",
+                reply_markup=kb_review_mod(order_id, photo_fwd.message_id, text_fwd.message_id),
             )
         else:
+            # Текстовый отзыв: форвардим сначала, удаляем после
+            text_fwd = await bot.forward_message(
+                chat_id=MODERATOR_CHAT_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            await _try_delete(message)
             await bot.send_message(
-                MODERATOR_CHAT_ID, caption, parse_mode="HTML"
+                MODERATOR_CHAT_ID,
+                "⬆️ Управление отзывом:",
+                reply_markup=kb_review_mod(order_id, text_fwd.message_id),
             )
     except Exception as e:
-        logging.warning(f"Не удалось отправить отзыв модератору: {e}")
+        logging.warning(f"Не удалось переслать отзыв модератору: {e}")
 
     thanks_kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2532,6 +2650,53 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
         reply_markup=thanks_kb,
     )
+
+
+@dp.callback_query(F.data.startswith("pub_review:"))
+async def cb_publish_review(call: CallbackQuery) -> None:
+    """Модератор публикует отзыв в канал — пересылает через forward_message."""
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    # callback_data: pub_review:{order_id}:{msg_id1}[:{msg_id2}]
+    parts = call.data.split(":")
+    # parts[0]="pub_review", parts[1]=order_id, parts[2+]=msg_ids
+    mod_msg_ids = [int(p) for p in parts[2:] if p]
+    try:
+        for mid in mod_msg_ids:
+            await bot.forward_message(
+                chat_id=REVIEWS_CHANNEL,
+                from_chat_id=call.message.chat.id,
+                message_id=mid,
+            )
+        published_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="✅ Опубликовано в канале",
+                    url=REVIEWS_URL,
+                )]
+            ]
+        )
+        await call.message.edit_reply_markup(reply_markup=published_kb)
+        await call.answer("✅ Отзыв опубликован в канале!", show_alert=True)
+    except Exception as e:
+        logging.warning(f"Ошибка публикации отзыва: {e}")
+        await call.answer(f"Ошибка: {e}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("rej_review:"))
+async def cb_reject_review(call: CallbackQuery) -> None:
+    """Модератор отклоняет отзыв."""
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    rejected_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отклонён", callback_data="noop")]
+        ]
+    )
+    await call.message.edit_reply_markup(reply_markup=rejected_kb)
+    await call.answer("Отзыв отклонён.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("gpfix:"))
@@ -2903,15 +3068,13 @@ async def cb_adm_find(call: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     await state.set_state(AdminStates.waiting_user_id)
-    await send_or_edit(
-        call,
-        "🔍 Отправьте Telegram ID пользователя одним сообщением.",
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
-            ]
-        ),
+    kb_find = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
+        call, "🔍 Отправьте Telegram ID пользователя одним сообщением.", kb_find,
     )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
@@ -2919,9 +3082,13 @@ async def cb_adm_find(call: CallbackQuery, state: FSMContext) -> None:
 async def msg_adm_user_id(message: Message, state: FSMContext) -> None:
     if not _is_moderator(message.from_user.id):
         return
+    await _try_delete(message)
     target_id = parse_positive_int(message.text)
     if target_id is None:
-        await message.answer("Введите корректный числовой Telegram ID.")
+        await _edit_prompt(state, "⚠️ Введите корректный числовой Telegram ID.",
+                           InlineKeyboardMarkup(inline_keyboard=[[
+                               InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")
+                           ]]))
         return
     await state.clear()
     user_row = await db_find_user(target_id)
@@ -2959,18 +3126,18 @@ async def cb_adm_credit(call: CallbackQuery, state: FSMContext) -> None:
     prev = await state.get_data()
     saved_source = prev.get("admin_user_from_list_page")
     await state.set_state(AdminStates.waiting_credit_amount)
-    await state.update_data(
-        adm_target_id=target_id, admin_user_from_list_page=saved_source
-    )
-    await send_or_edit(
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
         call,
         f"➕ Сколько рублей начислить пользователю <code>{target_id}</code>?\n"
         "Отправьте число одним сообщением.",
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
-            ]
-        ),
+        kb_cancel,
+    )
+    await state.update_data(
+        adm_target_id=target_id, admin_user_from_list_page=saved_source,
+        _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id,
     )
     await call.answer()
 
@@ -2979,9 +3146,13 @@ async def cb_adm_credit(call: CallbackQuery, state: FSMContext) -> None:
 async def msg_adm_credit(message: Message, state: FSMContext) -> None:
     if not _is_moderator(message.from_user.id):
         return
+    await _try_delete(message)
     amount = parse_positive_int(message.text)
     if amount is None:
-        await message.answer("Введите положительное число рублей.")
+        await _edit_prompt(state, "⚠️ Введите положительное число рублей.",
+                           InlineKeyboardMarkup(inline_keyboard=[[
+                               InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")
+                           ]]))
         return
     data = await state.get_data()
     target_id = int(data.get("adm_target_id", 0))
