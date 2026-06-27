@@ -737,6 +737,16 @@ async def db_promo_usage_count(promo_id: int) -> int:
         return int(row[0]) if row else 0
 
 
+async def db_get_all_user_ids() -> list[int]:
+    """Возвращает tg_id всех не заблокированных пользователей (для рассылки)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT tg_id FROM users WHERE is_blacklisted = 0"
+        )
+        rows = await cur.fetchall()
+    return [row[0] for row in rows]
+
+
 # =====================================================================
 # Состояния FSM (для ввода чисел и почты)
 # =====================================================================
@@ -763,6 +773,8 @@ class AdminStates(StatesGroup):
     waiting_block_reason = State()
     waiting_unblock_reason = State()
     waiting_gp_price = State()
+    waiting_mod_reply = State()   # ответ покупателю из чата модератора
+    waiting_broadcast = State()  # рассылка всем пользователям
 
 
 class PromoStates(StatesGroup):
@@ -2424,10 +2436,11 @@ def kb_review_cancel() -> InlineKeyboardMarkup:
     )
 
 
-def kb_review_mod(order_id: int, *msg_ids: int) -> InlineKeyboardMarkup:
-    """Клавиатура модератора.
-    msg_ids — id пересланных сообщений в чате модератора (1 или 2 штуки).
-    Они передаются в callback_data через ':' для последующего форварда в канал.
+def kb_review_mod(order_id: int, buyer_id: int, *msg_ids: int) -> InlineKeyboardMarkup:
+    """Клавиатура модератора под управляющим сообщением отзыва.
+    buyer_id  — tg_id покупателя для кнопки «Ответить».
+    msg_ids   — id всех сообщений в чате модератора (заголовок + пересланные),
+                передаются в callback_data для форварда в канал.
     """
     ids_str = ":".join(str(m) for m in msg_ids)
     return InlineKeyboardMarkup(
@@ -2436,6 +2449,12 @@ def kb_review_mod(order_id: int, *msg_ids: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="✅ Опубликовать в канал",
                     callback_data=f"pub_review:{order_id}:{ids_str}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Ответить покупателю",
+                    callback_data=f"reply_buyer:{buyer_id}",
                 ),
             ],
             [
@@ -2603,7 +2622,9 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
             f"⭐ <b>Новый отзыв</b>\n"
             f"🎁 Товар: <b>{escape(str(title))}</b>"
         )
-        await bot.send_message(MODERATOR_CHAT_ID, header, parse_mode="HTML")
+        # Заголовок тоже сохраняем — он пересылается в канал вместе с отзывом
+        header_msg = await bot.send_message(MODERATOR_CHAT_ID, header, parse_mode="HTML")
+        buyer_id = message.from_user.id
 
         if photo_id and photo_msg_id and photo_chat_id:
             # Сначала форвардим — потом удаляем оригиналы
@@ -2622,7 +2643,10 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
             await bot.send_message(
                 MODERATOR_CHAT_ID,
                 "⬆️ Управление отзывом:",
-                reply_markup=kb_review_mod(order_id, photo_fwd.message_id, text_fwd.message_id),
+                reply_markup=kb_review_mod(
+                    order_id, buyer_id,
+                    header_msg.message_id, photo_fwd.message_id, text_fwd.message_id,
+                ),
             )
         else:
             # Текстовый отзыв: форвардим сначала, удаляем после
@@ -2635,7 +2659,10 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
             await bot.send_message(
                 MODERATOR_CHAT_ID,
                 "⬆️ Управление отзывом:",
-                reply_markup=kb_review_mod(order_id, text_fwd.message_id),
+                reply_markup=kb_review_mod(
+                    order_id, buyer_id,
+                    header_msg.message_id, text_fwd.message_id,
+                ),
             )
     except Exception as e:
         logging.warning(f"Не удалось переслать отзыв модератору: {e}")
@@ -4095,6 +4122,118 @@ def _acquire_single_instance_lock() -> None:
     lock_file.write(str(os.getpid()))
     lock_file.flush()
     globals()["_bot_lock_file"] = lock_file
+
+
+# =====================================================================
+# Ответ покупателю из чата модератора
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("reply_buyer:"))
+async def cb_reply_buyer(call: CallbackQuery, state: FSMContext) -> None:
+    """Модератор нажимает «Ответить покупателю» — бот просит написать текст."""
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    buyer_id = int(call.data.split(":")[1])
+    await state.set_state(AdminStates.waiting_mod_reply)
+    await state.update_data(mod_reply_buyer_id=buyer_id)
+    await call.message.answer(
+        f"✍️ Напишите сообщение покупателю (поддерживается текст и фото).\n\n"
+        f"Для отмены нажмите кнопку ниже.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="mod_reply_cancel"),
+        ]]),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mod_reply_cancel")
+async def cb_mod_reply_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    await call.message.edit_text("❌ Ответ покупателю отменён.")
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_mod_reply)
+async def msg_mod_reply(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    data = await state.get_data()
+    buyer_id = int(data.get("mod_reply_buyer_id", 0))
+    await state.clear()
+    try:
+        await bot.copy_message(
+            chat_id=buyer_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await message.answer("✅ Сообщение отправлено покупателю.")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить: {e}")
+
+
+# =====================================================================
+# Рассылка всем пользователям (только модератор)
+# =====================================================================
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext) -> None:
+    """Команда /broadcast — начать рассылку всем пользователям."""
+    if not _is_moderator(message.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_broadcast)
+    user_count = await db_users_count()
+    await message.answer(
+        f"📢 <b>Рассылка</b>\n\n"
+        f"Всего получателей: <b>{user_count}</b> чел.\n\n"
+        f"Пришлите сообщение (текст, фото, видео — любой формат).\n"
+        f"Оно будет отправлено каждому пользователю бота.\n\n"
+        f"Для отмены: /cancel",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("cancel"), AdminStates.waiting_broadcast)
+async def cmd_broadcast_cancel(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("❌ Рассылка отменена.")
+
+
+@dp.message(AdminStates.waiting_broadcast)
+async def msg_broadcast(message: Message, state: FSMContext) -> None:
+    """Получает сообщение от модератора и рассылает всем пользователям."""
+    if not _is_moderator(message.from_user.id):
+        return
+    await state.clear()
+    user_ids = await db_get_all_user_ids()
+    sent = 0
+    failed = 0
+    status_msg = await message.answer(
+        f"⏳ Рассылка запущена — {len(user_ids)} получателей..."
+    )
+    for uid in user_ids:
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # не превышаем лимиты Telegram (20 msg/s)
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"📨 Отправлено: <b>{sent}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>",
+        parse_mode="HTML",
+    )
 
 
 async def _health_server() -> None:
