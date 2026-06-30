@@ -673,6 +673,35 @@ async def db_list_promos() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def db_list_regular_promos() -> list[dict]:
+    """Возвращает только обычные промокоды (без реферальных ref_discount)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM promo_codes WHERE game != 'ref_discount' ORDER BY id DESC"
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_delete_all_regular_promos() -> int:
+    """Удаляет все обычные промокоды (не реферальные) вместе с записями использования."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            ids = await conn.fetch(
+                "SELECT id FROM promo_codes WHERE game != 'ref_discount'"
+            )
+            if not ids:
+                return 0
+            id_list = [r["id"] for r in ids]
+            await conn.execute(
+                "DELETE FROM user_promos WHERE promo_id = ANY($1::int[])", id_list
+            )
+            result = await conn.execute(
+                "DELETE FROM promo_codes WHERE game != 'ref_discount'"
+            )
+            return int(result.split()[-1])
+
+
 async def db_delete_promo(promo_id: int) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -726,7 +755,7 @@ async def db_get_user_promos(tg_id: int) -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch(
         "SELECT up.id, up.tg_id, up.promo_id, up.claimed_at, up.used_at, "
-        "pc.code, pc.game, pc.product_title, pc.promo_price, "
+        "pc.code, pc.game, pc.product_title, pc.promo_price, pc.discount_pct, "
         "pc.expires_at, pc.starts_at, pc.is_active "
         "FROM user_promos up "
         "JOIN promo_codes pc ON pc.id = up.promo_id "
@@ -880,6 +909,30 @@ async def db_admin_remove_user_promo(tg_id: int, promo_id: int) -> bool:
     )
     deleted = int(result.split()[-1])
     return deleted > 0
+
+
+async def db_delete_all_user_ref_promos(tg_id: int) -> int:
+    """Удаляет все НЕИСПОЛЬЗОВАННЫЕ реферальные промокоды из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos "
+        "WHERE tg_id = $1 AND used_at IS NULL AND promo_id IN "
+        "(SELECT id FROM promo_codes WHERE game = 'ref_discount')",
+        tg_id,
+    )
+    return int(result.split()[-1])
+
+
+async def db_delete_all_user_regular_promos(tg_id: int) -> int:
+    """Удаляет все обычные (не реферальные) промокоды из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos "
+        "WHERE tg_id = $1 AND promo_id IN "
+        "(SELECT id FROM promo_codes WHERE game != 'ref_discount')",
+        tg_id,
+    )
+    return int(result.split()[-1])
 
 
 async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
@@ -3771,15 +3824,22 @@ async def cb_adm_ref_promos(call: CallbackQuery) -> None:
 
     lines = [f"<b>🎟️ Реферальные промокоды</b>\nПользователь: <code>{target_id}</code>\n"]
     rows = []
+    active_count = 0
     for p in promos:
         status = "✅ активен" if not p["used_at"] and p["is_active"] else "🔴 использован/отозван"
         lines.append(f"• <code>{p['code']}</code> — скидка {p['discount_pct']}% — {status}")
         if not p["used_at"]:
+            active_count += 1
             rows.append([InlineKeyboardButton(
                 text=f"❌ Удалить {p['code']}",
                 callback_data=f"adm:del_ref_promo:{target_id}:{p['promo_id']}",
             )])
 
+    if active_count > 0:
+        rows.append([InlineKeyboardButton(
+            text=f"🗑️ Удалить все активные ({active_count})",
+            callback_data=f"adm:del_all_ref_promos:{target_id}",
+        )])
     rows.append([InlineKeyboardButton(
         text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
     )])
@@ -3823,20 +3883,54 @@ async def cb_adm_del_ref_promo(call: CallbackQuery) -> None:
     else:
         lines = [f"<b>🎟️ Реферальные промокоды</b>\nПользователь: <code>{target_id}</code>\n"]
         rows = []
+        active_count = 0
         for p in promos:
             status = "✅ активен" if not p["used_at"] and p["is_active"] else "🔴 использован/отозван"
             lines.append(f"• <code>{p['code']}</code> — скидка {p['discount_pct']}% — {status}")
             if not p["used_at"]:
+                active_count += 1
                 rows.append([InlineKeyboardButton(
                     text=f"❌ Удалить {p['code']}",
                     callback_data=f"adm:del_ref_promo:{target_id}:{p['promo_id']}",
                 )])
+        if active_count > 0:
+            rows.append([InlineKeyboardButton(
+                text=f"🗑️ Удалить все активные ({active_count})",
+                callback_data=f"adm:del_all_ref_promos:{target_id}",
+            )])
         rows.append([InlineKeyboardButton(
             text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
         )])
         text = "\n".join(lines)
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:del_all_ref_promos:"))
+async def cb_adm_del_all_ref_promos(call: CallbackQuery) -> None:
+    """Модератор удаляет все активные реферальные промокоды пользователя."""
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+
+    deleted = await db_delete_all_user_ref_promos(target_id)
+    await call.answer(f"Удалено: {deleted} промокодов", show_alert=True)
+
+    text = (
+        f"<b>🎟️ Реферальные промокоды</b>\n"
+        f"Пользователь: <code>{target_id}</code>\n\n"
+        f"✅ Удалено активных промокодов: <b>{deleted}</b>\n\n"
+        "Промокодов нет."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+    ])
     await send_or_edit(call, text, kb)
 
 
@@ -3912,6 +4006,8 @@ def kb_admin_promos(promos: list[dict]) -> InlineKeyboardMarkup:
             )
         ])
     rows.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="adm:promo_create")])
+    if promos:
+        rows.append([InlineKeyboardButton(text="🗑️ Удалить все промокоды", callback_data="adm:del_all_promos")])
     rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3945,13 +4041,29 @@ async def cb_adm_promos(call: CallbackQuery, state: FSMContext) -> None:
     if not _is_moderator(call.from_user.id):
         return
     await state.clear()
-    promos = await db_list_promos()
+    promos = await db_list_regular_promos()
     text = "<b>🎟️ Промокоды</b>\n\n"
     if promos:
         text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления."
     else:
         text += "Промокодов пока нет. Создайте первый!"
     await send_or_edit(call, text, kb_admin_promos(promos))
+
+
+@dp.callback_query(F.data == "adm:del_all_promos")
+async def cb_adm_del_all_promos(call: CallbackQuery) -> None:
+    """Модератор удаляет все обычные промокоды разом."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    deleted = await db_delete_all_regular_promos()
+    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
+    text = (
+        "<b>🎟️ Промокоды</b>\n\n"
+        f"✅ Удалено промокодов: <b>{deleted}</b>\n\n"
+        "Промокодов пока нет. Создайте первый!"
+    )
+    await send_or_edit(call, text, kb_admin_promos([]))
 
 
 @dp.callback_query(F.data == "adm:promo_create")
@@ -4290,9 +4402,9 @@ async def cb_adm_promo_del_yes(call: CallbackQuery) -> None:
         return
     await db_delete_promo(promo_id)
     await call.answer("Промокод удалён.", show_alert=True)
-    promos = await db_list_promos()
+    promos = await db_list_regular_promos()
     text = "<b>🎟️ Промокоды</b>\n\n"
-    text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления." if promos else "Промокодов пока нет."
+    text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления." if promos else "Промокодов пока нет. Создайте первый!"
     await send_or_edit(call, text, kb_admin_promos(promos))
 
 
@@ -4374,7 +4486,9 @@ async def msg_promo_input(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data == "my_promos")
 async def cb_my_promos(call: CallbackQuery) -> None:
     await call.answer()
-    user_promos = await db_get_user_promos(call.from_user.id)
+    all_promos = await db_get_user_promos(call.from_user.id)
+    # Реферальные промокоды — только в отдельной вкладке
+    user_promos = [up for up in all_promos if up.get("game") != "ref_discount"]
 
     if not user_promos:
         await send_or_edit(
@@ -4402,6 +4516,7 @@ async def cb_my_promos(call: CallbackQuery) -> None:
         label = f"{icon} {up['code']} — {up['product_title']} ({up['promo_price']}₽)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"promo_detail:{up['promo_id']}")])
 
+    rows.append([InlineKeyboardButton(text="🗑️ Удалить все", callback_data="del_all_my_promos")])
     rows.append([InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")])
     rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")])
 
@@ -4725,10 +4840,99 @@ async def cb_referral_info(call: CallbackQuery) -> None:
         text += f"• {name} — {refs} реф., скидка {disc}%{current}\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎟️ Мои промокоды", callback_data="my_promos")],
+        [InlineKeyboardButton(text="🎟️ Мои реф. промокоды", callback_data="my_ref_promos")],
         [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
     ])
     await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data == "my_ref_promos")
+async def cb_my_ref_promos(call: CallbackQuery) -> None:
+    """Реферальные промокоды пользователя — отдельная вкладка."""
+    await call.answer()
+    all_promos = await db_get_user_promos(call.from_user.id)
+    ref_promos = [up for up in all_promos if up.get("game") == "ref_discount"]
+
+    if not ref_promos:
+        await send_or_edit(
+            call,
+            "🎟️ <b>Мои реферальные промокоды</b>\n\n"
+            "У вас пока нет реферальных промокодов.\n"
+            "Приглашайте друзей и повышайте уровень!",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👥 Реф. программа", callback_data="referral_info")],
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+            ])
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    active_count = 0
+    for up in ref_promos:
+        used = up.get("used_at") is not None
+        valid = _promo_is_valid_now(up) and not used
+        disc = up.get("discount_pct", 0)
+        if used:
+            label = f"✔️ {up['code']} — {disc}% (использован)"
+            rows.append([InlineKeyboardButton(text=label, callback_data="referral_info")])
+        elif valid:
+            active_count += 1
+            label = f"✅ {up['code']} — скидка {disc}%"
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"activate_ref_promo:{up['promo_id']}")])
+        else:
+            label = f"🔴 {up['code']} — {disc}% (недействителен)"
+            rows.append([InlineKeyboardButton(text=label, callback_data="referral_info")])
+
+    if active_count > 0:
+        rows.append([InlineKeyboardButton(
+            text=f"🗑️ Удалить все активные ({active_count})",
+            callback_data="del_all_ref_promos",
+        )])
+    rows.append([InlineKeyboardButton(text="👥 Реф. программа", callback_data="referral_info")])
+    rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")])
+
+    await send_or_edit(
+        call,
+        f"🎟️ <b>Мои реферальные промокоды</b>\n\n"
+        f"✅ — активен (нажмите, чтобы применить к покупке)\n"
+        f"✔️ — использован  |  🔴 — недействителен\n\n"
+        f"Всего: <b>{len(ref_promos)}</b>, активных: <b>{active_count}</b>",
+        InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+@dp.callback_query(F.data == "del_all_ref_promos")
+async def cb_del_all_ref_promos(call: CallbackQuery) -> None:
+    """Пользователь удаляет все свои активные реферальные промокоды."""
+    deleted = await db_delete_all_user_ref_promos(call.from_user.id)
+    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
+    await send_or_edit(
+        call,
+        "🎟️ <b>Мои реферальные промокоды</b>\n\n"
+        "Активных реферальных промокодов нет.\n"
+        "Приглашайте друзей и повышайте уровень!",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Реф. программа", callback_data="referral_info")],
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+        ])
+    )
+
+
+@dp.callback_query(F.data == "del_all_my_promos")
+async def cb_del_all_my_promos(call: CallbackQuery) -> None:
+    """Пользователь удаляет все свои обычные промокоды."""
+    deleted = await db_delete_all_user_regular_promos(call.from_user.id)
+    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
+    await send_or_edit(
+        call,
+        "🎟️ <b>Мои промокоды</b>\n\n"
+        "У вас нет промокодов.\n"
+        "Нажмите «Ввести промокод», чтобы добавить.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")],
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+        ])
+    )
 
 
 @dp.callback_query(F.data.startswith("activate_ref_promo:"))
