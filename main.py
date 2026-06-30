@@ -14,6 +14,8 @@ Telegram-бот для онлайн-магазина цифровых товар
 """
 
 import asyncio
+import csv
+import io
 import logging
 import re
 import secrets
@@ -46,6 +48,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
