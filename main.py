@@ -840,6 +840,48 @@ async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int]:
             return referrer_id, level_up, new_level
 
 
+async def db_admin_set_ref_level(tg_id: int, new_level: int) -> int:
+    """Принудительно устанавливает реферальный уровень пользователю.
+    Возвращает старый уровень."""
+    pool = await get_pool()
+    old = await pool.fetchval(
+        "SELECT referral_level FROM users WHERE tg_id = $1", tg_id
+    )
+    await pool.execute(
+        "UPDATE users SET referral_level = $1 WHERE tg_id = $2",
+        new_level, tg_id,
+    )
+    return int(old) if old is not None else 0
+
+
+async def db_admin_get_user_ref_promos(tg_id: int) -> list[dict]:
+    """Возвращает все реферальные промокоды пользователя (выданные и использованные)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT up.id AS up_id, up.promo_id, up.used_at,
+               pc.code, pc.discount_pct, pc.is_active
+        FROM user_promos up
+        JOIN promo_codes pc ON pc.id = up.promo_id
+        WHERE up.tg_id = $1 AND pc.game = 'ref_discount'
+        ORDER BY up.id DESC
+        """,
+        tg_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_admin_remove_user_promo(tg_id: int, promo_id: int) -> bool:
+    """Удаляет реферальный промокод из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos WHERE tg_id = $1 AND promo_id = $2",
+        tg_id, promo_id,
+    )
+    deleted = int(result.split()[-1])
+    return deleted > 0
+
+
 async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
     """Создаёт 3 промокода на скидку при повышении уровня."""
     discount = level * REFERRAL_DISCOUNT_PER_LEVEL
@@ -3177,6 +3219,18 @@ def kb_admin_user(
                     callback_data=f"adm:tx:{target_id}",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text="👑 Выдать реф. статус",
+                    callback_data=f"adm:ref_level:{target_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎟️ Реф. промокоды",
+                    callback_data=f"adm:ref_promos:{target_id}",
+                )
+            ],
             nav_row,
         ]
     )
@@ -3203,6 +3257,10 @@ async def _send_admin_user_card(
     blocked = bool(user_row.get("is_blacklisted"))
     orders_cnt = await db_orders_count(target_id)
     from_list_page = await _get_admin_card_source(state)
+    level = user_row.get("referral_level", 0) or 0
+    ref_count = user_row.get("referral_count", 0) or 0
+    level_name = _ref_level_name(level)
+    discount = _ref_discount_pct(level)
     text = (
         "<b>👤 Карточка пользователя</b>\n\n"
         f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
@@ -3210,6 +3268,8 @@ async def _send_admin_user_card(
         f"Имя: {escape(user_row.get('first_name') or '—')}\n"
         f"Баланс: <b>{user_row['balance']}₽</b>\n"
         f"Заказов: <b>{orders_cnt}</b>\n"
+        f"Реф. статус: <b>{level_name}</b> (скидка {discount}%)\n"
+        f"Рефералов засчитано: <b>{ref_count}</b>\n"
         f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
     )
     await send_or_edit(
@@ -3553,6 +3613,231 @@ async def cb_adm_back(call: CallbackQuery, state: FSMContext) -> None:
     except (ValueError, IndexError):
         return
     await _send_admin_user_card(call, target_id, state)
+
+
+# =====================================================================
+# Реферальные статусы и промокоды — Административная панель
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("adm:ref_level:"))
+async def cb_adm_ref_level(call: CallbackQuery) -> None:
+    """Показывает список уровней для выбора."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    user_row = await db_find_user(target_id)
+    if not user_row:
+        await call.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    current_level = user_row.get("referral_level", 0) or 0
+    current_name = _ref_level_name(current_level)
+
+    text = (
+        f"<b>👑 Выдача реферального статуса</b>\n\n"
+        f"Пользователь: <code>{target_id}</code>\n"
+        f"Текущий статус: <b>{current_name}</b> (ур. {current_level})\n\n"
+        "Выберите новый уровень.\n"
+        "<i>⚠️ При повышении уровня пользователь получит уведомление "
+        "и промокоды на скидку. При понижении промокоды не отзываются.</i>"
+    )
+
+    rows = []
+    for lvl, (name, disc) in REFERRAL_LEVELS.items():
+        marker = " ✓" if lvl == current_level else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{name} — {disc}%{marker}",
+            callback_data=f"adm:set_ref_level:{target_id}:{lvl}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
+    )])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:set_ref_level:"))
+async def cb_adm_set_ref_level(call: CallbackQuery, state: FSMContext) -> None:
+    """Устанавливает реферальный уровень пользователю."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        parts = call.data.split(":")
+        target_id = int(parts[2])
+        new_level = int(parts[3])
+    except (ValueError, IndexError):
+        return
+
+    if new_level not in REFERRAL_LEVELS:
+        await call.answer("Некорректный уровень.", show_alert=True)
+        return
+
+    old_level = await db_admin_set_ref_level(target_id, new_level)
+    level_name = _ref_level_name(new_level)
+    discount = _ref_discount_pct(new_level)
+
+    promo_codes: list[str] = []
+    if new_level > old_level:
+        # Генерируем промокоды за каждый новый уровень
+        for lvl in range(old_level + 1, new_level + 1):
+            codes = await db_create_ref_promo_codes(target_id, lvl)
+            promo_codes.extend(codes)
+
+        # Уведомляем пользователя
+        if promo_codes:
+            codes_text = "\n".join(f"<code>{c}</code>" for c in promo_codes)
+            try:
+                await bot.send_message(
+                    target_id,
+                    f"🎉 <b>Вам выдан новый реферальный статус!</b>\n\n"
+                    f"🏆 Ваш статус: <b>{level_name}</b>\n"
+                    f"💰 Скидка на заказы: <b>{discount}%</b>\n\n"
+                    f"🎟️ Ваши промокоды на скидку:\n{codes_text}\n\n"
+                    f"Доступны в разделе «Мои промокоды».\n"
+                    f"<i>Не действует на Telegram Stars.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить {target_id} о новом уровне: {e}")
+        else:
+            try:
+                await bot.send_message(
+                    target_id,
+                    f"🎉 <b>Вам выдан реферальный статус!</b>\n\n"
+                    f"🏆 Ваш статус: <b>{level_name}</b>\n"
+                    f"💰 Скидка на заказы: <b>{discount}%</b>\n\n"
+                    f"<i>Не действует на Telegram Stars.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить {target_id}: {e}")
+    elif new_level < old_level:
+        old_name = _ref_level_name(old_level)
+        try:
+            await bot.send_message(
+                target_id,
+                f"ℹ️ Ваш реферальный статус изменён.\n\n"
+                f"Новый статус: <b>{level_name}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    promo_info = f"\nВыдано промокодов: <b>{len(promo_codes)}</b>" if promo_codes else ""
+    action = "повышен" if new_level > old_level else ("понижен" if new_level < old_level else "не изменён")
+    text = (
+        f"✅ <b>Статус {action}.</b>\n\n"
+        f"Пользователь: <code>{target_id}</code>\n"
+        f"Новый статус: <b>{level_name}</b> (ур. {new_level}){promo_info}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Реф. промокоды", callback_data=f"adm:ref_promos:{target_id}")],
+        [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:ref_promos:"))
+async def cb_adm_ref_promos(call: CallbackQuery) -> None:
+    """Просмотр реферальных промокодов пользователя."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    promos = await db_admin_get_user_ref_promos(target_id)
+
+    if not promos:
+        text = (
+            f"<b>🎟️ Реферальные промокоды</b>\n"
+            f"Пользователь: <code>{target_id}</code>\n\n"
+            "Промокодов нет."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+        ])
+        await send_or_edit(call, text, kb)
+        return
+
+    lines = [f"<b>🎟️ Реферальные промокоды</b>\nПользователь: <code>{target_id}</code>\n"]
+    rows = []
+    for p in promos:
+        status = "✅ активен" if not p["used_at"] and p["is_active"] else "🔴 использован/отозван"
+        lines.append(f"• <code>{p['code']}</code> — скидка {p['discount_pct']}% — {status}")
+        if not p["used_at"]:
+            rows.append([InlineKeyboardButton(
+                text=f"❌ Удалить {p['code']}",
+                callback_data=f"adm:del_ref_promo:{target_id}:{p['promo_id']}",
+            )])
+
+    rows.append([InlineKeyboardButton(
+        text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
+    )])
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…"
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:del_ref_promo:"))
+async def cb_adm_del_ref_promo(call: CallbackQuery) -> None:
+    """Удаляет реферальный промокод из инвентаря пользователя."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        parts = call.data.split(":")
+        target_id = int(parts[2])
+        promo_id = int(parts[3])
+    except (ValueError, IndexError):
+        return
+
+    ok = await db_admin_remove_user_promo(target_id, promo_id)
+    if ok:
+        await call.answer("Промокод удалён.", show_alert=False)
+    else:
+        await call.answer("Промокод не найден или уже удалён.", show_alert=True)
+
+    # Обновляем список
+    promos = await db_admin_get_user_ref_promos(target_id)
+    if not promos:
+        text = (
+            f"<b>🎟️ Реферальные промокоды</b>\n"
+            f"Пользователь: <code>{target_id}</code>\n\n"
+            "Промокодов нет."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+        ])
+    else:
+        lines = [f"<b>🎟️ Реферальные промокоды</b>\nПользователь: <code>{target_id}</code>\n"]
+        rows = []
+        for p in promos:
+            status = "✅ активен" if not p["used_at"] and p["is_active"] else "🔴 использован/отозван"
+            lines.append(f"• <code>{p['code']}</code> — скидка {p['discount_pct']}% — {status}")
+            if not p["used_at"]:
+                rows.append([InlineKeyboardButton(
+                    text=f"❌ Удалить {p['code']}",
+                    callback_data=f"adm:del_ref_promo:{target_id}:{p['promo_id']}",
+                )])
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
+        )])
+        text = "\n".join(lines)
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    await send_or_edit(call, text, kb)
 
 
 # =====================================================================
