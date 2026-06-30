@@ -39,7 +39,7 @@ from html import escape
 
 import os
 
-import aiosqlite
+import asyncpg
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -256,33 +256,43 @@ class BlacklistMiddleware(BaseMiddleware):
 dp.message.middleware(BlacklistMiddleware())
 dp.callback_query.middleware(BlacklistMiddleware())
 
-# База данных хранится ВНЕ git-репозитория — данные не сбрасываются при правках кода.
-DB_PATH = "/home/runner/shop_data/shop.db"
+# =====================================================================
+# База данных (PostgreSQL через asyncpg + Neon)
+# =====================================================================
+
+_pool: asyncpg.Pool | None = None
 
 
-# =====================================================================
-# База данных
-# =====================================================================
+async def get_pool() -> asyncpg.Pool:
+    """Возвращает глобальный пул соединений с Neon PostgreSQL."""
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            os.environ["CONNECTION_STRING"],
+            min_size=1,
+            max_size=5,
+        )
+    return _pool
 
 
 async def db_init() -> None:
-    """Создаёт таблицы, если их ещё нет. Папка для БД создаётся автоматически."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    """Создаёт таблицы в PostgreSQL, если их ещё нет."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                tg_id          INTEGER PRIMARY KEY,
+                tg_id          BIGINT PRIMARY KEY,
                 username       TEXT,
                 first_name     TEXT,
                 balance        INTEGER NOT NULL DEFAULT 0,
-                is_blacklisted INTEGER NOT NULL DEFAULT 0,
+                is_blacklisted BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at     TEXT NOT NULL
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id      INTEGER NOT NULL,
+                id         SERIAL PRIMARY KEY,
+                tg_id      BIGINT NOT NULL,
                 title      TEXT NOT NULL,
                 price      INTEGER NOT NULL,
                 status     TEXT NOT NULL,
@@ -293,126 +303,102 @@ async def db_init() -> None:
                 created_at TEXT NOT NULL
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id      INTEGER NOT NULL,
+                id         SERIAL PRIMARY KEY,
+                tg_id      BIGINT NOT NULL,
                 amount     INTEGER NOT NULL,
                 kind       TEXT NOT NULL,
                 reason     TEXT,
                 created_at TEXT NOT NULL
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS reviews (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                id            SERIAL PRIMARY KEY,
                 order_id      INTEGER NOT NULL UNIQUE,
-                tg_id         INTEGER NOT NULL,
+                tg_id         BIGINT NOT NULL,
                 photo_file_id TEXT,
                 comment       TEXT,
                 created_at    TEXT NOT NULL
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS promo_codes (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                code          TEXT    UNIQUE NOT NULL COLLATE NOCASE,
-                game          TEXT    NOT NULL,
-                product_title TEXT    NOT NULL,
+                id            SERIAL PRIMARY KEY,
+                code          TEXT UNIQUE NOT NULL,
+                game          TEXT NOT NULL,
+                product_title TEXT NOT NULL,
                 promo_price   INTEGER NOT NULL,
                 starts_at     TEXT,
                 expires_at    TEXT,
-                is_active     INTEGER NOT NULL DEFAULT 1,
-                created_at    TEXT    NOT NULL
+                is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at    TEXT NOT NULL
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_promos (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                tg_id      INTEGER NOT NULL,
+                id         SERIAL PRIMARY KEY,
+                tg_id      BIGINT NOT NULL,
                 promo_id   INTEGER NOT NULL,
-                claimed_at TEXT    NOT NULL,
+                claimed_at TEXT NOT NULL,
                 used_at    TEXT,
                 UNIQUE(tg_id, promo_id)
             )
         """)
-        cur = await db.execute("PRAGMA table_info(orders)")
-        cols = [r[1] for r in await cur.fetchall()]
-        if "login_data" not in cols:
-            await db.execute("ALTER TABLE orders ADD COLUMN login_data TEXT")
-        if "login_code" not in cols:
-            await db.execute("ALTER TABLE orders ADD COLUMN login_code TEXT")
-        if "category" not in cols:
-            await db.execute("ALTER TABLE orders ADD COLUMN category TEXT")
-
-        cur = await db.execute("PRAGMA table_info(users)")
-        ucols = [r[1] for r in await cur.fetchall()]
-        if "is_blacklisted" not in ucols:
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN is_blacklisted INTEGER NOT NULL DEFAULT 0"
-            )
-        await db.commit()
 
 
 async def db_get_or_create_user(user) -> dict:
     """Возвращает запись пользователя, создавая её при первом обращении."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (user.id,))
-        row = await cur.fetchone()
-        if row is None:
-            await db.execute(
-                "INSERT INTO users (tg_id, username, first_name, balance, created_at)"
-                " VALUES (?, ?, ?, 0, ?)",
-                (
-                    user.id,
-                    user.username,
-                    user.first_name,
-                    datetime.utcnow().isoformat(timespec="seconds"),
-                ),
-            )
-            await db.commit()
-            cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (user.id,))
-            row = await cur.fetchone()
-        else:
-            await db.execute(
-                "UPDATE users SET username = ?, first_name = ? WHERE tg_id = ?",
-                (user.username, user.first_name, user.id),
-            )
-            await db.commit()
-        return dict(row)
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        INSERT INTO users (tg_id, username, first_name, balance, created_at)
+        VALUES ($1, $2, $3, 0, $4)
+        ON CONFLICT (tg_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name
+        RETURNING *
+        """,
+        user.id,
+        user.username,
+        user.first_name,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    return dict(row)
 
 
 async def db_get_balance(tg_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
-        row = await cur.fetchone()
-        return int(row[0]) if row else 0
+    pool = await get_pool()
+    val = await pool.fetchval("SELECT balance FROM users WHERE tg_id = $1", tg_id)
+    return int(val) if val is not None else 0
 
 
 async def db_add_balance(tg_id: int, amount: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET balance = balance + ? WHERE tg_id = ?",
-            (amount, tg_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET balance = balance + $1 WHERE tg_id = $2",
+        amount, tg_id,
+    )
     return await db_get_balance(tg_id)
 
 
 async def db_try_charge(tg_id: int, amount: int) -> bool:
     """Списывает amount с баланса, если денег достаточно. Возвращает True/False."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT balance FROM users WHERE tg_id = ?", (tg_id,))
-        row = await cur.fetchone()
-        if not row or row[0] < amount:
-            return False
-        await db.execute(
-            "UPDATE users SET balance = balance - ? WHERE tg_id = ?",
-            (amount, tg_id),
-        )
-        await db.commit()
-        return True
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT balance FROM users WHERE tg_id = $1 FOR UPDATE",
+                tg_id,
+            )
+            if not row or row["balance"] < amount:
+                return False
+            await conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE tg_id = $2",
+                amount, tg_id,
+            )
+            return True
 
 
 async def db_create_order(
@@ -422,196 +408,176 @@ async def db_create_order(
     status: str = "Оплачен",
     category: str | None = None,
 ) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO orders (tg_id, title, price, status, category, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                tg_id,
-                title,
-                price,
-                status,
-                category,
-                datetime.utcnow().isoformat(timespec="seconds"),
-            ),
-        )
-        await db.commit()
-        return cur.lastrowid
+    pool = await get_pool()
+    order_id = await pool.fetchval(
+        "INSERT INTO orders (tg_id, title, price, status, category, created_at)"
+        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        tg_id,
+        title,
+        price,
+        status,
+        category,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    return order_id
 
 
 async def db_set_order_status(order_id: int, status: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE orders SET status = ? WHERE id = ?",
-            (status, order_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET status = $1 WHERE id = $2",
+        status, order_id,
+    )
 
 
 async def db_get_order(order_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
-        row = await cur.fetchone()
-        return dict(row) if row else None
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT * FROM orders WHERE id = $1", order_id)
+    return dict(row) if row else None
 
 
 async def db_set_order_contact(order_id: int, contact: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE orders SET contact = ? WHERE id = ?",
-            (contact, order_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET contact = $1 WHERE id = $2",
+        contact, order_id,
+    )
 
 
 async def db_set_order_login(order_id: int, login_data: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE orders SET login_data = ? WHERE id = ?",
-            (login_data, order_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET login_data = $1 WHERE id = $2",
+        login_data, order_id,
+    )
 
 
 async def db_set_order_login_code(order_id: int, code: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE orders SET login_code = ? WHERE id = ?",
-            (code, order_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET login_code = $1 WHERE id = $2",
+        code, order_id,
+    )
 
 
 async def db_add_review(
     order_id: int, tg_id: int, photo_file_id: str | None, comment: str
 ) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT OR REPLACE INTO reviews "
-            "(order_id, tg_id, photo_file_id, comment, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                order_id,
-                tg_id,
-                photo_file_id,
-                comment,
-                datetime.utcnow().isoformat(timespec="seconds"),
-            ),
-        )
-        await db.commit()
-        return cur.lastrowid
+    pool = await get_pool()
+    review_id = await pool.fetchval(
+        """
+        INSERT INTO reviews (order_id, tg_id, photo_file_id, comment, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (order_id) DO UPDATE
+            SET photo_file_id = EXCLUDED.photo_file_id,
+                comment       = EXCLUDED.comment,
+                created_at    = EXCLUDED.created_at
+        RETURNING id
+        """,
+        order_id,
+        tg_id,
+        photo_file_id,
+        comment,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    return review_id
 
 
 async def db_has_review(order_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM reviews WHERE order_id = ?", (order_id,)
-        )
-        return await cur.fetchone() is not None
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT 1 FROM reviews WHERE order_id = $1", order_id
+    )
+    return val is not None
 
 
 async def db_add_transaction(
     tg_id: int, amount: int, kind: str, reason: str | None = None
 ) -> None:
     """Записывает движение по балансу. amount: +начисление / -списание."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO transactions (tg_id, amount, kind, reason, created_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (
-                tg_id,
-                amount,
-                kind,
-                reason,
-                datetime.utcnow().isoformat(timespec="seconds"),
-            ),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO transactions (tg_id, amount, kind, reason, created_at)"
+        " VALUES ($1, $2, $3, $4, $5)",
+        tg_id,
+        amount,
+        kind,
+        reason,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
 
 
 async def db_get_transactions(tg_id: int, limit: int = 20) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM transactions WHERE tg_id = ? ORDER BY id DESC LIMIT ?",
-            (tg_id, limit),
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM transactions WHERE tg_id = $1 ORDER BY id DESC LIMIT $2",
+        tg_id, limit,
+    )
+    return [dict(r) for r in rows]
 
 
 async def db_set_balance(tg_id: int, value: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET balance = ? WHERE tg_id = ?",
-            (value, tg_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET balance = $1 WHERE tg_id = $2",
+        value, tg_id,
+    )
     return await db_get_balance(tg_id)
 
 
 async def db_set_blacklist(tg_id: int, value: bool) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_blacklisted = ? WHERE tg_id = ?",
-            (1 if value else 0, tg_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET is_blacklisted = $1 WHERE tg_id = $2",
+        value, tg_id,
+    )
 
 
 async def db_is_blacklisted(tg_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT is_blacklisted FROM users WHERE tg_id = ?", (tg_id,)
-        )
-        row = await cur.fetchone()
-        return bool(row[0]) if row else False
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT is_blacklisted FROM users WHERE tg_id = $1", tg_id
+    )
+    return bool(val) if val is not None else False
 
 
 async def db_find_user(tg_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
-        row = await cur.fetchone()
-        return dict(row) if row else None
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT * FROM users WHERE tg_id = $1", tg_id)
+    return dict(row) if row else None
 
 
 async def db_get_orders(tg_id: int, limit: int = 10) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM orders WHERE tg_id = ? ORDER BY id DESC LIMIT ?",
-            (tg_id, limit),
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM orders WHERE tg_id = $1 ORDER BY id DESC LIMIT $2",
+        tg_id, limit,
+    )
+    return [dict(r) for r in rows]
 
 
 async def db_orders_count(tg_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM orders WHERE tg_id = ?", (tg_id,))
-        row = await cur.fetchone()
-        return int(row[0]) if row else 0
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT COUNT(*) FROM orders WHERE tg_id = $1", tg_id
+    )
+    return int(val) if val else 0
 
 
 async def db_users_count() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM users")
-        row = await cur.fetchone()
-        return int(row[0]) if row else 0
+    pool = await get_pool()
+    val = await pool.fetchval("SELECT COUNT(*) FROM users")
+    return int(val) if val else 0
 
 
 async def db_list_users(limit: int, offset: int) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT tg_id, username, first_name, balance, is_blacklisted "
-            "FROM users ORDER BY rowid DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, username, first_name, balance, is_blacklisted "
+        "FROM users ORDER BY tg_id DESC LIMIT $1 OFFSET $2",
+        limit, offset,
+    )
+    return [dict(r) for r in rows]
 
 
 async def db_create_promo(
@@ -623,127 +589,117 @@ async def db_create_promo(
     expires_at: str | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO promo_codes (code, game, product_title, promo_price, starts_at, expires_at, is_active, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-            (code.upper(), game, product_title, promo_price, starts_at, expires_at, now),
-        )
-        await db.commit()
-        return cur.lastrowid  # type: ignore[return-value]
+    pool = await get_pool()
+    promo_id = await pool.fetchval(
+        "INSERT INTO promo_codes (code, game, product_title, promo_price, starts_at,"
+        " expires_at, is_active, created_at)"
+        " VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) RETURNING id",
+        code.upper(), game, product_title, promo_price, starts_at, expires_at, now,
+    )
+    return promo_id
 
 
 async def db_get_promo_by_code(code: str) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM promo_codes WHERE code = ? COLLATE NOCASE",
-            (code.strip(),),
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else None
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM promo_codes WHERE UPPER(code) = UPPER($1)",
+        code.strip(),
+    )
+    return dict(row) if row else None
 
 
 async def db_get_promo_by_id(promo_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM promo_codes WHERE id = ?", (promo_id,))
-        row = await cur.fetchone()
-        return dict(row) if row else None
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM promo_codes WHERE id = $1", promo_id
+    )
+    return dict(row) if row else None
 
 
 async def db_list_promos() -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM promo_codes ORDER BY id DESC")
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    pool = await get_pool()
+    rows = await pool.fetch("SELECT * FROM promo_codes ORDER BY id DESC")
+    return [dict(r) for r in rows]
 
 
 async def db_delete_promo(promo_id: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM promo_codes WHERE id = ?", (promo_id,))
-        await db.execute("DELETE FROM user_promos WHERE promo_id = ?", (promo_id,))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM user_promos WHERE promo_id = $1", promo_id)
+            await conn.execute("DELETE FROM promo_codes WHERE id = $1", promo_id)
 
 
 async def db_toggle_promo(promo_id: int, is_active: bool) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE promo_codes SET is_active = ? WHERE id = ?",
-            (1 if is_active else 0, promo_id),
-        )
-        await db.commit()
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE promo_codes SET is_active = $1 WHERE id = $2",
+        is_active, promo_id,
+    )
 
 
 async def db_claim_promo(tg_id: int, promo_id: int) -> bool:
     """Добавляет промокод в список пользователя. False — уже есть."""
     now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        try:
-            await db.execute(
-                "INSERT INTO user_promos (tg_id, promo_id, claimed_at) VALUES (?, ?, ?)",
-                (tg_id, promo_id, now),
-            )
-            await db.commit()
-            return True
-        except Exception:
-            return False
+    pool = await get_pool()
+    try:
+        await pool.execute(
+            "INSERT INTO user_promos (tg_id, promo_id, claimed_at) VALUES ($1, $2, $3)",
+            tg_id, promo_id, now,
+        )
+        return True
+    except Exception:
+        return False
 
 
 async def db_use_promo(tg_id: int, promo_id: int) -> bool:
     """Помечает промокод как использованный. False — уже использован."""
     now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT used_at FROM user_promos WHERE tg_id = ? AND promo_id = ?",
-            (tg_id, promo_id),
-        )
-        row = await cur.fetchone()
-        if not row or row[0] is not None:
-            return False
-        await db.execute(
-            "UPDATE user_promos SET used_at = ? WHERE tg_id = ? AND promo_id = ?",
-            (now, tg_id, promo_id),
-        )
-        await db.commit()
-        return True
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT used_at FROM user_promos WHERE tg_id = $1 AND promo_id = $2",
+                tg_id, promo_id,
+            )
+            if not row or row["used_at"] is not None:
+                return False
+            await conn.execute(
+                "UPDATE user_promos SET used_at = $1 WHERE tg_id = $2 AND promo_id = $3",
+                now, tg_id, promo_id,
+            )
+            return True
 
 
 async def db_get_user_promos(tg_id: int) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT up.id, up.tg_id, up.promo_id, up.claimed_at, up.used_at, "
-            "pc.code, pc.game, pc.product_title, pc.promo_price, "
-            "pc.expires_at, pc.starts_at, pc.is_active "
-            "FROM user_promos up "
-            "JOIN promo_codes pc ON pc.id = up.promo_id "
-            "WHERE up.tg_id = ? ORDER BY up.id DESC",
-            (tg_id,),
-        )
-        rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT up.id, up.tg_id, up.promo_id, up.claimed_at, up.used_at, "
+        "pc.code, pc.game, pc.product_title, pc.promo_price, "
+        "pc.expires_at, pc.starts_at, pc.is_active "
+        "FROM user_promos up "
+        "JOIN promo_codes pc ON pc.id = up.promo_id "
+        "WHERE up.tg_id = $1 ORDER BY up.id DESC",
+        tg_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def db_promo_usage_count(promo_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM user_promos WHERE promo_id = ? AND used_at IS NOT NULL",
-            (promo_id,),
-        )
-        row = await cur.fetchone()
-        return int(row[0]) if row else 0
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT COUNT(*) FROM user_promos WHERE promo_id = $1 AND used_at IS NOT NULL",
+        promo_id,
+    )
+    return int(val) if val else 0
 
 
 async def db_get_all_user_ids() -> list[int]:
     """Возвращает tg_id всех не заблокированных пользователей (для рассылки)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT tg_id FROM users WHERE is_blacklisted = 0"
-        )
-        rows = await cur.fetchall()
-    return [row[0] for row in rows]
+    pool = await get_pool()
+    rows = await pool.fetch("SELECT tg_id FROM users WHERE is_blacklisted = FALSE")
+    return [r["tg_id"] for r in rows]
+
 
 
 # =====================================================================
