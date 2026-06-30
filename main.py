@@ -4212,7 +4212,91 @@ async def _health_server() -> None:
     logging.info("Health-check сервер запущен на порту %s", port)
     await asyncio.Event().wait()
 
+# =====================================================================
+# Экспорт данных (только модератор)
+# =====================================================================
 
+
+@dp.message(Command("export"))
+async def cmd_export(message: Message) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+
+    wait_msg = await message.answer("⏳ Собираю данные, подождите...")
+    pool = await get_pool()
+
+    users = await pool.fetch(
+        "SELECT tg_id, username, first_name, balance, is_blacklisted, created_at "
+        "FROM users ORDER BY tg_id"
+    )
+    orders = await pool.fetch(
+        "SELECT id, tg_id, title, price, status, category, contact, login_data, created_at "
+        "FROM orders ORDER BY id"
+    )
+    transactions = await pool.fetch(
+        "SELECT id, tg_id, amount, kind, reason, created_at "
+        "FROM transactions ORDER BY id"
+    )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow(["=== ПОЛЬЗОВАТЕЛИ ==="])
+    writer.writerow(["tg_id", "username", "имя", "баланс (руб)", "в чёрном списке", "дата регистрации"])
+    for u in users:
+        writer.writerow([
+            u["tg_id"],
+            u["username"] or "",
+            u["first_name"] or "",
+            u["balance"],
+            "Да" if u["is_blacklisted"] else "Нет",
+            _fmt_msk(u["created_at"]),
+        ])
+
+    writer.writerow([])
+    writer.writerow(["=== ЗАКАЗЫ ==="])
+    writer.writerow(["id", "tg_id", "товар", "цена (руб)", "статус", "категория", "контакт", "данные входа", "дата"])
+    for o in orders:
+        writer.writerow([
+            o["id"],
+            o["tg_id"],
+            o["title"],
+            o["price"],
+            o["status"],
+            o["category"] or "",
+            o["contact"] or "",
+            o["login_data"] or "",
+            _fmt_msk(o["created_at"]),
+        ])
+
+    writer.writerow([])
+    writer.writerow(["=== ТРАНЗАКЦИИ ==="])
+    writer.writerow(["id", "tg_id", "сумма", "тип", "причина", "дата"])
+    for t in transactions:
+        writer.writerow([
+            t["id"],
+            t["tg_id"],
+            t["amount"],
+            t["kind"],
+            t["reason"] or "",
+            _fmt_msk(t["created_at"]),
+        ])
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    now_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d_%H-%M")
+
+    await wait_msg.delete()
+    await message.answer_document(
+        BufferedInputFile(csv_bytes, filename=f"shop_export_{now_str}.csv"),
+        caption=(
+            f"📊 <b>Экспорт данных магазина</b>\n\n"
+            f"👥 Пользователей: <b>{len(users)}</b>\n"
+            f"🛒 Заказов: <b>{len(orders)}</b>\n"
+            f"💳 Транзакций: <b>{len(transactions)}</b>\n\n"
+            f"🕒 Сформировано: {now_str} МСК"
+        ),
+        parse_mode="HTML",
+    )
 async def main() -> None:
     _acquire_single_instance_lock()
     await db_init()
