@@ -131,6 +131,21 @@ MIN_TOPUP = 10  # рублей
 # Минимальное количество Telegram Stars
 MIN_TG_STARS = 50
 
+# =====================================================================
+# РЕФЕРАЛЬНАЯ ПРОГРАММА — настройки
+# =====================================================================
+REFERRAL_LEVELS = {
+    0: ("Новичок",      0),
+    1: ("🥉 Приятель",  2),
+    2: ("🥈 Знакомый",  4),
+    3: ("🥇 Партнёр",   6),
+    4: ("💎 Советник",  8),
+    5: ("👑 Легенда",  10),
+}
+REFERRAL_REFS_PER_LEVEL     = 2  # рефералов для перехода на следующий уровень
+REFERRAL_DISCOUNT_PER_LEVEL = 2  # % скидки за каждый уровень
+REFERRAL_PROMOS_PER_LEVELUP = 3  # промокодов за повышение уровня
+
 # --- Тексты ---
 WELCOME_TEXT = (
     "<b>Добро пожаловать в магазин цифровых товаров.</b>\n\n"
@@ -190,21 +205,21 @@ LOGIN_HINTS = {
 # Структура: (ключ, "Название для кнопки/карточки", цена ₽, "способ выдачи")
 
 ROBUX_INSTANT = [
-    ("rb_40", "40 робуксов", 79, "моментально"),
+    ("rb_40", "40 робуксов", 59, "моментально"),
     ("rb_80", "80 робуксов", 99, "моментально"),
-    ("rb_200", "200 робуксов", 279, "моментально"),
-    ("rb_400", "400 робуксов", 459, "моментально"),
+    ("rb_200", "200 робуксов", 249, "моментально"),
+    ("rb_400", "400 робуксов", 449, "моментально"),
     ("rb_500", "500 робуксов", 499, "моментально"),
-    ("rb_1000", "1000 робуксов", 909, "моментально"),
-    ("rb_1700", "1700 робуксов", 1619, "моментально"),
-    ("rb_2000", "2000 робуксов", 1819, "моментально"),
-    ("rb_3600", "3600 робуксов", 3299, "моментально"),
+    ("rb_1000", "1000 робуксов", 879, "моментально"),
+    ("rb_1700", "1700 робуксов", 1499, "моментально"),
+    ("rb_2000", "2000 робуксов", 1699, "моментально"),
+    ("rb_3600", "3600 робуксов", 3099, "моментально"),
 ]
 
 BRAWL_PRODUCTS = [
-    ("bs_pass", "Brawl Pass", 899, "по согласованию через Telegram"),
-    ("bs_pass_plus", "Brawl Pass Plus", 1239, "по согласованию через Telegram"),
-    ("bs_pro", "Pro Pass", 2199, "по согласованию через Telegram"),
+    ("bs_pass", "Brawl Pass", 849, "по согласованию через Telegram"),
+    ("bs_pass_plus", "Brawl Pass Plus", 1149, "по согласованию через Telegram"),
+    ("bs_pro", "Pro Pass", 2099, "по согласованию через Telegram"),
 ]
 
 # =====================================================================
@@ -349,23 +364,56 @@ async def db_init() -> None:
                 UNIQUE(tg_id, promo_id)
             )
         """)
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_level "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_count "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_ref_promo INTEGER"
+        )
+        await conn.execute(
+            "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS "
+            "discount_pct INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS referral_purchases (
+                id          SERIAL PRIMARY KEY,
+                buyer_id    BIGINT NOT NULL,
+                referrer_id BIGINT NOT NULL,
+                created_at  TEXT NOT NULL,
+                UNIQUE(buyer_id)
+            )
+        """)
 
 
 async def db_get_or_create_user(user) -> dict:
     """Возвращает запись пользователя, создавая её при первом обращении."""
     pool = await get_pool()
+    ref_code = secrets.token_urlsafe(8)
     row = await pool.fetchrow(
         """
-        INSERT INTO users (tg_id, username, first_name, balance, created_at)
-        VALUES ($1, $2, $3, 0, $4)
+        INSERT INTO users (tg_id, username, first_name, balance, referral_code, created_at)
+        VALUES ($1, $2, $3, 0, $4, $5)
         ON CONFLICT (tg_id) DO UPDATE
-            SET username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name
+            SET username      = EXCLUDED.username,
+                first_name    = EXCLUDED.first_name,
+                referral_code = COALESCE(users.referral_code, EXCLUDED.referral_code)
         RETURNING *
         """,
         user.id,
         user.username,
         user.first_name,
+        ref_code,
         datetime.utcnow().isoformat(timespec="seconds"),
     )
     return dict(row)
@@ -704,6 +752,124 @@ async def db_get_all_user_ids() -> list[int]:
     return [r["tg_id"] for r in rows]
 
 
+# =====================================================================
+# Реферальная система — вспомогательные функции
+# =====================================================================
+
+def _ref_level_name(level: int) -> str:
+    return REFERRAL_LEVELS.get(level, ("Новичок", 0))[0]
+
+
+def _ref_discount_pct(level: int) -> int:
+    return level * REFERRAL_DISCOUNT_PER_LEVEL
+
+
+async def db_get_user_by_ref_code(ref_code: str) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM users WHERE referral_code = $1", ref_code
+    )
+    return dict(row) if row else None
+
+
+async def db_set_referred_by(tg_id: int, referrer_id: int) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET referred_by = $1 WHERE tg_id = $2 AND referred_by IS NULL",
+        referrer_id, tg_id,
+    )
+
+
+async def db_set_active_ref_promo(tg_id: int, promo_id: int | None) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET active_ref_promo = $1 WHERE tg_id = $2",
+        promo_id, tg_id,
+    )
+
+
+async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int]:
+    """
+    Вызывается когда заказ покупателя выполнен модератором.
+    Если покупатель был приглашён — засчитывает реферал пригласившему.
+    Возвращает: (referrer_id | None, level_up: bool, new_level: int)
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            buyer = await conn.fetchrow(
+                "SELECT referred_by FROM users WHERE tg_id = $1", buyer_id
+            )
+            if not buyer or not buyer["referred_by"]:
+                return None, False, 0
+
+            referrer_id = buyer["referred_by"]
+
+            exists = await conn.fetchval(
+                "SELECT 1 FROM referral_purchases WHERE buyer_id = $1", buyer_id
+            )
+            if exists:
+                return None, False, 0
+
+            await conn.execute(
+                "INSERT INTO referral_purchases (buyer_id, referrer_id, created_at) "
+                "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                buyer_id, referrer_id,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+
+            new_row = await conn.fetchrow(
+                "UPDATE users SET referral_count = referral_count + 1 "
+                "WHERE tg_id = $1 RETURNING referral_level, referral_count",
+                referrer_id,
+            )
+            if not new_row:
+                return referrer_id, False, 0
+
+            new_count = new_row["referral_count"]
+            old_level = new_row["referral_level"]
+            new_level = min(5, new_count // REFERRAL_REFS_PER_LEVEL)
+
+            level_up = new_level > old_level
+            if level_up:
+                await conn.execute(
+                    "UPDATE users SET referral_level = $1 WHERE tg_id = $2",
+                    new_level, referrer_id,
+                )
+
+            return referrer_id, level_up, new_level
+
+
+async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
+    """Создаёт 3 промокода на скидку при повышении уровня."""
+    discount = level * REFERRAL_DISCOUNT_PER_LEVEL
+    pool = await get_pool()
+    codes = []
+    now = datetime.now(timezone.utc).isoformat()
+    for _ in range(REFERRAL_PROMOS_PER_LEVELUP):
+        code = "REF-" + secrets.token_urlsafe(6).upper()[:8]
+        try:
+            promo_id = await pool.fetchval(
+                "INSERT INTO promo_codes (code, game, product_title, promo_price, "
+                "discount_pct, is_active, created_at) "
+                "VALUES ($1, $2, $3, 0, $4, TRUE, $5) RETURNING id",
+                code,
+                "ref_discount",
+                f"Скидка {discount}% на любой товар (не Telegram Stars)",
+                discount,
+                now,
+            )
+            await pool.execute(
+                "INSERT INTO user_promos (tg_id, promo_id, claimed_at) "
+                "VALUES ($1, $2, $3)",
+                referrer_id, promo_id, now,
+            )
+            codes.append(code)
+        except Exception as e:
+            logging.warning(f"Ошибка создания реферального промокода: {e}")
+    return codes
+
+
 
 # =====================================================================
 # Состояния FSM (для ввода чисел и почты)
@@ -952,6 +1118,7 @@ def kb_profile() -> InlineKeyboardMarkup:
                     text="✏️ Ввести промокод", callback_data="enter_promo"
                 ),
             ],
+            [InlineKeyboardButton(text="👥 Реферальная программа", callback_data="referral_info")],
             [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
         ]
     )
@@ -1231,6 +1398,15 @@ def is_valid_email(text: str) -> bool:
 async def handle_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await db_get_or_create_user(message.from_user)
+
+    # Обрабатываем реферальную ссылку
+    parts = message.text.split() if message.text else []
+    if len(parts) > 1 and parts[1].startswith("ref_"):
+        ref_code = parts[1][4:]
+        referrer = await db_get_user_by_ref_code(ref_code)
+        if referrer and referrer["tg_id"] != message.from_user.id:
+            await db_set_referred_by(message.from_user.id, referrer["tg_id"])
+
     try:
         await message.answer_photo(
             photo=WELCOME_IMAGE_URL,
@@ -1508,7 +1684,27 @@ async def perform_purchase(
     """Списывает price с баланса и создаёт заказ."""
     await call.answer()
     user = call.from_user
-    await db_get_or_create_user(user)
+    user_row = await db_get_or_create_user(user)
+
+    # Применяем активный реферальный промокод (если есть, и категория не tgstars)
+    discount_applied = 0
+    applied_ref_promo_id = None
+    if category != "tgstars":
+        active_promo_id = user_row.get("active_ref_promo")
+        if active_promo_id:
+            ref_promo = await db_get_promo_by_id(active_promo_id)
+            if ref_promo and ref_promo.get("discount_pct", 0) > 0:
+                user_promo_list = await db_get_user_promos(user.id)
+                up = next(
+                    (p for p in user_promo_list
+                     if p["promo_id"] == active_promo_id and p.get("used_at") is None),
+                    None,
+                )
+                if up:
+                    discount_applied = ref_promo["discount_pct"]
+                    price = max(1, round(price * (100 - discount_applied) / 100))
+                    applied_ref_promo_id = active_promo_id
+            await db_set_active_ref_promo(user.id, None)
 
     ok = await db_try_charge(user.id, price)
     if ok and state is not None:
@@ -1548,15 +1744,23 @@ async def perform_purchase(
         kind="purchase",
         reason=f"Заказ #{order_id}: {title}",
     )
+    if applied_ref_promo_id:
+        await db_use_promo(user.id, applied_ref_promo_id)
+
     new_balance = await db_get_balance(user.id)
     login_hint = LOGIN_HINTS.get(category) if category else None
     needs_code = category in ("roblox_instant", "brawl")
     login_label = "🔐 Отправить данные для входа"
+    discount_line = (
+        f"🎫 Реферальная скидка: <b>-{discount_applied}%</b>\n"
+        if discount_applied else ""
+    )
 
     text = (
         "✅ <b>Оплата прошла успешно. Заказ принят в обработку.</b>\n\n"
         f"🧾 Номер заказа: <code>#{order_id}</code>\n"
         f"🎁 Товар: {escape(title)}\n"
+        f"{discount_line}"
         f"💰 Сумма: <b>{price}₽</b>\n"
         f"💼 Остаток на балансе: <b>{new_balance}₽</b>\n\n"
     )
@@ -1936,6 +2140,10 @@ async def cb_profile(call: CallbackQuery) -> None:
     user = call.from_user
     username = f"@{user.username}" if user.username else "не указан"
     created = user_row["created_at"].split("T")[0]
+    level = user_row.get("referral_level", 0)
+    level_name = _ref_level_name(level)
+    discount = _ref_discount_pct(level)
+    discount_line = f" · скидка <b>{discount}%</b>" if discount else ""
 
     text = (
         "<b>👤 Ваш профиль</b>\n\n"
@@ -1945,7 +2153,7 @@ async def cb_profile(call: CallbackQuery) -> None:
         f"Баланс: <b>{user_row['balance']}₽</b>\n"
         f"Дата регистрации: {created}\n"
         f"Заказов: <b>{orders_cnt}</b>\n"
-        "Статус: Обычный пользователь"
+        f"Статус: <b>{level_name}</b>{discount_line}"
     )
     await show_section(call, "profile", text, kb_profile())
     await call.answer()
@@ -2329,6 +2537,47 @@ async def cb_order_done(call: CallbackQuery) -> None:
         return
 
     await db_set_order_status(order_id, "Выполнен")
+
+    # Обработка реферальной программы
+    referrer_id, level_up, new_level = await db_process_referral(target_id)
+    if referrer_id:
+        ref_row = await db_find_user(referrer_id)
+        ref_count = ref_row["referral_count"] if ref_row else 0
+        next_level_refs = (new_level + 1) * REFERRAL_REFS_PER_LEVEL if new_level < 5 else None
+        refs_left = (next_level_refs - ref_count) if next_level_refs else None
+
+        if level_up:
+            codes = await db_create_ref_promo_codes(referrer_id, new_level)
+            codes_text = "\n".join(f"<code>{c}</code>" for c in codes)
+            level_name = _ref_level_name(new_level)
+            discount = _ref_discount_pct(new_level)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 <b>Поздравляем! Вы достигли нового уровня!</b>\n\n"
+                    f"🏆 Ваш новый статус: <b>{level_name}</b>\n"
+                    f"💰 Ваша скидка на заказы: <b>{discount}%</b>\n\n"
+                    f"🎟️ Вам начислено <b>{REFERRAL_PROMOS_PER_LEVELUP} промокода</b> "
+                    f"на скидку {discount}%:\n{codes_text}\n\n"
+                    f"Промокоды доступны в разделе «Мои промокоды». "
+                    f"Каждый промокод — на один заказ.\n"
+                    f"<i>Не действует на Telegram Stars.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить о повышении уровня {referrer_id}: {e}")
+        else:
+            progress = f"\nДо следующего уровня: ещё <b>{refs_left}</b> реферал(ов)." if refs_left else ""
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"✅ <b>+1 реферал засчитан!</b>\n\n"
+                    f"Ваш приглашённый совершил первую покупку.\n"
+                    f"Всего рефералов: <b>{ref_count}</b>.{progress}",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
 
     try:
         old = call.message.text or call.message.caption or ""
@@ -3924,10 +4173,19 @@ async def cb_promo_detail(call: CallbackQuery) -> None:
         ])
     else:
         text += "✅ <b>Промокод активен!</b> Воспользуйтесь предложением ниже."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛒 Воспользоваться предложением", callback_data=f"use_promo_confirm:{promo_id}")],
-            [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
-        ])
+        if promo.get("game") == "ref_discount":
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🎯 Применить скидку к следующей покупке",
+                    callback_data=f"activate_ref_promo:{promo_id}",
+                )],
+                [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+            ])
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛒 Воспользоваться предложением", callback_data=f"use_promo_confirm:{promo_id}")],
+                [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+            ])
 
     await send_or_edit(call, text, kb)
 
@@ -4134,6 +4392,97 @@ async def msg_mod_reply(message: Message, state: FSMContext) -> None:
 
 
 # =====================================================================
+# Реферальная программа — пользовательские callback'и
+# =====================================================================
+
+
+@dp.callback_query(F.data == "referral_info")
+async def cb_referral_info(call: CallbackQuery) -> None:
+    await call.answer()
+    user_row = await db_get_or_create_user(call.from_user)
+    level = user_row.get("referral_level", 0)
+    ref_count = user_row.get("referral_count", 0)
+    ref_code = user_row.get("referral_code") or ""
+    discount = _ref_discount_pct(level)
+    level_name = _ref_level_name(level)
+
+    # Ссылка вида https://t.me/BOTNAME?start=ref_CODE
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{ref_code}"
+
+    next_level = level + 1
+    if next_level <= 5:
+        next_refs_needed = next_level * REFERRAL_REFS_PER_LEVEL
+        refs_left = next_refs_needed - ref_count
+        next_level_name, next_discount = REFERRAL_LEVELS[next_level]
+        progress_text = (
+            f"\n📈 До уровня <b>{next_level_name}</b>: ещё <b>{refs_left}</b> реферал(ов)"
+        )
+    else:
+        progress_text = "\n🏆 Максимальный уровень достигнут!"
+
+    text = (
+        "<b>👥 Реферальная программа</b>\n\n"
+        f"Ваш статус: <b>{level_name}</b>\n"
+        f"Рефералов засчитано: <b>{ref_count}</b>\n"
+        f"Ваша скидка на заказы: <b>{discount}%</b>{' (не действует на Telegram Stars)' if discount else ''}\n"
+        f"{progress_text}\n\n"
+        f"🔗 Ваша реферальная ссылка:\n<code>{ref_link}</code>\n\n"
+        "<b>Как это работает:</b>\n"
+        "1. Поделитесь ссылкой с друзьями\n"
+        "2. Когда приглашённый совершит первую покупку — вам засчитается реферал\n"
+        "3. Каждые 2 реферала — новый уровень с бонусными промокодами на скидку\n\n"
+        "<b>Уровни:</b>\n"
+    )
+    for lvl, (name, disc) in REFERRAL_LEVELS.items():
+        refs = lvl * REFERRAL_REFS_PER_LEVEL
+        current = " ← <b>Вы здесь</b>" if lvl == level else ""
+        text += f"• {name} — {refs} реф., скидка {disc}%{current}\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Мои промокоды", callback_data="my_promos")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("activate_ref_promo:"))
+async def cb_activate_ref_promo(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo or promo.get("game") != "ref_discount":
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+    if not user_promo or user_promo.get("used_at") is not None:
+        await call.answer("Промокод уже использован или недоступен.", show_alert=True)
+        return
+
+    await db_set_active_ref_promo(call.from_user.id, promo_id)
+
+    discount = promo.get("discount_pct", 0)
+    text = (
+        f"✅ <b>Скидка {discount}% активирована!</b>\n\n"
+        f"При следующей покупке (кроме Telegram Stars) скидка применится автоматически.\n\n"
+        f"Промокод: <code>{promo['code']}</code>\n"
+        f"Скидка действует на один заказ.\n\n"
+        f"Перейдите в меню и выберите товар."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 В магазин", callback_data="shop")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+# =====================================================================
 # Рассылка всем пользователям (только модератор)
 # =====================================================================
 
@@ -4194,24 +4543,6 @@ async def msg_broadcast(message: Message, state: FSMContext) -> None:
     )
 
 
-async def _health_server() -> None:
-    """Маленький HTTP-сервер для health-check на Render Web Service."""
-    from aiohttp import web
-
-    async def handle(request: web.Request) -> web.Response:
-        return web.Response(text="ok")
-
-    port = int(os.environ.get("PORT", 8000))
-    app = web.Application()
-    app.router.add_get("/", handle)
-    app.router.add_get("/health", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info("Health-check сервер запущен на порту %s", port)
-    await asyncio.Event().wait()
-
 # =====================================================================
 # Экспорт данных (только модератор)
 # =====================================================================
@@ -4219,14 +4550,17 @@ async def _health_server() -> None:
 
 @dp.message(Command("export"))
 async def cmd_export(message: Message) -> None:
+    """Команда /export — выгрузка всех данных магазина в CSV (только модератор)."""
     if not _is_moderator(message.from_user.id):
         return
 
     wait_msg = await message.answer("⏳ Собираю данные, подождите...")
+
     pool = await get_pool()
 
     users = await pool.fetch(
-        "SELECT tg_id, username, first_name, balance, is_blacklisted, created_at "
+        "SELECT tg_id, username, first_name, balance, is_blacklisted, "
+        "referral_level, referral_count, created_at "
         "FROM users ORDER BY tg_id"
     )
     orders = await pool.fetch(
@@ -4242,13 +4576,18 @@ async def cmd_export(message: Message) -> None:
     writer = csv.writer(output)
 
     writer.writerow(["=== ПОЛЬЗОВАТЕЛИ ==="])
-    writer.writerow(["tg_id", "username", "имя", "баланс (руб)", "в чёрном списке", "дата регистрации"])
+    writer.writerow([
+        "tg_id", "username", "имя", "баланс (руб)",
+        "реф. уровень", "реф. кол-во", "в чёрном списке", "дата регистрации",
+    ])
     for u in users:
         writer.writerow([
             u["tg_id"],
             u["username"] or "",
             u["first_name"] or "",
             u["balance"],
+            u["referral_level"] or 0,
+            u["referral_count"] or 0,
             "Да" if u["is_blacklisted"] else "Нет",
             _fmt_msk(u["created_at"]),
         ])
@@ -4297,6 +4636,27 @@ async def cmd_export(message: Message) -> None:
         ),
         parse_mode="HTML",
     )
+
+
+async def _health_server() -> None:
+    """Маленький HTTP-сервер для health-check на Render Web Service."""
+    from aiohttp import web
+
+    async def handle(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    port = int(os.environ.get("PORT", 8000))
+    app = web.Application()
+    app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("Health-check сервер запущен на порту %s", port)
+    await asyncio.Event().wait()
+
+
 async def main() -> None:
     _acquire_single_instance_lock()
     await db_init()
