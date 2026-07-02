@@ -4389,13 +4389,14 @@ async def msg_promo_discount_pct(message: Message, state: FSMContext) -> None:
     await state.set_state(PromoStates.waiting_dates)
     await message.answer(
         f"Скидка: <b>{pct}%</b>\n\n"
-        "📅 Введите <b>срок действия</b> промокода.\n"
-        "Только дата окончания: <code>31.12.2026</code>\n"
-        "Или диапазон: <code>01.07.2026 - 31.12.2026</code>\n"
-        "Или <code>без срока</code> для бессрочного.",
+        "📅 Введите <b>срок действия</b> промокода:\n\n"
+        "• Дата окончания: <code>31.12.2026</code>\n"
+        "• Диапазон дат: <code>01.07.2026 - 31.12.2026</code>\n"
+        "• Или нажмите кнопку ниже, если промокод бессрочный:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+            [InlineKeyboardButton(text="♾️ Бессрочно", callback_data="adm:promo_dates:forever")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
         ])
     )
 
