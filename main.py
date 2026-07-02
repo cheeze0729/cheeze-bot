@@ -219,7 +219,7 @@ ROBUX_INSTANT = [
 BRAWL_PRODUCTS = [
     ("bs_pass", "Brawl Pass", 899, "по согласованию через Telegram"),
     ("bs_pass_plus", "Brawl Pass Plus", 1239, "по согласованию через Telegram"),
-    ("bs_pro", "Pro Pass", 2199, "по согласованию через Telegram"),
+    ("bs_pro", "Pro Pass", 2249, "по согласованию через Telegram"),
 ]
 
 # =====================================================================
