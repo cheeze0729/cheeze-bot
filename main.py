@@ -205,21 +205,21 @@ LOGIN_HINTS = {
 # Структура: (ключ, "Название для кнопки/карточки", цена ₽, "способ выдачи")
 
 ROBUX_INSTANT = [
-    ("rb_40", "40 робуксов", 79, "моментально"),
+    ("rb_40", "40 робуксов", 59, "моментально"),
     ("rb_80", "80 робуксов", 99, "моментально"),
-    ("rb_200", "200 робуксов", 279, "моментально"),
-    ("rb_400", "400 робуксов", 459, "моментально"),
+    ("rb_200", "200 робуксов", 249, "моментально"),
+    ("rb_400", "400 робуксов", 449, "моментально"),
     ("rb_500", "500 робуксов", 499, "моментально"),
-    ("rb_1000", "1000 робуксов", 909, "моментально"),
-    ("rb_1700", "1700 робуксов", 1619, "моментально"),
-    ("rb_2000", "2000 робуксов", 1819, "моментально"),
-    ("rb_3600", "3600 робуксов", 3299, "моментально"),
+    ("rb_1000", "1000 робуксов", 879, "моментально"),
+    ("rb_1700", "1700 робуксов", 1499, "моментально"),
+    ("rb_2000", "2000 робуксов", 1699, "моментально"),
+    ("rb_3600", "3600 робуксов", 3099, "моментально"),
 ]
 
 BRAWL_PRODUCTS = [
-    ("bs_pass", "Brawl Pass", 899, "по согласованию через Telegram"),
-    ("bs_pass_plus", "Brawl Pass Plus", 1239, "по согласованию через Telegram"),
-    ("bs_pro", "Pro Pass", 2199, "по согласованию через Telegram"),
+    ("bs_pass", "Brawl Pass", 849, "по согласованию через Telegram"),
+    ("bs_pass_plus", "Brawl Pass Plus", 1149, "по согласованию через Telegram"),
+    ("bs_pro", "Pro Pass", 2099, "по согласованию через Telegram"),
 ]
 
 # =====================================================================
@@ -394,6 +394,33 @@ async def db_init() -> None:
                 UNIQUE(buyer_id)
             )
         """)
+        # Миграция: переводим денежные колонки в NUMERIC для поддержки копеек
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='users' AND column_name='balance' AND data_type='integer'
+                ) THEN
+                    ALTER TABLE users ALTER COLUMN balance TYPE NUMERIC(12,2)
+                        USING balance::NUMERIC(12,2);
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='transactions' AND column_name='amount' AND data_type='integer'
+                ) THEN
+                    ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(12,2)
+                        USING amount::NUMERIC(12,2);
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='orders' AND column_name='price' AND data_type='integer'
+                ) THEN
+                    ALTER TABLE orders ALTER COLUMN price TYPE NUMERIC(12,2)
+                        USING price::NUMERIC(12,2);
+                END IF;
+            END $$;
+        """)
 
 
 async def db_get_or_create_user(user) -> dict:
@@ -419,13 +446,13 @@ async def db_get_or_create_user(user) -> dict:
     return dict(row)
 
 
-async def db_get_balance(tg_id: int) -> int:
+async def db_get_balance(tg_id: int) -> float:
     pool = await get_pool()
     val = await pool.fetchval("SELECT balance FROM users WHERE tg_id = $1", tg_id)
-    return int(val) if val is not None else 0
+    return float(val) if val is not None else 0.0
 
 
-async def db_add_balance(tg_id: int, amount: int) -> int:
+async def db_add_balance(tg_id: int, amount: float) -> float:
     pool = await get_pool()
     await pool.execute(
         "UPDATE users SET balance = balance + $1 WHERE tg_id = $2",
@@ -434,7 +461,7 @@ async def db_add_balance(tg_id: int, amount: int) -> int:
     return await db_get_balance(tg_id)
 
 
-async def db_try_charge(tg_id: int, amount: int) -> bool:
+async def db_try_charge(tg_id: int, amount: float) -> bool:
     """Списывает amount с баланса, если денег достаточно. Возвращает True/False."""
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -443,7 +470,7 @@ async def db_try_charge(tg_id: int, amount: int) -> bool:
                 "SELECT balance FROM users WHERE tg_id = $1 FOR UPDATE",
                 tg_id,
             )
-            if not row or row["balance"] < amount:
+            if not row or float(row["balance"]) < amount:
                 return False
             await conn.execute(
                 "UPDATE users SET balance = balance - $1 WHERE tg_id = $2",
@@ -455,7 +482,7 @@ async def db_try_charge(tg_id: int, amount: int) -> bool:
 async def db_create_order(
     tg_id: int,
     title: str,
-    price: int,
+    price: float,
     status: str = "Оплачен",
     category: str | None = None,
 ) -> int:
@@ -543,7 +570,7 @@ async def db_has_review(order_id: int) -> bool:
 
 
 async def db_add_transaction(
-    tg_id: int, amount: int, kind: str, reason: str | None = None
+    tg_id: int, amount: float, kind: str, reason: str | None = None
 ) -> None:
     """Записывает движение по балансу. amount: +начисление / -списание."""
     pool = await get_pool()
@@ -567,7 +594,7 @@ async def db_get_transactions(tg_id: int, limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def db_set_balance(tg_id: int, value: int) -> int:
+async def db_set_balance(tg_id: int, value: float) -> float:
     pool = await get_pool()
     await pool.execute(
         "UPDATE users SET balance = $1 WHERE tg_id = $2",
@@ -673,35 +700,6 @@ async def db_list_promos() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def db_list_regular_promos() -> list[dict]:
-    """Возвращает только обычные промокоды (без реферальных ref_discount)."""
-    pool = await get_pool()
-    rows = await pool.fetch(
-        "SELECT * FROM promo_codes WHERE game != 'ref_discount' ORDER BY id DESC"
-    )
-    return [dict(r) for r in rows]
-
-
-async def db_delete_all_regular_promos() -> int:
-    """Удаляет все обычные промокоды (не реферальные) вместе с записями использования."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            ids = await conn.fetch(
-                "SELECT id FROM promo_codes WHERE game != 'ref_discount'"
-            )
-            if not ids:
-                return 0
-            id_list = [r["id"] for r in ids]
-            await conn.execute(
-                "DELETE FROM user_promos WHERE promo_id = ANY($1::int[])", id_list
-            )
-            result = await conn.execute(
-                "DELETE FROM promo_codes WHERE game != 'ref_discount'"
-            )
-            return int(result.split()[-1])
-
-
 async def db_delete_promo(promo_id: int) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -793,6 +791,14 @@ def _ref_discount_pct(level: int) -> int:
     return level * REFERRAL_DISCOUNT_PER_LEVEL
 
 
+def _fmt_price(p: float | int) -> str:
+    """Форматирует цену: без копеек если целое, с копейками если дробное."""
+    v = float(p)
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.2f}"
+
+
 async def db_get_user_by_ref_code(ref_code: str) -> dict | None:
     pool = await get_pool()
     row = await pool.fetchrow(
@@ -817,11 +823,12 @@ async def db_set_active_ref_promo(tg_id: int, promo_id: int | None) -> None:
     )
 
 
-async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int]:
+async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int, bool]:
     """
     Вызывается когда заказ покупателя выполнен модератором.
     Если покупатель был приглашён — засчитывает реферал пригласившему.
-    Возвращает: (referrer_id | None, level_up: bool, new_level: int)
+    Возвращает: (referrer_id | None, level_up: bool, new_level: int, is_first_purchase: bool)
+    is_first_purchase: True если первая покупка приглашённого (нужно выдать ему промокоды)
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -830,7 +837,7 @@ async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int]:
                 "SELECT referred_by FROM users WHERE tg_id = $1", buyer_id
             )
             if not buyer or not buyer["referred_by"]:
-                return None, False, 0
+                return None, False, 0, False
 
             referrer_id = buyer["referred_by"]
 
@@ -838,7 +845,7 @@ async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int]:
                 "SELECT 1 FROM referral_purchases WHERE buyer_id = $1", buyer_id
             )
             if exists:
-                return None, False, 0
+                return None, False, 0, False
 
             await conn.execute(
                 "INSERT INTO referral_purchases (buyer_id, referrer_id, created_at) "
@@ -853,7 +860,7 @@ async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int]:
                 referrer_id,
             )
             if not new_row:
-                return referrer_id, False, 0
+                return referrer_id, False, 0, True
 
             new_count = new_row["referral_count"]
             old_level = new_row["referral_level"]
@@ -866,7 +873,7 @@ async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int]:
                     new_level, referrer_id,
                 )
 
-            return referrer_id, level_up, new_level
+            return referrer_id, level_up, new_level, True
 
 
 async def db_admin_set_ref_level(tg_id: int, new_level: int) -> int:
@@ -964,6 +971,34 @@ async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
             logging.warning(f"Ошибка создания реферального промокода: {e}")
     return codes
 
+
+async def db_create_invite_promo_codes(buyer_id: int) -> list[str]:
+    """Создаёт 3 промокода на 5% скидку для приглашённого пользователя."""
+    INVITE_DISCOUNT = 5
+    pool = await get_pool()
+    codes: list[str] = []
+    now = datetime.now(timezone.utc).isoformat()
+    for _ in range(3):
+        code = "INV-" + secrets.token_urlsafe(6).upper()[:8]
+        try:
+            promo_id = await pool.fetchval(
+                "INSERT INTO promo_codes (code, game, product_title, promo_price, "
+                "discount_pct, is_active, created_at) "
+                "VALUES ($1, $2, $3, 0, $4, TRUE, $5) RETURNING id",
+                code,
+                "ref_discount",
+                "Скидка 5% на любой товар (не Telegram Stars)",
+                INVITE_DISCOUNT,
+                now,
+            )
+            await pool.execute(
+                "INSERT INTO user_promos (tg_id, promo_id, claimed_at) VALUES ($1, $2, $3)",
+                buyer_id, promo_id, now,
+            )
+            codes.append(code)
+        except Exception as e:
+            logging.warning(f"Ошибка создания инвайт промокода: {e}")
+    return codes
 
 
 # =====================================================================
@@ -1500,7 +1535,30 @@ async def handle_start(message: Message, state: FSMContext) -> None:
         ref_code = parts[1][4:]
         referrer = await db_get_user_by_ref_code(ref_code)
         if referrer and referrer["tg_id"] != message.from_user.id:
+            user_row = await db_get_or_create_user(message.from_user)
+            already_referred = user_row.get("referred_by") is not None
             await db_set_referred_by(message.from_user.id, referrer["tg_id"])
+            # Выдаём 3 INV-промокода только при первом входе по реф. ссылке
+            if not already_referred:
+                invite_codes = await db_create_invite_promo_codes(message.from_user.id)
+                if invite_codes:
+                    codes_text = "\n".join(f"<code>{c}</code>" for c in invite_codes)
+                    try:
+                        await message.answer(
+                            f"🎁 <b>Добро пожаловать! Вам начислены промокоды.</b>\n\n"
+                            f"Вы перешли по реферальной ссылке и получили "
+                            f"<b>3 промокода</b> на скидку <b>5%</b> на любой заказ:\n\n"
+                            f"{codes_text}\n\n"
+                            f"Активируйте промокод в разделе "
+                            f"<b>«Мои реф. промокоды»</b> перед покупкой.\n"
+                            f"<i>Не действует на Telegram Stars.</i>",
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            f"Не удалось уведомить нового реферала "
+                            f"{message.from_user.id}: {e}"
+                        )
 
     try:
         await message.answer_photo(
@@ -1771,18 +1829,25 @@ async def cb_other(call: CallbackQuery) -> None:
 async def perform_purchase(
     call: CallbackQuery,
     title: str,
-    price: int,
+    price: float,
     category: str | None = None,
     extra: dict | None = None,
     state: FSMContext | None = None,
 ) -> None:
-    """Списывает price с баланса и создаёт заказ."""
+    """Показывает экран подтверждения с итоговой ценой (с учётом реф. скидки).
+    Фактическое списание происходит в confirm_purchase."""
     await call.answer()
     user = call.from_user
     user_row = await db_get_or_create_user(user)
 
-    # Применяем активный реферальный промокод (если есть, и категория не tgstars)
-    discount_applied = 0
+    original_price = float(price)
+
+    # Автоматическая скидка по реферальному уровню (не для TG Stars)
+    level = (user_row.get("referral_level") or 0) if category != "tgstars" else 0
+    level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
+
+    # Скидка по активному реф. промокоду (для приглашённых пользователей)
+    promo_disc = 0
     applied_ref_promo_id = None
     if category != "tgstars":
         active_promo_id = user_row.get("active_ref_promo")
@@ -1796,68 +1861,135 @@ async def perform_purchase(
                     None,
                 )
                 if up:
-                    discount_applied = ref_promo["discount_pct"]
-                    price = max(1, round(price * (100 - discount_applied) / 100))
+                    promo_disc = ref_promo["discount_pct"]
                     applied_ref_promo_id = active_promo_id
-            await db_set_active_ref_promo(user.id, None)
 
-    ok = await db_try_charge(user.id, price)
-    if ok and state is not None:
-        await state.clear()
+    final_price = original_price * (1 - level_disc / 100) * (1 - promo_disc / 100)
+
+    if state is not None:
+        await state.update_data(
+            _pnd_title=title,
+            _pnd_final=final_price,
+            _pnd_orig=original_price,
+            _pnd_cat=category,
+            _pnd_extra=extra,
+            _pnd_ldsc=level_disc,
+            _pnd_pdsc=promo_disc,
+            _pnd_pid=applied_ref_promo_id,
+        )
+
+    balance = await db_get_balance(user.id)
+
+    if level_disc or promo_disc:
+        disc_parts = []
+        if level_disc:
+            disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
+        if promo_disc:
+            disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
+        price_block = (
+            f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+            + "\n".join(disc_parts) + "\n"
+            + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+        )
+    else:
+        price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
+
+    enough = balance >= final_price
+    text = (
+        "🛒 <b>Подтверждение оплаты</b>\n\n"
+        f"📦 {escape(title)}\n\n"
+        f"{price_block}\n"
+        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+        + ("✅ Баланса достаточно для оплаты." if enough
+           else "❌ Недостаточно средств на балансе!")
+    )
+    if enough:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить оплату",
+                                  callback_data="confirm_purchase")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data == "confirm_purchase")
+async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
+    """Выполняет покупку, данные которой сохранены в FSM perform_purchase."""
+    await call.answer()
+    data = await state.get_data()
+
+    title: str | None = data.get("_pnd_title")
+    final_price: float | None = data.get("_pnd_final")
+    original_price: float = data.get("_pnd_orig") or 0.0
+    category: str | None = data.get("_pnd_cat")
+    extra: dict | None = data.get("_pnd_extra")
+    level_disc: int = data.get("_pnd_ldsc") or 0
+    promo_disc: int = data.get("_pnd_pdsc") or 0
+    applied_ref_promo_id = data.get("_pnd_pid")
+
+    if not title or final_price is None:
+        await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+
+    user = call.from_user
+
+    ok = await db_try_charge(user.id, final_price)
     if not ok:
         balance = await db_get_balance(user.id)
         text = (
             "❌ <b>Недостаточно средств на балансе.</b>\n\n"
-            f"Сумма заказа: {price}₽\n"
-            f"Ваш баланс: {balance}₽\n\n"
+            f"Сумма заказа: {_fmt_price(final_price)}₽\n"
+            f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
             "Пополните баланс и повторите попытку."
         )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="💳 Пополнить баланс", callback_data="topup"
-                    )
-                ],
-                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-            ]
-        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
         await send_or_edit(call, text, kb)
-        await call.answer()
         return
 
-    order_id = await db_create_order(
-        user.id,
-        title,
-        price,
-        status="Оплачен",
-        category=category,
-    )
-    await db_add_transaction(
-        user.id,
-        -price,
-        kind="purchase",
-        reason=f"Заказ #{order_id}: {title}",
-    )
+    order_id = await db_create_order(user.id, title, final_price,
+                                     status="Оплачен", category=category)
+    await db_add_transaction(user.id, -final_price, kind="purchase",
+                             reason=f"Заказ #{order_id}: {title}")
+
     if applied_ref_promo_id:
         await db_use_promo(user.id, applied_ref_promo_id)
+        await db_set_active_ref_promo(user.id, None)
+
+    # Сбрасываем pending-данные, оставляем прочее состояние FSM
+    await state.update_data(
+        _pnd_title=None, _pnd_final=None, _pnd_orig=None,
+        _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
+        _pnd_pdsc=None, _pnd_pid=None,
+    )
 
     new_balance = await db_get_balance(user.id)
     login_hint = LOGIN_HINTS.get(category) if category else None
     needs_code = category in ("roblox_instant", "brawl")
     login_label = "🔐 Отправить данные для входа"
-    discount_line = (
-        f"🎫 Реферальная скидка: <b>-{discount_applied}%</b>\n"
-        if discount_applied else ""
-    )
+
+    disc_line = ""
+    if level_disc:
+        disc_line += f"🏆 Скидка реф. уровень: <b>-{level_disc}%</b>\n"
+    if promo_disc:
+        disc_line += f"🎟️ Промокод: <b>-{promo_disc}%</b>\n"
+    if disc_line and original_price != final_price:
+        disc_line += f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
 
     text = (
         "✅ <b>Оплата прошла успешно. Заказ принят в обработку.</b>\n\n"
         f"🧾 Номер заказа: <code>#{order_id}</code>\n"
         f"🎁 Товар: {escape(title)}\n"
-        f"{discount_line}"
-        f"💰 Сумма: <b>{price}₽</b>\n"
-        f"💼 Остаток на балансе: <b>{new_balance}₽</b>\n\n"
+        f"{disc_line}"
+        f"💰 Сумма: <b>{_fmt_price(final_price)}₽</b>\n"
+        f"💼 Остаток на балансе: <b>{_fmt_price(new_balance)}₽</b>\n\n"
     )
 
     if category == "roblox_gamepass":
@@ -1865,9 +1997,7 @@ async def perform_purchase(
         if extra:
             gp_price = extra.get("gamepass_price")
             if gp_price:
-                text += (
-                    f"🎮 <b>Цена для создания геймпасса:</b> <b>{gp_price} R$</b>\n\n"
-                )
+                text += f"🎮 <b>Цена для создания геймпасса:</b> <b>{gp_price} R$</b>\n\n"
         text += (
             "🔗 Создайте геймпасс на указанную сумму и нажмите "
             "«Отправить ссылку на геймпасс» — пришлите ссылку одним "
@@ -1910,45 +2040,32 @@ async def perform_purchase(
     await call.answer("Заказ создан")
 
     username = f"@{user.username}" if user.username else "—"
-
-    admin_rows = [
-        [
-            InlineKeyboardButton(
-                text="✅ Завершить заказ",
-                callback_data=f"ordone:{order_id}:{user.id}",
-            )
-        ],
+    admin_rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="✅ Завершить заказ",
+                              callback_data=f"ordone:{order_id}:{user.id}")],
     ]
-
     if category == "roblox_gamepass" and extra:
         gp_price = int(extra.get("gamepass_price", 0))
         if gp_price > 0:
-            admin_rows.insert(
-                0,
-                [
-                    InlineKeyboardButton(
-                        text="🎮 Попросить изменить цену геймпасса",
-                        callback_data=f"gpfix:{order_id}:{user.id}:{gp_price}",
-                    )
-                ],
-            )
+            admin_rows.insert(0, [InlineKeyboardButton(
+                text="🎮 Попросить изменить цену геймпасса",
+                callback_data=f"gpfix:{order_id}:{user.id}:{gp_price}",
+            )])
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=admin_rows)
-
+    disc_note = f" (скидка {level_disc + promo_disc}%)" if level_disc or promo_disc else ""
     admin_text = (
         f"🆕 <b>Новый заказ #{order_id}</b>\n\n"
         f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
         f"Telegram ID: <code>{user.id}</code>\n"
         f"Товар: {escape(title)}\n"
-        f"Сумма: {price}₽\n"
+        f"Сумма: {_fmt_price(final_price)}₽{disc_note}\n"
         f"Статус: Оплачен"
     )
-
     if category == "roblox_gamepass" and extra:
         gp_price = extra.get("gamepass_price")
         if gp_price:
             admin_text += f"\nЦена геймпасса: <b>{gp_price} R$</b> (допуск ±5 R$)"
-
     await notify_moderator(admin_text, reply_markup=admin_kb)
 
 
@@ -2550,7 +2667,7 @@ async def cb_topup_admin_confirm(call: CallbackQuery) -> None:
     try:
         old = call.message.text or call.message.caption or ""
         await call.message.edit_text(
-            f"{old}\n\n✅ <b>Подтверждено.</b> Баланс пользователя: {new_balance}₽",
+            f"{old}\n\n✅ <b>Подтверждено.</b> Баланс пользователя: {_fmt_price(new_balance)}₽",
             parse_mode="HTML",
         )
     except Exception:
@@ -2565,8 +2682,8 @@ async def cb_topup_admin_confirm(call: CallbackQuery) -> None:
         )
         await bot.send_message(
             target_id,
-            f"✅ <b>Баланс пополнен на {amount}₽</b>\n\n"
-            f"Текущий баланс: <b>{new_balance}₽</b>",
+            f"✅ <b>Баланс пополнен на {_fmt_price(amount)}₽</b>\n\n"
+            f"Текущий баланс: <b>{_fmt_price(new_balance)}₽</b>",
             parse_mode="HTML",
             reply_markup=user_kb,
         )
@@ -2634,7 +2751,8 @@ async def cb_order_done(call: CallbackQuery) -> None:
     await db_set_order_status(order_id, "Выполнен")
 
     # Обработка реферальной программы
-    referrer_id, level_up, new_level = await db_process_referral(target_id)
+    referrer_id, level_up, new_level, _ = await db_process_referral(target_id)
+
     if referrer_id:
         ref_row = await db_find_user(referrer_id)
         ref_count = ref_row["referral_count"] if ref_row else 0
@@ -2642,8 +2760,6 @@ async def cb_order_done(call: CallbackQuery) -> None:
         refs_left = (next_level_refs - ref_count) if next_level_refs else None
 
         if level_up:
-            codes = await db_create_ref_promo_codes(referrer_id, new_level)
-            codes_text = "\n".join(f"<code>{c}</code>" for c in codes)
             level_name = _ref_level_name(new_level)
             discount = _ref_discount_pct(new_level)
             try:
@@ -2651,11 +2767,8 @@ async def cb_order_done(call: CallbackQuery) -> None:
                     referrer_id,
                     f"🎉 <b>Поздравляем! Вы достигли нового уровня!</b>\n\n"
                     f"🏆 Ваш новый статус: <b>{level_name}</b>\n"
-                    f"💰 Ваша скидка на заказы: <b>{discount}%</b>\n\n"
-                    f"🎟️ Вам начислено <b>{REFERRAL_PROMOS_PER_LEVELUP} промокода</b> "
-                    f"на скидку {discount}%:\n{codes_text}\n\n"
-                    f"Промокоды доступны в разделе «Мои промокоды». "
-                    f"Каждый промокод — на один заказ.\n"
+                    f"💰 Скидка на все заказы: <b>{discount}%</b>\n\n"
+                    f"Скидка применяется автоматически при каждой покупке.\n"
                     f"<i>Не действует на Telegram Stars.</i>",
                     parse_mode="HTML",
                 )
@@ -3520,8 +3633,8 @@ async def msg_adm_credit(message: Message, state: FSMContext) -> None:
     try:
         await bot.send_message(
             target_id,
-            f"✅ <b>Администратор начислил вам {amount}₽</b>\n"
-            f"Текущий баланс: <b>{new_balance}₽</b>",
+            f"✅ <b>Администратор начислил вам {_fmt_price(amount)}₽</b>\n"
+            f"Текущий баланс: <b>{_fmt_price(new_balance)}₽</b>",
             parse_mode="HTML",
         )
     except Exception:
@@ -3529,7 +3642,7 @@ async def msg_adm_credit(message: Message, state: FSMContext) -> None:
     from_list_page = saved_source if saved_source is not None else None
     from_list_page = int(from_list_page) if from_list_page is not None else None
     await message.answer(
-        f"✅ Начислено {amount}₽. Новый баланс: <b>{new_balance}₽</b>",
+        f"✅ Начислено {_fmt_price(amount)}₽. Новый баланс: <b>{_fmt_price(new_balance)}₽</b>",
         parse_mode="HTML",
         reply_markup=kb_admin_user(
             target_id,
@@ -3736,59 +3849,36 @@ async def cb_adm_set_ref_level(call: CallbackQuery, state: FSMContext) -> None:
     level_name = _ref_level_name(new_level)
     discount = _ref_discount_pct(new_level)
 
-    promo_codes: list[str] = []
     if new_level > old_level:
-        # Генерируем промокоды за каждый новый уровень
-        for lvl in range(old_level + 1, new_level + 1):
-            codes = await db_create_ref_promo_codes(target_id, lvl)
-            promo_codes.extend(codes)
-
-        # Уведомляем пользователя
-        if promo_codes:
-            codes_text = "\n".join(f"<code>{c}</code>" for c in promo_codes)
-            try:
-                await bot.send_message(
-                    target_id,
-                    f"🎉 <b>Вам выдан новый реферальный статус!</b>\n\n"
-                    f"🏆 Ваш статус: <b>{level_name}</b>\n"
-                    f"💰 Скидка на заказы: <b>{discount}%</b>\n\n"
-                    f"🎟️ Ваши промокоды на скидку:\n{codes_text}\n\n"
-                    f"Доступны в разделе «Мои промокоды».\n"
-                    f"<i>Не действует на Telegram Stars.</i>",
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logging.warning(f"Не удалось уведомить {target_id} о новом уровне: {e}")
-        else:
-            try:
-                await bot.send_message(
-                    target_id,
-                    f"🎉 <b>Вам выдан реферальный статус!</b>\n\n"
-                    f"🏆 Ваш статус: <b>{level_name}</b>\n"
-                    f"💰 Скидка на заказы: <b>{discount}%</b>\n\n"
-                    f"<i>Не действует на Telegram Stars.</i>",
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logging.warning(f"Не удалось уведомить {target_id}: {e}")
+        try:
+            await bot.send_message(
+                target_id,
+                f"🎉 <b>Вам выдан новый реферальный статус!</b>\n\n"
+                f"🏆 Ваш статус: <b>{level_name}</b>\n"
+                f"💰 Скидка на все заказы: <b>{discount}%</b>\n\n"
+                f"Скидка применяется автоматически при каждой покупке.\n"
+                f"<i>Не действует на Telegram Stars.</i>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить {target_id} о новом уровне: {e}")
     elif new_level < old_level:
-        old_name = _ref_level_name(old_level)
         try:
             await bot.send_message(
                 target_id,
                 f"ℹ️ Ваш реферальный статус изменён.\n\n"
-                f"Новый статус: <b>{level_name}</b>",
+                f"Новый статус: <b>{level_name}</b>\n"
+                f"💰 Скидка на все заказы: <b>{discount}%</b>",
                 parse_mode="HTML",
             )
         except Exception:
             pass
 
-    promo_info = f"\nВыдано промокодов: <b>{len(promo_codes)}</b>" if promo_codes else ""
     action = "повышен" if new_level > old_level else ("понижен" if new_level < old_level else "не изменён")
     text = (
         f"✅ <b>Статус {action}.</b>\n\n"
         f"Пользователь: <code>{target_id}</code>\n"
-        f"Новый статус: <b>{level_name}</b> (ур. {new_level}){promo_info}"
+        f"Новый статус: <b>{level_name}</b> (ур. {new_level})"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎟️ Реф. промокоды", callback_data=f"adm:ref_promos:{target_id}")],
@@ -4006,8 +4096,6 @@ def kb_admin_promos(promos: list[dict]) -> InlineKeyboardMarkup:
             )
         ])
     rows.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="adm:promo_create")])
-    if promos:
-        rows.append([InlineKeyboardButton(text="🗑️ Удалить все промокоды", callback_data="adm:del_all_promos")])
     rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -4041,29 +4129,13 @@ async def cb_adm_promos(call: CallbackQuery, state: FSMContext) -> None:
     if not _is_moderator(call.from_user.id):
         return
     await state.clear()
-    promos = await db_list_regular_promos()
+    promos = await db_list_promos()
     text = "<b>🎟️ Промокоды</b>\n\n"
     if promos:
         text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления."
     else:
         text += "Промокодов пока нет. Создайте первый!"
     await send_or_edit(call, text, kb_admin_promos(promos))
-
-
-@dp.callback_query(F.data == "adm:del_all_promos")
-async def cb_adm_del_all_promos(call: CallbackQuery) -> None:
-    """Модератор удаляет все обычные промокоды разом."""
-    await call.answer()
-    if not _is_moderator(call.from_user.id):
-        return
-    deleted = await db_delete_all_regular_promos()
-    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
-    text = (
-        "<b>🎟️ Промокоды</b>\n\n"
-        f"✅ Удалено промокодов: <b>{deleted}</b>\n\n"
-        "Промокодов пока нет. Создайте первый!"
-    )
-    await send_or_edit(call, text, kb_admin_promos([]))
 
 
 @dp.callback_query(F.data == "adm:promo_create")
@@ -4402,9 +4474,9 @@ async def cb_adm_promo_del_yes(call: CallbackQuery) -> None:
         return
     await db_delete_promo(promo_id)
     await call.answer("Промокод удалён.", show_alert=True)
-    promos = await db_list_regular_promos()
+    promos = await db_list_promos()
     text = "<b>🎟️ Промокоды</b>\n\n"
-    text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления." if promos else "Промокодов пока нет. Создайте первый!"
+    text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления." if promos else "Промокодов пока нет."
     await send_or_edit(call, text, kb_admin_promos(promos))
 
 
@@ -4615,15 +4687,15 @@ async def cb_use_promo_confirm(call: CallbackQuery) -> None:
         return
 
     balance = await db_get_balance(call.from_user.id)
-    price = promo["promo_price"]
+    price = float(promo["promo_price"])
 
     text = (
         "<b>🛒 Подтверждение покупки по промокоду</b>\n\n"
         f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
         f"📦 Товар: {escape(promo['product_title'])}\n"
-        f"💰 Сумма: <b>{price}₽</b>\n"
-        f"💼 Ваш баланс: <b>{balance}₽</b>\n\n"
+        f"💰 Сумма: <b>{_fmt_price(price)}₽</b>\n"
+        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
         "Оплата спишется с внутреннего баланса бота.\n"
         "Подтвердите покупку:"
     )
@@ -4659,7 +4731,7 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         return
 
     user = call.from_user
-    price = promo["promo_price"]
+    price = float(promo["promo_price"])
     title = f"[Промокод {promo['code']}] {promo['game']} — {promo['product_title']}"
 
     ok = await db_try_charge(user.id, price)
@@ -4667,8 +4739,8 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         balance = await db_get_balance(user.id)
         text = (
             "❌ <b>Недостаточно средств на балансе.</b>\n\n"
-            f"Сумма заказа: {price}₽\n"
-            f"Ваш баланс: {balance}₽\n\n"
+            f"Сумма заказа: {_fmt_price(price)}₽\n"
+            f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
             "Пополните баланс и повторите попытку."
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -4689,8 +4761,8 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
         f"📦 Товар: {escape(promo['product_title'])}\n"
-        f"💰 Сумма: <b>{price}₽</b>\n"
-        f"💼 Остаток на балансе: <b>{new_balance}₽</b>\n\n"
+        f"💰 Сумма: <b>{_fmt_price(price)}₽</b>\n"
+        f"💼 Остаток на балансе: <b>{_fmt_price(new_balance)}₽</b>\n\n"
         "С вами свяжется модератор. Вы также можете написать первым."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -4708,7 +4780,7 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
         f"📦 Товар: {escape(promo['product_title'])}\n"
-        f"💰 Сумма: <b>{price}₽</b>"
+        f"💰 Сумма: <b>{_fmt_price(price)}₽</b>"
     )
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"✅ Выполнен #{order_id}", callback_data=f"mod:done:{order_id}")],
