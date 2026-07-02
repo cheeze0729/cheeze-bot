@@ -5009,18 +5009,16 @@ async def cb_mod_done(call: CallbackQuery) -> None:
     tg_id = order["tg_id"]
     await db_update_order_status(order_id, "Выполнен")
 
-    ref_result = await db_process_referral(tg_id, order_id)
-    if ref_result:
-        referrer_id, level_up, new_level, is_first = ref_result
-        if is_first and referrer_id:
-            try:
-                await bot.send_message(
-                    referrer_id,
-                    f"🎉 По вашей реферальной ссылке совершена первая покупка!\n"
-                    f"{'📈 Ваш уровень повышен до ' + str(new_level) + '!' if level_up else ''}",
-                )
-            except Exception:
-                pass
+    referrer_id, level_up, new_level, is_first = await db_process_referral(tg_id)
+    if is_first and referrer_id:
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎉 По вашей реферальной ссылке совершена первая покупка!\n"
+                f"{'📈 Ваш уровень повышен до ' + str(new_level) + '!' if level_up else ''}",
+            )
+        except Exception:
+            pass
 
     try:
         await bot.send_message(
