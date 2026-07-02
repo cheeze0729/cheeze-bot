@@ -4293,11 +4293,10 @@ async def cb_adm_promo_type(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     if not _is_moderator(call.from_user.id):
         return
-    current_state = await state.get_state()
-    if current_state != PromoStates.waiting_discount_type.state:
+    data = await state.get_data()
+    if not data.get("promo_code"):
         return
     promo_type = call.data.split(":")[2]
-    data = await state.get_data()
     code = data.get("promo_code", "?")
 
     if promo_type == "pct":
@@ -4318,7 +4317,7 @@ async def cb_adm_promo_type(call: CallbackQuery, state: FSMContext) -> None:
             call,
             f"Код: <code>{escape(code)}</code>\n\n"
             "🎮 Выберите <b>игру</b>, для которой действует промокод:",
-            reply_markup=kb_promo_game_select()
+            kb_promo_game_select()
         )
 
 
