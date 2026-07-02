@@ -514,6 +514,11 @@ async def db_get_order(order_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+async def db_update_order_status(order_id: int, status: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE orders SET status = $1 WHERE id = $2", status, order_id)
+
+
 async def db_set_order_contact(order_id: int, contact: str) -> None:
     pool = await get_pool()
     await pool.execute(
@@ -665,14 +670,16 @@ async def db_create_promo(
     promo_price: int,
     starts_at: str | None = None,
     expires_at: str | None = None,
+    discount_pct: int = 0,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     pool = await get_pool()
     promo_id = await pool.fetchval(
-        "INSERT INTO promo_codes (code, game, product_title, promo_price, starts_at,"
-        " expires_at, is_active, created_at)"
-        " VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) RETURNING id",
-        code.upper(), game, product_title, promo_price, starts_at, expires_at, now,
+        "INSERT INTO promo_codes (code, game, product_title, promo_price, discount_pct,"
+        " starts_at, expires_at, is_active, created_at)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8) RETURNING id",
+        code.upper(), game, product_title, promo_price, discount_pct,
+        starts_at, expires_at, now,
     )
     return promo_id
 
@@ -942,6 +949,47 @@ async def db_delete_all_user_regular_promos(tg_id: int) -> int:
     return int(result.split()[-1])
 
 
+async def db_delete_all_used_user_promos(tg_id: int) -> int:
+    """Удаляет только ИСПОЛЬЗОВАННЫЕ обычные промокоды из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos "
+        "WHERE tg_id = $1 AND used_at IS NOT NULL AND promo_id IN "
+        "(SELECT id FROM promo_codes WHERE game != 'ref_discount')",
+        tg_id,
+    )
+    return int(result.split()[-1])
+
+
+async def db_list_regular_promos() -> list[dict]:
+    """Возвращает только обычные промокоды (без реферальных ref_discount)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM promo_codes WHERE game NOT IN ('ref_discount') ORDER BY id DESC"
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_delete_all_regular_promos() -> int:
+    """Удаляет все обычные промокоды (не реферальные) вместе с записями использования."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            ids = await conn.fetch(
+                "SELECT id FROM promo_codes WHERE game NOT IN ('ref_discount')"
+            )
+            if not ids:
+                return 0
+            id_list = [r["id"] for r in ids]
+            await conn.execute(
+                "DELETE FROM user_promos WHERE promo_id = ANY($1::int[])", id_list
+            )
+            result = await conn.execute(
+                "DELETE FROM promo_codes WHERE game NOT IN ('ref_discount')"
+            )
+            return int(result.split()[-1])
+
+
 async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
     """Создаёт 3 промокода на скидку при повышении уровня."""
     discount = level * REFERRAL_DISCOUNT_PER_LEVEL
@@ -1033,8 +1081,10 @@ class AdminStates(StatesGroup):
 
 class PromoStates(StatesGroup):
     waiting_code_input = State()
+    waiting_discount_type = State()
     waiting_product = State()
     waiting_price = State()
+    waiting_discount_pct = State()
     waiting_dates = State()
 
 
@@ -1492,16 +1542,32 @@ async def show_section(
 
 async def notify_moderator(
     text: str, reply_markup: InlineKeyboardMarkup | None = None
-) -> None:
+) -> "Message | None":
     """Отправляет уведомление модератору, если задан MODERATOR_CHAT_ID."""
     if not MODERATOR_CHAT_ID:
-        return
+        return None
     try:
-        await bot.send_message(
+        return await bot.send_message(
             MODERATOR_CHAT_ID, text, parse_mode="HTML", reply_markup=reply_markup
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить модератора: {e}")
+        return None
+
+
+async def notify_moderator_order(
+    text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    """Отправляет уведомление модератору о заказе и закрепляет сообщение."""
+    msg = await notify_moderator(text, reply_markup=reply_markup)
+    if msg is None:
+        return
+    try:
+        await bot.pin_chat_message(
+            msg.chat.id, msg.message_id, disable_notification=True
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось закрепить сообщение модератора: {e}")
 
 
 def parse_positive_int(text: str) -> int | None:
@@ -1842,15 +1908,27 @@ async def perform_purchase(
 
     original_price = float(price)
 
-    # Автоматическая скидка по реферальному уровню (не для TG Stars)
-    level = (user_row.get("referral_level") or 0) if category != "tgstars" else 0
+    # Скидка по активному реф./pct промокоду (для приглашённых пользователей)
+    # Проверяем тип заранее, чтобы не применять level_disc вместе с pct_discount
+    _active_promo_id_check = user_row.get("active_ref_promo") if category != "tgstars" else None
+    _active_promo_for_check = (
+        await db_get_promo_by_id(_active_promo_id_check)
+        if _active_promo_id_check else None
+    )
+    _has_active_pct = (
+        _active_promo_for_check is not None
+        and _active_promo_for_check.get("game") == "pct_discount"
+        and _active_promo_for_check.get("discount_pct", 0) > 0
+    )
+
+    # Автоматическая скидка по реферальному уровню (не для TG Stars, не если активен pct_discount)
+    level = (user_row.get("referral_level") or 0) if (category != "tgstars" and not _has_active_pct) else 0
     level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
 
-    # Скидка по активному реф. промокоду (для приглашённых пользователей)
     promo_disc = 0
     applied_ref_promo_id = None
     if category != "tgstars":
-        active_promo_id = user_row.get("active_ref_promo")
+        active_promo_id = _active_promo_id_check
         if active_promo_id:
             ref_promo = await db_get_promo_by_id(active_promo_id)
             if ref_promo and ref_promo.get("discount_pct", 0) > 0:
@@ -2043,6 +2121,8 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     admin_rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="✅ Завершить заказ",
                               callback_data=f"ordone:{order_id}:{user.id}")],
+        [InlineKeyboardButton(text="💸 Возврат",
+                              callback_data=f"mod:refund:{order_id}")],
     ]
     if category == "roblox_gamepass" and extra:
         gp_price = int(extra.get("gamepass_price", 0))
@@ -2066,7 +2146,7 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
         gp_price = extra.get("gamepass_price")
         if gp_price:
             admin_text += f"\nЦена геймпасса: <b>{gp_price} R$</b> (допуск ±5 R$)"
-    await notify_moderator(admin_text, reply_markup=admin_kb)
+    await notify_moderator_order(admin_text, reply_markup=admin_kb)
 
 
 # --- Запрос данных для входа ---
@@ -4089,13 +4169,14 @@ def kb_admin_promos(promos: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for p in promos:
         icon = "✅" if p["is_active"] else "🔴"
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{icon} {p['code']} — {p['product_title']} ({p['promo_price']}₽)",
-                callback_data=f"adm:promo:{p['id']}",
-            )
-        ])
+        if p.get("discount_pct", 0) > 0 and p.get("promo_price", 0) == 0:
+            label = f"{icon} {p['code']} — скидка {p['discount_pct']}% ({p['product_title']})"
+        else:
+            label = f"{icon} {p['code']} — {p['product_title']} ({p['promo_price']}₽)"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"adm:promo:{p['id']}")])
     rows.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="adm:promo_create")])
+    if promos:
+        rows.append([InlineKeyboardButton(text="🗑️ Удалить все промокоды", callback_data="adm:del_all_promos")])
     rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -4129,13 +4210,28 @@ async def cb_adm_promos(call: CallbackQuery, state: FSMContext) -> None:
     if not _is_moderator(call.from_user.id):
         return
     await state.clear()
-    promos = await db_list_promos()
+    promos = await db_list_regular_promos()
     text = "<b>🎟️ Промокоды</b>\n\n"
     if promos:
         text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления."
     else:
         text += "Промокодов пока нет. Создайте первый!"
     await send_or_edit(call, text, kb_admin_promos(promos))
+
+
+@dp.callback_query(F.data == "adm:del_all_promos")
+async def cb_adm_del_all_promos(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    deleted = await db_delete_all_regular_promos()
+    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
+    text = (
+        "<b>🎟️ Промокоды</b>\n\n"
+        f"✅ Удалено промокодов: <b>{deleted}</b>\n\n"
+        "Промокодов пока нет. Создайте первый!"
+    )
+    await send_or_edit(call, text, kb_admin_promos([]))
 
 
 @dp.callback_query(F.data == "adm:promo_create")
@@ -4179,13 +4275,48 @@ async def msg_promo_code_input(message: Message, state: FSMContext) -> None:
         )
         return
     await state.update_data(promo_code=code)
-    await state.set_state(None)
+    await state.set_state(PromoStates.waiting_discount_type)
     await message.answer(
         f"Код: <code>{escape(code)}</code>\n\n"
-        "🎮 Выберите <b>игру</b>, для которой действует промокод:",
+        "📋 Выберите <b>тип промокода</b>:",
         parse_mode="HTML",
-        reply_markup=kb_promo_game_select()
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏷️ Фиксированная цена", callback_data="adm:promo_type:price")],
+            [InlineKeyboardButton(text="💸 Скидка %", callback_data="adm:promo_type:pct")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ])
     )
+
+
+@dp.callback_query(F.data.startswith("adm:promo_type:"), PromoStates.waiting_discount_type)
+async def cb_adm_promo_type(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    promo_type = call.data.split(":")[2]
+    data = await state.get_data()
+    code = data.get("promo_code", "?")
+
+    if promo_type == "pct":
+        await state.update_data(promo_game="pct_discount")
+        await state.set_state(PromoStates.waiting_product)
+        await send_or_edit(
+            call,
+            f"Код: <code>{escape(code)}</code>  |  Тип: <b>Скидка %</b>\n\n"
+            "📦 Введите <b>описание промокода</b>\n"
+            "Например: <code>Скидка на любой товар</code>",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+            ])
+        )
+    else:
+        await state.set_state(None)
+        await send_or_edit(
+            call,
+            f"Код: <code>{escape(code)}</code>\n\n"
+            "🎮 Выберите <b>игру</b>, для которой действует промокод:",
+            reply_markup=kb_promo_game_select()
+        )
 
 
 @dp.callback_query(F.data.startswith("adm:promo_game:"))
@@ -4218,14 +4349,50 @@ async def msg_promo_product(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Название товара не может быть пустым. Введите ещё раз.")
         return
     await state.update_data(promo_product=product)
-    await state.set_state(PromoStates.waiting_price)
     data = await state.get_data()
     code = data.get("promo_code", "?")
     game = data.get("promo_game", "?")
+
+    if game == "pct_discount":
+        await state.set_state(PromoStates.waiting_discount_pct)
+        await message.answer(
+            f"Код: <code>{escape(code)}</code>  |  Тип: <b>Скидка %</b>\n"
+            f"Описание: <b>{escape(product)}</b>\n\n"
+            "💸 Введите <b>размер скидки в процентах</b> (целое число, например: <code>10</code>):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+            ])
+        )
+    else:
+        await state.set_state(PromoStates.waiting_price)
+        await message.answer(
+            f"Код: <code>{escape(code)}</code>  |  Игра: <b>{escape(game)}</b>\n"
+            f"Товар: <b>{escape(product)}</b>\n\n"
+            "💰 Введите <b>цену по промокоду</b> (целое число в рублях, например: <code>150</code>):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+            ])
+        )
+
+
+@dp.message(PromoStates.waiting_discount_pct)
+async def msg_promo_discount_pct(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    pct = parse_positive_int(message.text)
+    if pct is None or pct > 99:
+        await message.answer("⚠️ Введите корректное значение от 1 до 99.")
+        return
+    await state.update_data(promo_discount_pct=pct)
+    await state.set_state(PromoStates.waiting_dates)
     await message.answer(
-        f"Код: <code>{escape(code)}</code>  |  Игра: <b>{escape(game)}</b>\n"
-        f"Товар: <b>{escape(product)}</b>\n\n"
-        "💰 Введите <b>цену по промокоду</b> (целое число в рублях, например: <code>150</code>):",
+        f"Скидка: <b>{pct}%</b>\n\n"
+        "📅 Введите <b>срок действия</b> промокода.\n"
+        "Только дата окончания: <code>31.12.2026</code>\n"
+        "Или диапазон: <code>01.07.2026 - 31.12.2026</code>\n"
+        "Или <code>без срока</code> для бессрочного.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
@@ -4309,17 +4476,28 @@ async def _save_promo_and_confirm(
     game = data.get("promo_game")
     product = data.get("promo_product")
     price = data.get("promo_price")
-    if not all([code, game, product, price]):
+    discount_pct = data.get("promo_discount_pct", 0)
+    is_pct = game == "pct_discount"
+    if not all([code, game, product]) or (not is_pct and not price):
         await send_or_edit(call, "❌ Ошибка: данные утеряны. Начните заново.", kb_admin_promos([]))
         return
-    promo_id = await db_create_promo(code, game, product, int(price), starts_at, expires_at)
+    promo_id = await db_create_promo(
+        code, game, product,
+        0 if is_pct else int(price),
+        starts_at, expires_at,
+        discount_pct=int(discount_pct) if is_pct else 0,
+    )
     dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    if is_pct:
+        detail_line = f"💸 Скидка: <b>{discount_pct}%</b>\n"
+    else:
+        detail_line = f"💰 Цена: <b>{price}₽</b>\n"
     text = (
         "✅ <b>Промокод создан!</b>\n\n"
         f"🎟️ Код: <code>{escape(code)}</code>\n"
-        f"🎮 Игра: {escape(game)}\n"
-        f"📦 Товар: {escape(product)}\n"
-        f"💰 Цена: <b>{price}₽</b>\n"
+        f"🎮 Тип: {escape(game)}\n"
+        f"📦 Описание: {escape(product)}\n"
+        f"{detail_line}"
         f"📅 Срок: {dates_str}\n"
         f"🆔 ID: {promo_id}"
     )
@@ -4340,17 +4518,28 @@ async def _save_promo_and_confirm_msg(
     game = data.get("promo_game")
     product = data.get("promo_product")
     price = data.get("promo_price")
-    if not all([code, game, product, price]):
+    discount_pct = data.get("promo_discount_pct", 0)
+    is_pct = game == "pct_discount"
+    if not all([code, game, product]) or (not is_pct and not price):
         await message.answer("❌ Ошибка: данные утеряны. Начните заново.")
         return
-    promo_id = await db_create_promo(code, game, product, int(price), starts_at, expires_at)
+    promo_id = await db_create_promo(
+        code, game, product,
+        0 if is_pct else int(price),
+        starts_at, expires_at,
+        discount_pct=int(discount_pct) if is_pct else 0,
+    )
     dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    if is_pct:
+        detail_line = f"💸 Скидка: <b>{discount_pct}%</b>\n"
+    else:
+        detail_line = f"💰 Цена: <b>{price}₽</b>\n"
     text = (
         "✅ <b>Промокод создан!</b>\n\n"
         f"🎟️ Код: <code>{escape(code)}</code>\n"
-        f"🎮 Игра: {escape(game)}\n"
-        f"📦 Товар: {escape(product)}\n"
-        f"💰 Цена: <b>{price}₽</b>\n"
+        f"🎮 Тип: {escape(game)}\n"
+        f"📦 Описание: {escape(product)}\n"
+        f"{detail_line}"
         f"📅 Срок: {dates_str}\n"
         f"🆔 ID: {promo_id}"
     )
@@ -4474,7 +4663,7 @@ async def cb_adm_promo_del_yes(call: CallbackQuery) -> None:
         return
     await db_delete_promo(promo_id)
     await call.answer("Промокод удалён.", show_alert=True)
-    promos = await db_list_promos()
+    promos = await db_list_regular_promos()
     text = "<b>🎟️ Промокоды</b>\n\n"
     text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления." if promos else "Промокодов пока нет."
     await send_or_edit(call, text, kb_admin_promos(promos))
@@ -4585,10 +4774,13 @@ async def cb_my_promos(call: CallbackQuery) -> None:
             icon = "✅"
         else:
             icon = "🔴"
-        label = f"{icon} {up['code']} — {up['product_title']} ({up['promo_price']}₽)"
+        if up.get("game") == "pct_discount" and up.get("discount_pct", 0) > 0:
+            label = f"{icon} {up['code']} — скидка {up['discount_pct']}% ({up['product_title']})"
+        else:
+            label = f"{icon} {up['code']} — {up['product_title']} ({up['promo_price']}₽)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"promo_detail:{up['promo_id']}")])
 
-    rows.append([InlineKeyboardButton(text="🗑️ Удалить все", callback_data="del_all_my_promos")])
+    rows.append([InlineKeyboardButton(text="🗑️ Удалить использованные", callback_data="del_all_my_promos")])
     rows.append([InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")])
     rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")])
 
@@ -4625,11 +4817,17 @@ async def cb_promo_detail(call: CallbackQuery) -> None:
     valid_now = _promo_is_valid_now(promo)
     dates_str = _fmt_promo_dates(promo)
 
+    is_pct_type = promo.get("game") == "pct_discount"
+    if is_pct_type and promo.get("discount_pct", 0) > 0:
+        price_line = f"💸 Скидка: <b>{promo['discount_pct']}%</b>\n"
+    else:
+        price_line = f"💰 Цена по промокоду: <b>{promo['promo_price']}₽</b>\n"
+
     text = (
         f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
         f"📦 Товар: {escape(promo['product_title'])}\n"
-        f"💰 Цена по промокоду: <b>{promo['promo_price']}₽</b>\n"
+        f"{price_line}"
         f"📅 Срок: {dates_str}\n\n"
     )
 
@@ -4645,7 +4843,7 @@ async def cb_promo_detail(call: CallbackQuery) -> None:
         ])
     else:
         text += "✅ <b>Промокод активен!</b> Воспользуйтесь предложением ниже."
-        if promo.get("game") == "ref_discount":
+        if promo.get("game") in ("ref_discount", "pct_discount"):
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="🎯 Применить скидку к следующей покупке",
@@ -4784,8 +4982,116 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
     )
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"✅ Выполнен #{order_id}", callback_data=f"mod:done:{order_id}")],
+        [InlineKeyboardButton(text="💸 Возврат", callback_data=f"mod:refund:{order_id}")],
     ])
-    await notify_moderator(admin_text, reply_markup=admin_kb)
+    await notify_moderator_order(admin_text, reply_markup=admin_kb)
+
+
+@dp.callback_query(F.data.startswith("mod:done:"))
+async def cb_mod_done(call: CallbackQuery) -> None:
+    """Модератор отмечает заказ выполненным через кнопку в чате модератора."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        order_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    order = await db_get_order(order_id)
+    if not order:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    tg_id = order["tg_id"]
+    await db_update_order_status(order_id, "Выполнен")
+
+    ref_result = await db_process_referral(tg_id, order_id)
+    if ref_result:
+        referrer_id, level_up, new_level, is_first = ref_result
+        if is_first and referrer_id:
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 По вашей реферальной ссылке совершена первая покупка!\n"
+                    f"{'📈 Ваш уровень повышен до ' + str(new_level) + '!' if level_up else ''}",
+                )
+            except Exception:
+                pass
+
+    try:
+        await bot.send_message(
+            tg_id,
+            f"✅ <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+            "Спасибо за покупку! Если есть вопросы — обратитесь в поддержку.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await call.answer(f"Заказ #{order_id} отмечен выполненным.", show_alert=True)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("mod:refund:"))
+async def cb_mod_refund(call: CallbackQuery) -> None:
+    """Модератор делает возврат средств по заказу."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        order_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    order = await db_get_order(order_id)
+    if not order:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    if order.get("status") == "Возврат":
+        await call.answer("Возврат по этому заказу уже был выполнен.", show_alert=True)
+        return
+
+    tg_id = order["tg_id"]
+    refund_amount = float(order["price"])
+
+    await db_update_order_status(order_id, "Возврат")
+    await db_add_balance(tg_id, refund_amount)
+    await db_add_transaction(
+        tg_id, refund_amount, kind="refund",
+        reason=f"Возврат по заказу #{order_id}"
+    )
+
+    try:
+        await bot.send_message(
+            tg_id,
+            f"💸 <b>Возврат по заказу #{order_id}</b>\n\n"
+            f"На ваш баланс возвращено <b>{_fmt_price(refund_amount)}₽</b>.\n\n"
+            "Если у вас остались вопросы — обратитесь в поддержку.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await call.answer(
+        f"Возврат {_fmt_price(refund_amount)}₽ по заказу #{order_id} выполнен.",
+        show_alert=True,
+    )
+    try:
+        await call.message.edit_text(
+            call.message.text + f"\n\n💸 <b>Возврат выполнен</b> модератором.",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
 
 # =====================================================================
@@ -4992,9 +5298,9 @@ async def cb_del_all_ref_promos(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "del_all_my_promos")
 async def cb_del_all_my_promos(call: CallbackQuery) -> None:
-    """Пользователь удаляет все свои обычные промокоды."""
-    deleted = await db_delete_all_user_regular_promos(call.from_user.id)
-    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
+    """Пользователь удаляет все использованные промокоды из своего инвентаря."""
+    deleted = await db_delete_all_used_user_promos(call.from_user.id)
+    await call.answer(f"Удалено использованных промокодов: {deleted}", show_alert=True)
     await send_or_edit(
         call,
         "🎟️ <b>Мои промокоды</b>\n\n"
@@ -5016,7 +5322,7 @@ async def cb_activate_ref_promo(call: CallbackQuery) -> None:
         return
 
     promo = await db_get_promo_by_id(promo_id)
-    if not promo or promo.get("game") != "ref_discount":
+    if not promo or promo.get("game") not in ("ref_discount", "pct_discount"):
         await call.answer("Промокод не найден.", show_alert=True)
         return
 
