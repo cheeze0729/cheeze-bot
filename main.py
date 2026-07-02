@@ -4288,10 +4288,13 @@ async def msg_promo_code_input(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.callback_query(F.data.startswith("adm:promo_type:"), PromoStates.waiting_discount_type)
+@dp.callback_query(F.data.startswith("adm:promo_type:"))
 async def cb_adm_promo_type(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     if not _is_moderator(call.from_user.id):
+        return
+    current_state = await state.get_state()
+    if current_state != PromoStates.waiting_discount_type.state:
         return
     promo_type = call.data.split(":")[2]
     data = await state.get_data()
