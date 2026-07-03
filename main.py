@@ -50,6 +50,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -229,6 +230,10 @@ BRAWL_PRODUCTS = [
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# Пользователи, для которых прямо сейчас обрабатывается платёж —
+# защита от двойного списания при повторном/двойном нажатии кнопки оплаты.
+_processing_payments: set[int] = set()
 
 
 class BlacklistMiddleware(BaseMiddleware):
@@ -423,8 +428,9 @@ async def db_init() -> None:
         """)
 
 
-async def db_get_or_create_user(user) -> dict:
-    """Возвращает запись пользователя, создавая её при первом обращении."""
+async def db_get_or_create_user(user) -> tuple[dict, bool]:
+    """Возвращает запись пользователя, создавая её при первом обращении.
+    Возвращает (запись, is_new_user) — is_new_user True, если запись только что создана."""
     pool = await get_pool()
     ref_code = secrets.token_urlsafe(8)
     row = await pool.fetchrow(
@@ -435,7 +441,7 @@ async def db_get_or_create_user(user) -> dict:
             SET username      = EXCLUDED.username,
                 first_name    = EXCLUDED.first_name,
                 referral_code = COALESCE(users.referral_code, EXCLUDED.referral_code)
-        RETURNING *
+        RETURNING *, (xmax = 0) AS _is_new
         """,
         user.id,
         user.username,
@@ -443,7 +449,9 @@ async def db_get_or_create_user(user) -> dict:
         ref_code,
         datetime.utcnow().isoformat(timespec="seconds"),
     )
-    return dict(row)
+    data = dict(row)
+    is_new = bool(data.pop("_is_new", False))
+    return data, is_new
 
 
 async def db_get_balance(tg_id: int) -> float:
@@ -1020,13 +1028,13 @@ async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
     return codes
 
 
-async def db_create_invite_promo_codes(buyer_id: int) -> list[str]:
-    """Создаёт 3 промокода на 5% скидку для приглашённого пользователя."""
+async def db_create_invite_promo_codes(buyer_id: int, count: int = 3) -> list[str]:
+    """Создаёт count промокодов на 5% скидку (по умолчанию 3 — для приглашённого пользователя)."""
     INVITE_DISCOUNT = 5
     pool = await get_pool()
     codes: list[str] = []
     now = datetime.now(timezone.utc).isoformat()
-    for _ in range(3):
+    for _ in range(count):
         code = "INV-" + secrets.token_urlsafe(6).upper()[:8]
         try:
             promo_id = await pool.fetchval(
@@ -1593,20 +1601,21 @@ def is_valid_email(text: str) -> bool:
 @dp.message(CommandStart())
 async def handle_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await db_get_or_create_user(message.from_user)
+    user_row, is_new_user = await db_get_or_create_user(message.from_user)
 
     # Обрабатываем реферальную ссылку
     parts = message.text.split() if message.text else []
+    used_ref_link = False
     if len(parts) > 1 and parts[1].startswith("ref_"):
         ref_code = parts[1][4:]
         referrer = await db_get_user_by_ref_code(ref_code)
         if referrer and referrer["tg_id"] != message.from_user.id:
-            user_row = await db_get_or_create_user(message.from_user)
+            used_ref_link = True
             already_referred = user_row.get("referred_by") is not None
             await db_set_referred_by(message.from_user.id, referrer["tg_id"])
             # Выдаём 3 INV-промокода только при первом входе по реф. ссылке
             if not already_referred:
-                invite_codes = await db_create_invite_promo_codes(message.from_user.id)
+                invite_codes = await db_create_invite_promo_codes(message.from_user.id, count=3)
                 if invite_codes:
                     codes_text = "\n".join(f"<code>{c}</code>" for c in invite_codes)
                     try:
@@ -1625,6 +1634,26 @@ async def handle_start(message: Message, state: FSMContext) -> None:
                             f"Не удалось уведомить нового реферала "
                             f"{message.from_user.id}: {e}"
                         )
+
+    # Обычным новым пользователям (без реф. ссылки) выдаём 1 промокод на 5%
+    if not used_ref_link and is_new_user:
+        welcome_codes = await db_create_invite_promo_codes(message.from_user.id, count=1)
+        if welcome_codes:
+            try:
+                await message.answer(
+                    f"🎁 <b>Добро пожаловать! Вам начислен промокод.</b>\n\n"
+                    f"Вы получили промокод на скидку <b>5%</b> на любой заказ:\n\n"
+                    f"<code>{welcome_codes[0]}</code>\n\n"
+                    f"Активируйте промокод в разделе "
+                    f"<b>«Мои реф. промокоды»</b> перед покупкой.\n"
+                    f"<i>Не действует на Telegram Stars.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(
+                    f"Не удалось уведомить нового пользователя "
+                    f"{message.from_user.id}: {e}"
+                )
 
     try:
         await message.answer_photo(
@@ -1904,7 +1933,7 @@ async def perform_purchase(
     Фактическое списание происходит в confirm_purchase."""
     await call.answer()
     user = call.from_user
-    user_row = await db_get_or_create_user(user)
+    user_row, _ = await db_get_or_create_user(user)
 
     original_price = float(price)
 
@@ -2016,37 +2045,44 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
 
     user = call.from_user
 
-    ok = await db_try_charge(user.id, final_price)
-    if not ok:
-        balance = await db_get_balance(user.id)
-        text = (
-            "❌ <b>Недостаточно средств на балансе.</b>\n\n"
-            f"Сумма заказа: {_fmt_price(final_price)}₽\n"
-            f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
-            "Пополните баланс и повторите попытку."
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-        ])
-        await send_or_edit(call, text, kb)
+    if user.id in _processing_payments:
+        await call.answer("Платёж уже обрабатывается, подождите...", show_alert=True)
         return
+    _processing_payments.add(user.id)
+    try:
+        ok = await db_try_charge(user.id, final_price)
+        if not ok:
+            balance = await db_get_balance(user.id)
+            text = (
+                "❌ <b>Недостаточно средств на балансе.</b>\n\n"
+                f"Сумма заказа: {_fmt_price(final_price)}₽\n"
+                f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
+                "Пополните баланс и повторите попытку."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ])
+            await send_or_edit(call, text, kb)
+            return
 
-    order_id = await db_create_order(user.id, title, final_price,
-                                     status="Оплачен", category=category)
-    await db_add_transaction(user.id, -final_price, kind="purchase",
-                             reason=f"Заказ #{order_id}: {title}")
+        order_id = await db_create_order(user.id, title, final_price,
+                                         status="Оплачен", category=category)
+        await db_add_transaction(user.id, -final_price, kind="purchase",
+                                 reason=f"Заказ #{order_id}: {title}")
 
-    if applied_ref_promo_id:
-        await db_use_promo(user.id, applied_ref_promo_id)
-        await db_set_active_ref_promo(user.id, None)
+        if applied_ref_promo_id:
+            await db_use_promo(user.id, applied_ref_promo_id)
+            await db_set_active_ref_promo(user.id, None)
 
-    # Сбрасываем pending-данные, оставляем прочее состояние FSM
-    await state.update_data(
-        _pnd_title=None, _pnd_final=None, _pnd_orig=None,
-        _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
-        _pnd_pdsc=None, _pnd_pid=None,
-    )
+        # Сбрасываем pending-данные, оставляем прочее состояние FSM
+        await state.update_data(
+            _pnd_title=None, _pnd_final=None, _pnd_orig=None,
+            _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
+            _pnd_pdsc=None, _pnd_pid=None,
+        )
+    finally:
+        _processing_payments.discard(user.id)
 
     new_balance = await db_get_balance(user.id)
     login_hint = LOGIN_HINTS.get(category) if category else None
@@ -2427,7 +2463,7 @@ async def msg_email(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "profile")
 async def cb_profile(call: CallbackQuery) -> None:
-    user_row = await db_get_or_create_user(call.from_user)
+    user_row, _ = await db_get_or_create_user(call.from_user)
     orders_cnt = await db_orders_count(call.from_user.id)
     user = call.from_user
     username = f"@{user.username}" if user.username else "не указан"
@@ -2828,6 +2864,14 @@ async def cb_order_done(call: CallbackQuery) -> None:
         await call.answer("Некорректные данные.", show_alert=True)
         return
 
+    order = await db_get_order(order_id)
+    if not order:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.get("status") == "Выполнен":
+        await call.answer("Этот заказ уже отмечен как выполненный.", show_alert=True)
+        return
+
     await db_set_order_status(order_id, "Выполнен")
 
     # Обработка реферальной программы
@@ -2900,6 +2944,11 @@ async def cb_order_done(call: CallbackQuery) -> None:
         )
     except Exception as e:
         logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
+
+    try:
+        await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
 
     await call.answer("Заказ выполнен")
 
@@ -4935,25 +4984,33 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
     price = float(promo["promo_price"])
     title = f"[Промокод {promo['code']}] {promo['game']} — {promo['product_title']}"
 
-    ok = await db_try_charge(user.id, price)
-    if not ok:
-        balance = await db_get_balance(user.id)
-        text = (
-            "❌ <b>Недостаточно средств на балансе.</b>\n\n"
-            f"Сумма заказа: {_fmt_price(price)}₽\n"
-            f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
-            "Пополните баланс и повторите попытку."
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-        ])
-        await send_or_edit(call, text, kb)
+    if user.id in _processing_payments:
+        await call.answer("Платёж уже обрабатывается, подождите...", show_alert=True)
         return
+    _processing_payments.add(user.id)
+    try:
+        ok = await db_try_charge(user.id, price)
+        if not ok:
+            balance = await db_get_balance(user.id)
+            text = (
+                "❌ <b>Недостаточно средств на балансе.</b>\n\n"
+                f"Сумма заказа: {_fmt_price(price)}₽\n"
+                f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
+                "Пополните баланс и повторите попытку."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ])
+            await send_or_edit(call, text, kb)
+            return
 
-    order_id = await db_create_order(user.id, title, price, status="Оплачен", category="promo")
-    await db_add_transaction(user.id, -price, kind="purchase", reason=f"Заказ #{order_id}: {title}")
-    await db_use_promo(user.id, promo_id)
+        order_id = await db_create_order(user.id, title, price, status="Оплачен", category="promo")
+        await db_add_transaction(user.id, -price, kind="purchase", reason=f"Заказ #{order_id}: {title}")
+        await db_use_promo(user.id, promo_id)
+    finally:
+        _processing_payments.discard(user.id)
+
     new_balance = await db_get_balance(user.id)
 
     text = (
@@ -5005,6 +5062,9 @@ async def cb_mod_done(call: CallbackQuery) -> None:
     if not order:
         await call.answer("Заказ не найден.", show_alert=True)
         return
+    if order.get("status") == "Выполнен":
+        await call.answer("Этот заказ уже отмечен как выполненный.", show_alert=True)
+        return
 
     tg_id = order["tg_id"]
     await db_update_order_status(order_id, "Выполнен")
@@ -5021,11 +5081,26 @@ async def cb_mod_done(call: CallbackQuery) -> None:
             pass
 
     try:
+        user_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⭐ Оставить отзыв",
+                        callback_data=f"review:{order_id}",
+                    )
+                ],
+                [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ]
+        )
         await bot.send_message(
             tg_id,
-            f"✅ <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
-            "Спасибо за покупку! Если есть вопросы — обратитесь в поддержку.",
+            f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+            "Спасибо за покупку. Будем рады видеть вас снова.\n\n"
+            "⭐ Если вам понравилось — оставьте, пожалуйста, отзыв. "
+            "Это поможет другим покупателям и нам стать лучше.",
             parse_mode="HTML",
+            reply_markup=user_kb,
         )
     except Exception:
         pass
@@ -5033,6 +5108,11 @@ async def cb_mod_done(call: CallbackQuery) -> None:
     await call.answer(f"Заказ #{order_id} отмечен выполненным.", show_alert=True)
     try:
         await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    try:
+        await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
 
@@ -5093,6 +5173,11 @@ async def cb_mod_refund(call: CallbackQuery) -> None:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+
+    try:
+        await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -5178,7 +5263,7 @@ async def msg_mod_reply(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data == "referral_info")
 async def cb_referral_info(call: CallbackQuery) -> None:
     await call.answer()
-    user_row = await db_get_or_create_user(call.from_user)
+    user_row, _ = await db_get_or_create_user(call.from_user)
     level = user_row.get("referral_level", 0)
     ref_count = user_row.get("referral_count", 0)
     ref_code = user_row.get("referral_code") or ""
@@ -5523,6 +5608,52 @@ async def _health_server() -> None:
     await site.start()
     logging.info("Health-check сервер запущен на порту %s", port)
     await asyncio.Event().wait()
+
+
+@dp.errors()
+async def global_error_handler(event: ErrorEvent) -> bool:
+    """Глобальный обработчик ошибок: логирует падение хендлера,
+    уведомляет модератора и мягко отвечает пользователю, чтобы
+    сбои не оставались незамеченными молча."""
+    update = event.update
+    exception = event.exception
+    logging.exception(
+        "Необработанная ошибка при обработке апдейта %s: %s", update, exception
+    )
+
+    try:
+        error_text = (
+            f"⚠️ <b>Ошибка в боте</b>\n\n"
+            f"<code>{escape(str(exception))[:500]}</code>\n\n"
+            f"Тип апдейта: <code>{escape(update.event_type or '?')}</code>"
+        )
+        await notify_moderator(error_text)
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить модератора об ошибке: {e}")
+
+    try:
+        call = update.callback_query
+        if call is not None:
+            try:
+                await call.answer(
+                    "⚠️ Произошла ошибка. Попробуйте ещё раз или обратитесь в поддержку.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+        else:
+            message = update.message
+            chat_id = message.chat.id if message else None
+            if chat_id is not None:
+                await bot.send_message(
+                    chat_id,
+                    "⚠️ Произошла ошибка при обработке запроса. "
+                    "Попробуйте ещё раз или обратитесь в поддержку.",
+                )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить пользователя об ошибке: {e}")
+
+    return True
 
 
 async def main() -> None:
