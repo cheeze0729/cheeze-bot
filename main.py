@@ -5584,6 +5584,14 @@ async def cmd_export(message: Message) -> None:
     revenue = sum(float(o["price"] or 0) for o in orders if o["status"] in ("Выполнен", "Оплачен"))
     topups = sum(float(t["amount"] or 0) for t in transactions if t["kind"] == "topup")
     purchases_sum = sum(-float(t["amount"] or 0) for t in transactions if t["kind"] == "purchase")
+    avg_check = revenue / completed_orders if completed_orders else 0.0
+    success_rate = (completed_orders / total_orders * 100) if total_orders else 0.0
+
+    product_sales: dict[str, int] = {}
+    for o in orders:
+        if o["status"] in ("Выполнен", "Оплачен"):
+            product_sales[o["title"] or "—"] = product_sales.get(o["title"] or "—", 0) + 1
+    top_products = sorted(product_sales.items(), key=lambda kv: kv[1], reverse=True)[:10]
 
     now_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d_%H-%M")
 
@@ -5602,6 +5610,8 @@ async def cmd_export(message: Message) -> None:
         ("✅ Выполнено заказов", completed_orders),
         ("🕓 Ожидают выполнения (Оплачен)", paid_orders),
         ("💸 Возвраты", refunded_orders),
+        ("📊 Успешность заказов (%)", round(success_rate, 1)),
+        ("🧮 Средний чек (₽)", round(avg_check, 2)),
         ("📈 Выручка по заказам (₽)", round(revenue, 2)),
         ("➕ Пополнений баланса (₽)", round(topups, 2)),
         ("➖ Списано на покупки (₽)", round(purchases_sum, 2)),
@@ -5646,6 +5656,31 @@ async def cmd_export(message: Message) -> None:
         pie.height = 8
         pie.width = 12
         ws_sum.add_chart(pie, f"D{start_row}")
+
+    # Таблица "ТОП товаров"
+    if top_products:
+        top_start = chart_start + len(status_counts) + 3 if status_counts else start_row + len(kpi_rows) + 3
+        ws_sum[f"A{top_start}"] = "🏆 ТОП товаров"
+        ws_sum[f"A{top_start}"].font = Font(size=13, bold=True, color="2F5597")
+        ws_sum.merge_cells(f"A{top_start}:B{top_start}")
+
+        header_row = top_start + 1
+        ws_sum[f"A{header_row}"] = "Товар"
+        ws_sum[f"B{header_row}"] = "Продаж"
+        for col in ("A", "B"):
+            c = ws_sum[f"{col}{header_row}"]
+            c.font = Font(color="FFFFFF", bold=True)
+            c.fill = PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid")
+            c.alignment = Alignment(horizontal="center")
+
+        for i, (product, count) in enumerate(top_products, start=header_row + 1):
+            ws_sum[f"A{i}"] = product
+            ws_sum[f"B{i}"] = count
+            if i % 2 == 0:
+                for col in ("A", "B"):
+                    ws_sum[f"{col}{i}"].fill = PatternFill(
+                        start_color="FCE9DA", end_color="FCE9DA", fill_type="solid"
+                    )
 
     # ---------- Лист "Пользователи" ----------
     ws_u = wb.create_sheet("👥 Пользователи")
@@ -5750,6 +5785,8 @@ async def cmd_export(message: Message) -> None:
             f"📊 <b>Полный отчёт по магазину</b>\n\n"
             f"👥 Пользователей: <b>{len(users)}</b>\n"
             f"🛒 Заказов: <b>{len(orders)}</b> (✅ {completed_orders} / 🕓 {paid_orders} / 💸 {refunded_orders})\n"
+            f"📊 Успешность заказов: <b>{success_rate:.1f}%</b>\n"
+            f"🧮 Средний чек: <b>{_fmt_price(avg_check)}₽</b>\n"
             f"💳 Транзакций: <b>{len(transactions)}</b>\n"
             f"📈 Выручка: <b>{_fmt_price(revenue)}₽</b>\n\n"
             f"🕒 Сформировано: {now_str} МСК"
