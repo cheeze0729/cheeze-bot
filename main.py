@@ -14,7 +14,6 @@ Telegram-бот для онлайн-магазина цифровых товар
 """
 
 import asyncio
-import csv
 import io
 import logging
 import re
@@ -5294,8 +5293,9 @@ async def cb_referral_info(call: CallbackQuery) -> None:
         f"🔗 Ваша реферальная ссылка:\n<code>{ref_link}</code>\n\n"
         "<b>Как это работает:</b>\n"
         "1. Поделитесь ссылкой с друзьями\n"
-        "2. Когда приглашённый совершит первую покупку — вам засчитается реферал\n"
-        "3. Каждые 2 реферала — новый уровень с бонусными промокодами на скидку\n\n"
+        "2. Приглашённый получит 3 промокода на скидку 5%, если перейдёт по вашей ссылке\n"
+        "3. Когда приглашённый совершит первую покупку — вам засчитается реферал\n"
+        "4. Каждые 2 реферала — новый уровень с бонусными промокодами на скидку\n\n"
         "<b>Уровни:</b>\n"
     )
     for lvl, (name, disc) in REFERRAL_LEVELS.items():
@@ -5501,13 +5501,52 @@ async def msg_broadcast(message: Message, state: FSMContext) -> None:
 # =====================================================================
 
 
+def _xlsx_style_sheet(ws, headers: list[str], rows: list[list], header_hex: str) -> None:
+    """Оформляет лист Excel: цветная шапка, автоширина колонок, зебра-подсветка, рамки, freeze panes."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    header_fill = PatternFill(start_color=header_hex, end_color=header_hex, fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True, size=11)
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    zebra_fill = PatternFill(start_color="F2F6FC", end_color="F2F6FC", fill_type="solid")
+
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    ws.freeze_panes = "A2"
+
+    for r_idx, row in enumerate(rows, start=2):
+        ws.append(row)
+        for cell in ws[r_idx]:
+            cell.border = border
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if r_idx % 2 == 0:
+                cell.fill = zebra_fill
+
+    for col_idx, header in enumerate(headers, start=1):
+        col_letter = get_column_letter(col_idx)
+        max_len = len(str(header))
+        for row in rows:
+            val = row[col_idx - 1]
+            max_len = max(max_len, len(str(val)) if val is not None else 0)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 45)
+
+    if rows:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(rows) + 1}"
+
+
 @dp.message(Command("export"))
 async def cmd_export(message: Message) -> None:
-    """Команда /export — выгрузка всех данных магазина в CSV (только модератор)."""
+    """Команда /export — красивая выгрузка всех данных магазина в Excel (только модератор)."""
     if not _is_moderator(message.from_user.id):
         return
 
-    wait_msg = await message.answer("⏳ Собираю данные, подождите...")
+    wait_msg = await message.answer("⏳ Собираю данные и формирую отчёт, подождите...")
 
     pool = await get_pool()
 
@@ -5525,66 +5564,194 @@ async def cmd_export(message: Message) -> None:
         "FROM transactions ORDER BY id"
     )
 
-    output = io.StringIO()
-    writer = csv.writer(output)
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, PieChart, Reference
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
 
-    writer.writerow(["=== ПОЛЬЗОВАТЕЛИ ==="])
-    writer.writerow([
-        "tg_id", "username", "имя", "баланс (руб)",
-        "реф. уровень", "реф. кол-во", "в чёрном списке", "дата регистрации",
-    ])
-    for u in users:
-        writer.writerow([
+    wb = Workbook()
+
+    # ---------- Лист "Сводка" ----------
+    ws_sum = wb.active
+    ws_sum.title = "📊 Сводка"
+
+    total_balance = sum(float(u["balance"] or 0) for u in users)
+    blacklisted_count = sum(1 for u in users if u["is_blacklisted"])
+    total_orders = len(orders)
+    completed_orders = sum(1 for o in orders if o["status"] == "Выполнен")
+    paid_orders = sum(1 for o in orders if o["status"] == "Оплачен")
+    refunded_orders = sum(1 for o in orders if "озврат" in (o["status"] or ""))
+    revenue = sum(float(o["price"] or 0) for o in orders if o["status"] in ("Выполнен", "Оплачен"))
+    topups = sum(float(t["amount"] or 0) for t in transactions if t["kind"] == "topup")
+    purchases_sum = sum(-float(t["amount"] or 0) for t in transactions if t["kind"] == "purchase")
+
+    now_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d_%H-%M")
+
+    ws_sum["A1"] = "🛍️ Отчёт по магазину"
+    ws_sum["A1"].font = Font(size=20, bold=True, color="2F5597")
+    ws_sum.merge_cells("A1:D1")
+    ws_sum["A2"] = f"Сформировано: {now_str} МСК"
+    ws_sum["A2"].font = Font(size=10, italic=True, color="808080")
+    ws_sum.merge_cells("A2:D2")
+
+    kpi_rows = [
+        ("👥 Всего пользователей", len(users)),
+        ("🚫 В чёрном списке", blacklisted_count),
+        ("💰 Суммарный баланс пользователей (₽)", round(total_balance, 2)),
+        ("🛒 Всего заказов", total_orders),
+        ("✅ Выполнено заказов", completed_orders),
+        ("🕓 Ожидают выполнения (Оплачен)", paid_orders),
+        ("💸 Возвраты", refunded_orders),
+        ("📈 Выручка по заказам (₽)", round(revenue, 2)),
+        ("➕ Пополнений баланса (₽)", round(topups, 2)),
+        ("➖ Списано на покупки (₽)", round(purchases_sum, 2)),
+        ("🧾 Всего транзакций", len(transactions)),
+    ]
+    start_row = 4
+    ws_sum[f"A{start_row}"] = "Показатель"
+    ws_sum[f"B{start_row}"] = "Значение"
+    for col in ("A", "B"):
+        c = ws_sum[f"{col}{start_row}"]
+        c.font = Font(color="FFFFFF", bold=True)
+        c.fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
+        c.alignment = Alignment(horizontal="center")
+    for i, (label, value) in enumerate(kpi_rows, start=start_row + 1):
+        ws_sum[f"A{i}"] = label
+        ws_sum[f"B{i}"] = value
+        if i % 2 == 0:
+            for col in ("A", "B"):
+                ws_sum[f"{col}{i}"].fill = PatternFill(
+                    start_color="F2F6FC", end_color="F2F6FC", fill_type="solid"
+                )
+    ws_sum.column_dimensions["A"].width = 42
+    ws_sum.column_dimensions["B"].width = 20
+
+    # Круговая диаграмма по статусам заказов
+    status_counts: dict[str, int] = {}
+    for o in orders:
+        status_counts[o["status"] or "—"] = status_counts.get(o["status"] or "—", 0) + 1
+    if status_counts:
+        chart_start = start_row + len(kpi_rows) + 3
+        ws_sum[f"A{chart_start}"] = "Статус заказа"
+        ws_sum[f"B{chart_start}"] = "Количество"
+        for i, (status, count) in enumerate(status_counts.items(), start=chart_start + 1):
+            ws_sum[f"A{i}"] = status
+            ws_sum[f"B{i}"] = count
+        pie = PieChart()
+        pie.title = "Заказы по статусам"
+        data = Reference(ws_sum, min_col=2, min_row=chart_start, max_row=chart_start + len(status_counts))
+        cats = Reference(ws_sum, min_col=1, min_row=chart_start + 1, max_row=chart_start + len(status_counts))
+        pie.add_data(data, titles_from_data=True)
+        pie.set_categories(cats)
+        pie.height = 8
+        pie.width = 12
+        ws_sum.add_chart(pie, f"D{start_row}")
+
+    # ---------- Лист "Пользователи" ----------
+    ws_u = wb.create_sheet("👥 Пользователи")
+    u_headers = ["TG ID", "Username", "Имя", "Баланс (₽)", "Реф. уровень", "Реф. кол-во", "Чёрный список", "Дата регистрации"]
+    u_rows = [
+        [
             u["tg_id"],
-            u["username"] or "",
-            u["first_name"] or "",
-            u["balance"],
+            f"@{u['username']}" if u["username"] else "—",
+            u["first_name"] or "—",
+            round(float(u["balance"] or 0), 2),
             u["referral_level"] or 0,
             u["referral_count"] or 0,
-            "Да" if u["is_blacklisted"] else "Нет",
+            "🚫 Да" if u["is_blacklisted"] else "Нет",
             _fmt_msk(u["created_at"]),
-        ])
+        ]
+        for u in users
+    ]
+    _xlsx_style_sheet(ws_u, u_headers, u_rows, "2F5597")
 
-    writer.writerow([])
-    writer.writerow(["=== ЗАКАЗЫ ==="])
-    writer.writerow(["id", "tg_id", "товар", "цена (руб)", "статус", "категория", "контакт", "данные входа", "дата"])
-    for o in orders:
-        writer.writerow([
+    # ---------- Лист "Заказы" ----------
+    ws_o = wb.create_sheet("🛒 Заказы")
+    o_headers = ["ID", "TG ID", "Товар", "Цена (₽)", "Статус", "Категория", "Контакт", "Данные входа", "Дата"]
+    o_rows = [
+        [
             o["id"],
             o["tg_id"],
             o["title"],
-            o["price"],
+            round(float(o["price"] or 0), 2),
             o["status"],
-            o["category"] or "",
-            o["contact"] or "",
-            o["login_data"] or "",
+            o["category"] or "—",
+            o["contact"] or "—",
+            o["login_data"] or "—",
             _fmt_msk(o["created_at"]),
-        ])
+        ]
+        for o in orders
+    ]
+    _xlsx_style_sheet(ws_o, o_headers, o_rows, "1F7A46")
+    status_col = o_headers.index("Статус") + 1
+    status_colors = {
+        "Выполнен": "C6EFCE",
+        "Оплачен": "FFEB9C",
+    }
+    from openpyxl.styles import PatternFill as _PF
+    for r_idx, o in enumerate(orders, start=2):
+        color = status_colors.get(o["status"])
+        if "озврат" in (o["status"] or ""):
+            color = "FFC7CE"
+        if color:
+            ws_o.cell(row=r_idx, column=status_col).fill = _PF(
+                start_color=color, end_color=color, fill_type="solid"
+            )
 
-    writer.writerow([])
-    writer.writerow(["=== ТРАНЗАКЦИИ ==="])
-    writer.writerow(["id", "tg_id", "сумма", "тип", "причина", "дата"])
-    for t in transactions:
-        writer.writerow([
+    # ---------- Лист "Транзакции" ----------
+    ws_t = wb.create_sheet("💳 Транзакции")
+    t_headers = ["ID", "TG ID", "Сумма (₽)", "Тип", "Причина", "Дата"]
+    t_rows = [
+        [
             t["id"],
             t["tg_id"],
-            t["amount"],
+            round(float(t["amount"] or 0), 2),
             t["kind"],
-            t["reason"] or "",
+            t["reason"] or "—",
             _fmt_msk(t["created_at"]),
-        ])
+        ]
+        for t in transactions
+    ]
+    _xlsx_style_sheet(ws_t, t_headers, t_rows, "7B3FA0")
+    amount_col = t_headers.index("Сумма (₽)") + 1
+    for r_idx, t in enumerate(transactions, start=2):
+        cell = ws_t.cell(row=r_idx, column=amount_col)
+        cell.font = Font(color="1F7A46" if float(t["amount"] or 0) >= 0 else "C00000", bold=True)
 
-    csv_bytes = output.getvalue().encode("utf-8-sig")
-    now_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d_%H-%M")
+    if orders:
+        bar = BarChart()
+        bar.title = "Заказы по категориям"
+        bar.type = "col"
+        cat_counts: dict[str, int] = {}
+        for o in orders:
+            cat_counts[o["category"] or "—"] = cat_counts.get(o["category"] or "—", 0) + 1
+        helper_row = len(o_rows) + 4
+        ws_o.cell(row=helper_row, column=1, value="Категория")
+        ws_o.cell(row=helper_row, column=2, value="Кол-во")
+        for i, (cat, count) in enumerate(cat_counts.items(), start=helper_row + 1):
+            ws_o.cell(row=i, column=1, value=cat)
+            ws_o.cell(row=i, column=2, value=count)
+        data = Reference(ws_o, min_col=2, min_row=helper_row, max_row=helper_row + len(cat_counts))
+        cats = Reference(ws_o, min_col=1, min_row=helper_row + 1, max_row=helper_row + len(cat_counts))
+        bar.add_data(data, titles_from_data=True)
+        bar.set_categories(cats)
+        bar.height = 8
+        bar.width = 14
+        ws_o.add_chart(bar, f"K2")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    xlsx_bytes = buf.getvalue()
 
     await wait_msg.delete()
     await message.answer_document(
-        BufferedInputFile(csv_bytes, filename=f"shop_export_{now_str}.csv"),
+        BufferedInputFile(xlsx_bytes, filename=f"shop_export_{now_str}.xlsx"),
         caption=(
-            f"📊 <b>Экспорт данных магазина</b>\n\n"
+            f"📊 <b>Полный отчёт по магазину</b>\n\n"
             f"👥 Пользователей: <b>{len(users)}</b>\n"
-            f"🛒 Заказов: <b>{len(orders)}</b>\n"
-            f"💳 Транзакций: <b>{len(transactions)}</b>\n\n"
+            f"🛒 Заказов: <b>{len(orders)}</b> (✅ {completed_orders} / 🕓 {paid_orders} / 💸 {refunded_orders})\n"
+            f"💳 Транзакций: <b>{len(transactions)}</b>\n"
+            f"📈 Выручка: <b>{_fmt_price(revenue)}₽</b>\n\n"
             f"🕒 Сформировано: {now_str} МСК"
         ),
         parse_mode="HTML",
