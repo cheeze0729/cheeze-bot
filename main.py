@@ -5550,18 +5550,23 @@ async def cmd_export(message: Message) -> None:
 
     pool = await get_pool()
 
+    # Тестовый аккаунт модератора исключаем из всей статистики —
+    # его транзакции/заказы не отражают реальную активность магазина.
     users = await pool.fetch(
         "SELECT tg_id, username, first_name, balance, is_blacklisted, "
         "referral_level, referral_count, created_at "
-        "FROM users ORDER BY tg_id"
+        "FROM users WHERE tg_id != $1 ORDER BY tg_id",
+        MODERATOR_CHAT_ID,
     )
     orders = await pool.fetch(
         "SELECT id, tg_id, title, price, status, category, contact, login_data, created_at "
-        "FROM orders ORDER BY id"
+        "FROM orders WHERE tg_id != $1 ORDER BY id",
+        MODERATOR_CHAT_ID,
     )
     transactions = await pool.fetch(
         "SELECT id, tg_id, amount, kind, reason, created_at "
-        "FROM transactions ORDER BY id"
+        "FROM transactions WHERE tg_id != $1 ORDER BY id",
+        MODERATOR_CHAT_ID,
     )
 
     from openpyxl import Workbook
