@@ -120,16 +120,8 @@ SECTION_IMAGES: dict[str, str | None] = {
     "card_brawl": None,
 }
 
-# Курсы
-ROBUX_GAMEPASS_RATE = 0.65  # 1 робукс = 0.65 ₽
-ROBUX_GAMEPASS_PASS_PRICE_RATE = 0.7  # Цена геймпасса в Roblox
-TG_STARS_RATE = 1.3  # 1 звезда = 1.3 ₽
-
-# Минимальная сумма пополнения
-MIN_TOPUP = 10  # рублей
-
-# Минимальное количество Telegram Stars
-MIN_TG_STARS = 50
+# Курсы и лимиты теперь хранятся в таблице settings (управляются через /admin → Каталог и курсы).
+# Начальные значения задаются в db_init() и применяются только при первом запуске.
 
 # =====================================================================
 # РЕФЕРАЛЬНАЯ ПРОГРАММА — настройки
@@ -200,27 +192,8 @@ LOGIN_HINTS = {
 
 # =====================================================================
 # КАТАЛОГ ТОВАРОВ
-# =====================================================================
-# Чтобы добавить товар — просто добавьте новую запись в нужный список.
-# Структура: (ключ, "Название для кнопки/карточки", цена ₽, "способ выдачи")
-
-ROBUX_INSTANT = [
-    ("rb_40", "40 робуксов", 79, "моментально"),
-    ("rb_80", "80 робуксов", 99, "моментально"),
-    ("rb_200", "200 робуксов", 279, "моментально"),
-    ("rb_400", "400 робуксов", 459, "моментально"),
-    ("rb_500", "500 робуксов", 499, "моментально"),
-    ("rb_1000", "1000 робуксов", 909, "моментально"),
-    ("rb_1700", "1700 робуксов", 1619, "моментально"),
-    ("rb_2000", "2000 робуксов", 1819, "моментально"),
-    ("rb_3600", "3600 робуксов", 3299, "моментально"),
-]
-
-BRAWL_PRODUCTS = [
-    ("bs_pass", "Brawl Pass", 899, "по согласованию через Telegram"),
-    ("bs_pass_plus", "Brawl Pass Plus", 1239, "по согласованию через Telegram"),
-    ("bs_pro", "Pro Pass", 2249, "по согласованию через Telegram"),
-]
+# Каталог товаров теперь хранится в таблице products (управляется через /admin → Каталог и курсы).
+# Начальные товары добавляются в db_init() и применяются только при первом запуске.
 
 # =====================================================================
 # Инициализация бота
@@ -398,6 +371,58 @@ async def db_init() -> None:
                 UNIQUE(buyer_id)
             )
         """)
+        # Каталог товаров
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id         SERIAL PRIMARY KEY,
+                category   TEXT NOT NULL,
+                key        TEXT NOT NULL UNIQUE,
+                name       TEXT NOT NULL,
+                price      NUMERIC(12,2) NOT NULL,
+                delivery   TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                active     BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        """)
+        # Настройки (курсы, лимиты)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        # Заполняем настройки начальными значениями
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES
+                ('robux_gamepass_rate',           '0.65'),
+                ('robux_gamepass_pass_price_rate','0.7'),
+                ('tg_stars_rate',                 '1.3'),
+                ('min_topup',                     '10'),
+                ('min_tg_stars',                  '50')
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Заполняем каталог начальными товарами (не перезаписываем существующие)
+        await conn.execute("""
+            INSERT INTO products (category, key, name, price, delivery, sort_order) VALUES
+                ('roblox_instant','rb_40',   '40 робуксов',   79,   'моментально', 0),
+                ('roblox_instant','rb_80',   '80 робуксов',   99,   'моментально', 1),
+                ('roblox_instant','rb_200',  '200 робуксов',  279,  'моментально', 2),
+                ('roblox_instant','rb_400',  '400 робуксов',  459,  'моментально', 3),
+                ('roblox_instant','rb_500',  '500 робуксов',  499,  'моментально', 4),
+                ('roblox_instant','rb_1000', '1000 робуксов', 909,  'моментально', 5),
+                ('roblox_instant','rb_1700', '1700 робуксов', 1619, 'моментально', 6),
+                ('roblox_instant','rb_2000', '2000 робуксов', 1819, 'моментально', 7),
+                ('roblox_instant','rb_3600', '3600 робуксов', 3299, 'моментально', 8),
+                ('brawl','bs_pass',      'Brawl Pass',      899,  'по согласованию через Telegram', 0),
+                ('brawl','bs_pass_plus', 'Brawl Pass Plus', 1239, 'по согласованию через Telegram', 1),
+                ('brawl','bs_pro',       'Pro Pass',        2249, 'по согласованию через Telegram', 2)
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Миграция: добавляем флаг ожидания подтверждения получения заказа
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS "
+            "confirm_pending BOOLEAN NOT NULL DEFAULT FALSE"
+        )
         # Миграция: переводим денежные колонки в NUMERIC для поддержки копеек
         await conn.execute("""
             DO $$
@@ -513,6 +538,111 @@ async def db_set_order_status(order_id: int, status: str) -> None:
         "UPDATE orders SET status = $1 WHERE id = $2",
         status, order_id,
     )
+
+
+async def db_set_confirm_pending(order_id: int, value: bool) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET confirm_pending = $1 WHERE id = $2",
+        value, order_id,
+    )
+
+
+async def db_get_confirm_pending(order_id: int) -> bool:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT confirm_pending FROM orders WHERE id = $1", order_id
+    )
+    return bool(val) if val is not None else False
+
+
+# =====================================================================
+# Каталог товаров и настройки (DB)
+# =====================================================================
+
+async def db_get_products(category: str) -> list[tuple]:
+    """Возвращает активные товары категории: [(key, name, price, delivery), ...]."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT key, name, price, delivery FROM products "
+        "WHERE category = $1 AND active = TRUE ORDER BY sort_order, id",
+        category,
+    )
+    return [(r["key"], r["name"], float(r["price"]), r["delivery"]) for r in rows]
+
+
+async def db_get_product_by_key(key: str) -> tuple | None:
+    """Возвращает товар по ключу: (key, name, price, delivery) или None."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT key, name, price, delivery FROM products WHERE key = $1", key
+    )
+    return (row["key"], row["name"], float(row["price"]), row["delivery"]) if row else None
+
+
+async def db_all_products() -> list[dict]:
+    """Все товары (для админ-панели)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT id, category, key, name, price, delivery, sort_order, active "
+        "FROM products ORDER BY category, sort_order, id"
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_update_product_price(key: str, price: float) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE products SET price = $1 WHERE key = $2", price, key)
+
+
+async def db_toggle_product(key: str) -> bool:
+    """Переключает флаг active товара, возвращает новое значение."""
+    pool = await get_pool()
+    new_val = await pool.fetchval(
+        "UPDATE products SET active = NOT active WHERE key = $1 RETURNING active", key
+    )
+    return bool(new_val)
+
+
+async def db_add_product(
+    category: str, key: str, name: str, price: float, delivery: str
+) -> bool:
+    """Добавляет товар. Возвращает False, если ключ уже существует."""
+    pool = await get_pool()
+    try:
+        sort_max = await pool.fetchval(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM products WHERE category = $1",
+            category,
+        )
+        await pool.execute(
+            "INSERT INTO products (category, key, name, price, delivery, sort_order) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            category, key, name, price, delivery, int(sort_max or 0),
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def db_get_setting(key: str, default: str = "") -> str:
+    pool = await get_pool()
+    val = await pool.fetchval("SELECT value FROM settings WHERE key = $1", key)
+    return val if val is not None else default
+
+
+async def db_set_setting(key: str, value: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        key, value,
+    )
+
+
+async def db_all_settings() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch("SELECT key, value FROM settings ORDER BY key")
+    return [dict(r) for r in rows]
 
 
 async def db_get_order(order_id: int) -> dict | None:
@@ -1066,12 +1196,12 @@ class ShopStates(StatesGroup):
     waiting_topup_confirm = State()
     waiting_robux_amount = State()
     waiting_stars_amount = State()
-    waiting_email = State()
     waiting_login_data = State()
     waiting_login_code = State()
     waiting_promo_input = State()
     waiting_review_photo = State()
     waiting_review_text = State()
+    waiting_reject_screenshot = State()
 
 
 class AdminStates(StatesGroup):
@@ -1082,8 +1212,14 @@ class AdminStates(StatesGroup):
     waiting_block_reason = State()
     waiting_unblock_reason = State()
     waiting_gp_price = State()
-    waiting_mod_reply = State()   # ответ покупателю из чата модератора
-    waiting_broadcast = State()  # рассылка всем пользователям
+    waiting_mod_reply = State()        # ответ покупателю из чата модератора
+    waiting_broadcast = State()        # рассылка всем пользователям
+    waiting_edit_product_price = State()   # изменение цены товара
+    waiting_edit_setting_value = State()   # изменение настройки (курс/лимит)
+    waiting_new_product_key = State()      # ключ нового товара
+    waiting_new_product_name = State()     # название нового товара
+    waiting_new_product_price = State()    # цена нового товара
+    waiting_new_product_delivery = State() # способ выдачи нового товара
 
 
 class PromoStates(StatesGroup):
@@ -1221,12 +1357,6 @@ def kb_after_purchase(
                 InlineKeyboardButton(
                     text="💬 Связаться с модератором через бота",
                     callback_data=f"contact_mod:{order_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📧 Указать почту для связи",
-                    callback_data=f"contact_email:{order_id}",
                 )
             ],
             [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
@@ -1387,12 +1517,6 @@ def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
                 )
             ],
             [
-                InlineKeyboardButton(
-                    text="📧 Указать почту для связи",
-                    callback_data=f"contact_email:{order_id}",
-                )
-            ],
-            [
                 InlineKeyboardButton(text="⬅️ Назад", callback_data="orders"),
                 InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
             ],
@@ -1404,13 +1528,6 @@ def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
 # =====================================================================
 # Утилиты
 # =====================================================================
-
-
-def find_product(items: list[tuple], key: str) -> tuple | None:
-    for item in items:
-        if item[0] == key:
-            return item
-    return None
 
 
 def order_needs_login(category: str | None) -> bool:
@@ -1588,9 +1705,6 @@ def parse_positive_int(text: str) -> int | None:
     return value
 
 
-def is_valid_email(text: str) -> bool:
-    return re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", (text or "").strip()) is not None
-
 
 # =====================================================================
 # /start и главное меню
@@ -1714,11 +1828,12 @@ async def cb_shop(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "cat:roblox_instant")
 async def cb_roblox_instant(call: CallbackQuery) -> None:
+    products = await db_get_products("roblox_instant")
     await show_section(
         call,
         "roblox_instant",
         "<b>Roblox — моментально</b>\n\nВыберите количество робуксов:",
-        kb_product_list(ROBUX_INSTANT, "rbi"),
+        kb_product_list(products, "rbi"),
     )
     await call.answer()
 
@@ -1726,7 +1841,7 @@ async def cb_roblox_instant(call: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("rbi:"))
 async def cb_roblox_instant_card(call: CallbackQuery) -> None:
     key = call.data.split(":", 1)[1]
-    product = find_product(ROBUX_INSTANT, key)
+    product = await db_get_product_by_key(key)
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
@@ -1773,8 +1888,10 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
         )
         return
 
-    price = max(1, round(qty * ROBUX_GAMEPASS_RATE))
-    gamepass_price = max(1, round(qty / ROBUX_GAMEPASS_PASS_PRICE_RATE))
+    gp_rate = float(await db_get_setting("robux_gamepass_rate", "0.65"))
+    gp_pass_rate = float(await db_get_setting("robux_gamepass_pass_price_rate", "0.7"))
+    price = max(1, round(qty * gp_rate))
+    gamepass_price = max(1, round(qty / gp_pass_rate))
 
     await state.update_data(
         robux_qty=qty,
@@ -1785,7 +1902,7 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
     text = (
         f"<b>Roblox геймпассом</b>\n\n"
         f"Количество: <b>{qty}</b> робуксов\n"
-        f"Курс оплаты: 1 робукс = {ROBUX_GAMEPASS_RATE}₽\n"
+        f"Курс оплаты: 1 робукс = {gp_rate}₽\n"
         f"Итого к оплате: <b>{price}₽</b>\n"
         f"Цена для создания геймпасса: <b>{gamepass_price} R$</b>\n"
         "Срок: до 5 дней\n"
@@ -1803,9 +1920,10 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "cat:brawl")
 async def cb_brawl(call: CallbackQuery) -> None:
+    brawl_products = await db_get_products("brawl")
     rows = [
         [InlineKeyboardButton(text=f"{n} — {p}₽", callback_data=f"bs:{k}")]
-        for k, n, p, _ in BRAWL_PRODUCTS
+        for k, n, p, _ in brawl_products
     ]
     rows.append(
         [InlineKeyboardButton(text="🎁 Другие акции", callback_data="bs:promo")]
@@ -1837,7 +1955,7 @@ async def cb_brawl_card(call: CallbackQuery) -> None:
     key = call.data.split(":", 1)[1]
     if key == "promo":
         return
-    product = find_product(BRAWL_PRODUCTS, key)
+    product = await db_get_product_by_key(key)
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
@@ -1859,9 +1977,10 @@ async def cb_brawl_card(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "cat:tgstars")
 async def cb_tgstars(call: CallbackQuery, state: FSMContext) -> None:
+    stars_rate = float(await db_get_setting("tg_stars_rate", "1.3"))
     text = (
         "<b>Telegram Stars</b>\n\n"
-        f"Курс: 1 звезда = {TG_STARS_RATE}₽\n\n"
+        f"Курс: 1 звезда = {stars_rate}₽\n\n"
         "Введите количество звёзд одним сообщением (например: 100):"
     )
     sent = await show_section(call, "tgstars", text, kb_back_main("shop"))
@@ -1880,20 +1999,22 @@ async def msg_stars_amount(message: Message, state: FSMContext) -> None:
                            "⚠️ Введите положительное число звёзд (например: 100).",
                            kb_back_main("shop"))
         return
-    if qty < MIN_TG_STARS:
+    stars_rate = float(await db_get_setting("tg_stars_rate", "1.3"))
+    min_stars = int(await db_get_setting("min_tg_stars", "50"))
+    if qty < min_stars:
         await _edit_prompt(state,
-                           f"⚠️ Минимальное количество — {MIN_TG_STARS} звёзд.\n"
+                           f"⚠️ Минимальное количество — {min_stars} звёзд.\n"
                            "Попробуйте ещё раз:",
                            kb_back_main("shop"))
         return
-    price = max(1, round(qty * TG_STARS_RATE))
+    price = max(1, round(qty * stars_rate))
     await state.update_data(stars_qty=qty, stars_price=price)
     text = (
         f"<b>Telegram Stars</b>\n\n"
         f"Количество: <b>{qty}</b> ⭐\n"
-        f"Курс: 1 звезда = {TG_STARS_RATE}₽\n"
+        f"Курс: 1 звезда = {stars_rate}₽\n"
         f"Итого: <b>{price}₽</b>\n"
-        "Минимум: <b>50 звёзд</b>\n"
+        f"Минимум: <b>{min_stars} звёзд</b>\n"
         "Способ выдачи: моментально\n"
         "Способ оплаты: Оплата с внутреннего баланса бота"
     )
@@ -2301,7 +2422,7 @@ async def msg_login_code(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("buy:rbi:"))
 async def cb_buy_rbi(call: CallbackQuery, state: FSMContext) -> None:
     key = call.data.split(":", 2)[2]
-    product = find_product(ROBUX_INSTANT, key)
+    product = await db_get_product_by_key(key)
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
@@ -2315,7 +2436,7 @@ async def cb_buy_rbi(call: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("buy:bs:"))
 async def cb_buy_bs(call: CallbackQuery, state: FSMContext) -> None:
     key = call.data.split(":", 2)[2]
-    product = find_product(BRAWL_PRODUCTS, key)
+    product = await db_get_product_by_key(key)
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
@@ -2400,59 +2521,6 @@ async def cb_contact_mod(call: CallbackQuery) -> None:
     )
     await send_or_edit(call, text, kb)
     await call.answer()
-
-
-@dp.callback_query(F.data.startswith("contact_email:"))
-async def cb_contact_email(call: CallbackQuery, state: FSMContext) -> None:
-    order_id = int(call.data.split(":", 1)[1])
-    await state.set_state(ShopStates.waiting_email)
-    text = (
-        f"Введите вашу почту для связи по заказу <b>#{order_id}</b> "
-        "одним сообщением.\n\n"
-        "Например: <code>example@mail.ru</code>"
-    )
-    sent = await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
-    await state.update_data(order_id=order_id,
-                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
-    await call.answer()
-
-
-@dp.message(ShopStates.waiting_email)
-async def msg_email(message: Message, state: FSMContext) -> None:
-    await _try_delete(message)
-    data = await state.get_data()
-    order_id = int(data.get("order_id", 0))
-    if not is_valid_email(message.text or ""):
-        await _edit_prompt(state,
-                           "⚠️ Неверный формат почты. Введите корректный адрес, "
-                           "например: <code>example@mail.ru</code>",
-                           kb_back_main(f"order_actions:{order_id}"))
-        return
-    email = message.text.strip()
-    await state.clear()
-
-    if order_id:
-        await db_set_order_contact(order_id, email)
-
-    user = message.from_user
-    username = f"@{user.username}" if user.username else "—"
-    await notify_moderator(
-        f"📧 Покупатель оставил почту по заказу <b>#{order_id}</b>\n\n"
-        f"Почта: <code>{escape(email)}</code>\n"
-        f"Имя: {escape(user.first_name or '')}\n"
-        f"Username: {escape(username)}\n"
-        f"Telegram ID: <code>{user.id}</code>"
-    )
-
-    await message.answer(
-        f"✅ Спасибо! Модератор свяжется с вами по почте: <b>{escape(email)}</b>",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-            ]
-        ),
-        parse_mode="HTML",
-    )
 
 
 # =====================================================================
@@ -2641,9 +2709,10 @@ async def cb_transactions(call: CallbackQuery) -> None:
 async def cb_topup(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(ShopStates.waiting_topup_amount)
+    min_topup = int(await db_get_setting("min_topup", "10"))
     text = (
         "💳 <b>Пополнение баланса</b>\n\n"
-        f"Введите сумму пополнения в рублях (минимум {MIN_TOPUP}₽).\n"
+        f"Введите сумму пополнения в рублях (минимум {min_topup}₽).\n"
         "Например: 500"
     )
     sent = await show_section(call, "topup", text, kb_back_main("profile"))
@@ -2661,9 +2730,10 @@ async def msg_topup_amount(message: Message, state: FSMContext) -> None:
                            "⚠️ Введите положительное число рублей, например: 500.",
                            kb_back_main("profile"))
         return
-    if amount < MIN_TOPUP:
+    min_topup = int(await db_get_setting("min_topup", "10"))
+    if amount < min_topup:
         await _edit_prompt(state,
-                           f"⚠️ Минимальная сумма пополнения — {MIN_TOPUP}₽\n"
+                           f"⚠️ Минимальная сумма пополнения — {min_topup}₽\n"
                            "Попробуйте ещё раз:",
                            kb_back_main("profile"))
         return
@@ -2679,7 +2749,7 @@ async def cb_topup_go(call: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     amount = int(data.get("topup_amount", 0))
     await state.clear()
-    if amount < MIN_TOPUP:
+    if amount < int(await db_get_setting("min_topup", "10")):
         await call.answer("Сумма не задана.", show_alert=True)
         return
     code = f"{secrets.randbelow(1_000_000):06d}"
@@ -2845,6 +2915,55 @@ async def cb_topup_admin_reject(call: CallbackQuery) -> None:
 
 
 # =====================================================================
+# Авто-подтверждение заказа через 30 минут
+# =====================================================================
+
+RECEIPT_CONFIRM_TIMEOUT = 30 * 60  # секунд
+
+
+async def _auto_confirm_receipt(order_id: int, tg_id: int) -> None:
+    """Через 30 минут автоматически подтверждает заказ, если покупатель не ответил."""
+    await asyncio.sleep(RECEIPT_CONFIRM_TIMEOUT)
+    still_pending = await db_get_confirm_pending(order_id)
+    if not still_pending:
+        return  # пользователь уже нажал кнопку
+
+    await db_set_confirm_pending(order_id, False)
+
+    # Уведомляем модератора
+    try:
+        await notify_moderator(
+            f"⏱ <b>Заказ #{order_id} подтверждён автоматически</b>\n\n"
+            f"Покупатель (ID <code>{tg_id}</code>) не ответил в течение 30 минут — "
+            "заказ засчитан выполненным."
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить модератора об авто-подтверждении: {e}")
+
+    # Сообщаем покупателю
+    try:
+        order = await db_get_order(order_id)
+        has_review = await db_has_review(order_id)
+        review_btn = [] if has_review else [
+            [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review:{order_id}")]
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=review_btn + [
+            [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await bot.send_message(
+            tg_id,
+            f"⏱ <b>Заказ #{order_id} подтверждён автоматически.</b>\n\n"
+            "Вы не выбрали ответ в течение 30 минут, поэтому получение засчитано автоматически.\n\n"
+            + ("⭐ Если хотите — оставьте отзыв о заказе." if not has_review else ""),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить авто-подтверждение пользователю {tg_id}: {e}")
+
+
+# =====================================================================
 # Действия модератора по заказу
 # =====================================================================
 
@@ -2924,23 +3043,31 @@ async def cb_order_done(call: CallbackQuery) -> None:
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⭐ Оставить отзыв",
-                        callback_data=f"review:{order_id}",
+                        text="✅ Подтвердить получение",
+                        callback_data=f"confirm_receipt:{order_id}",
                     )
                 ],
-                [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
-                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отклонить",
+                        callback_data=f"reject_receipt:{order_id}",
+                    )
+                ],
             ]
         )
         await bot.send_message(
             target_id,
             f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
-            "Спасибо за покупку. Будем рады видеть вас снова.\n\n"
-            "⭐ Если вам понравилось — оставьте, пожалуйста, отзыв. "
-            "Это поможет другим покупателям и нам стать лучше.",
+            "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
+            "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
+            "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
+            "прислать скриншот из игры в качестве доказательства.\n\n"
+            "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
             parse_mode="HTML",
             reply_markup=user_kb,
         )
+        await db_set_confirm_pending(order_id, True)
+        asyncio.create_task(_auto_confirm_receipt(order_id, target_id))
     except Exception as e:
         logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
 
@@ -2950,6 +3077,153 @@ async def cb_order_done(call: CallbackQuery) -> None:
         pass
 
     await call.answer("Заказ выполнен")
+
+
+# =====================================================================
+# Подтверждение / отклонение получения заказа
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("confirm_receipt:"))
+async def cb_confirm_receipt(call: CallbackQuery) -> None:
+    """Покупатель подтверждает получение товара → предлагаем оставить отзыв."""
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order or order["tg_id"] != call.from_user.id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    # Если таймер уже сработал — флаг сброшен, просто показываем успех
+    await db_set_confirm_pending(order_id, False)
+
+    user = call.from_user
+    username = f"@{user.username}" if user.username else "—"
+    # Уведомляем модератора
+    try:
+        await notify_moderator(
+            f"✅ <b>Покупатель подтвердил получение заказа #{order_id}</b>\n\n"
+            f"Имя: {escape(user.first_name or '—')}\n"
+            f"Username: {escape(username)}\n"
+            f"Telegram ID: <code>{user.id}</code>"
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить модератора о подтверждении: {e}")
+
+    has_review = await db_has_review(order_id)
+    review_btn = [] if has_review else [
+        [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review:{order_id}")]
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=review_btn + [
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"✅ <b>Спасибо! Получение заказа #{order_id} подтверждено.</b>\n\n"
+        "Рады, что всё прошло хорошо. Будем ждать вас снова!\n\n"
+        + ("⭐ Если вам понравилось — оставьте, пожалуйста, отзыв. "
+           "Это помогает другим покупателям и нам становиться лучше." if not has_review else ""),
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("reject_receipt:"))
+async def cb_reject_receipt(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель отклоняет получение → просим прислать скриншот из игры."""
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order or order["tg_id"] != call.from_user.id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    await state.set_state(ShopStates.waiting_reject_screenshot)
+    await state.update_data(reject_order_id=order_id)
+
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"⚠️ <b>Отклонение заказа #{order_id}</b>\n\n"
+        "Пожалуйста, пришлите <b>скриншот из игры</b>, подтверждающий, "
+        "что товар не был зачислен (например, скриншот инвентаря или баланса).\n\n"
+        "Скриншот будет отправлен модератору для разбора ситуации.\n\n"
+        "⚠️ Напоминаем: ложное отклонение может привести к блокировке.",
+        kb_cancel,
+    )
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_reject_screenshot)
+async def msg_reject_screenshot(message: Message, state: FSMContext) -> None:
+    """Получаем скриншот от покупателя и пересылаем модератору."""
+    await _try_delete(message)
+    data = await state.get_data()
+    order_id = int(data.get("reject_order_id", 0))
+
+    file_id: str | None = None
+    is_document = False
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_id = message.document.file_id
+        is_document = True
+
+    if not file_id:
+        kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ])
+        await message.answer(
+            "⚠️ Пришлите изображение (фото или картинку файлом).",
+            reply_markup=kb_cancel,
+            parse_mode="HTML",
+        )
+        return
+
+    await state.clear()
+    await db_set_confirm_pending(order_id, False)
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+
+    # Уведомляем модератора
+    caption = (
+        f"🚫 <b>Покупатель отклонил получение заказа #{order_id}</b>\n\n"
+        f"Имя: {escape(user.first_name or '—')}\n"
+        f"Username: {escape(username)}\n"
+        f"Telegram ID: <code>{user.id}</code>\n\n"
+        "Скриншот от покупателя прикреплён ниже."
+    )
+    try:
+        if is_document:
+            await bot.send_document(
+                MODERATOR_CHAT_ID, file_id, caption=caption, parse_mode="HTML"
+            )
+        else:
+            await bot.send_photo(
+                MODERATOR_CHAT_ID, file_id, caption=caption, parse_mode="HTML"
+            )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить скриншот отклонения модератору: {e}")
+
+    await message.answer(
+        f"✅ <b>Скриншот отправлен модератору.</b>\n\n"
+        f"Мы рассмотрим ситуацию по заказу <b>#{order_id}</b> и свяжемся с вами.\n\n"
+        "Если хотите написать напрямую — нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=kb_support(),
+    )
 
 
 # =====================================================================
@@ -3418,9 +3692,69 @@ def kb_admin_main() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="adm:promos")],
+            [InlineKeyboardButton(text="🛒 Каталог и курсы", callback_data="adm:catalog")],
             [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
         ]
     )
+
+
+# ---- вспомогательные словари для каталога ----
+
+_CATEGORY_LABELS: dict[str, str] = {
+    "roblox_instant": "🎮 Roblox — моментально",
+    "brawl":          "⚔️ Brawl Stars",
+}
+
+_SETTING_LABELS: dict[str, str] = {
+    "robux_gamepass_rate":            "💎 Курс геймпасс (₽/робукс)",
+    "robux_gamepass_pass_price_rate": "🎮 Делитель цены геймпасса",
+    "tg_stars_rate":                  "⭐ Курс Telegram Stars (₽/звезда)",
+    "min_topup":                      "💳 Минимум пополнения (₽)",
+    "min_tg_stars":                   "⭐ Минимум Telegram Stars",
+}
+
+
+def kb_catalog_categories() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"adm:catalog:cat:{cat}")]
+        for cat, label in _CATEGORY_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="⚙️ Курсы и лимиты", callback_data="adm:settings")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_catalog_products(products: list[dict], category: str) -> InlineKeyboardMarkup:
+    rows = []
+    for p in products:
+        status = "✅" if p["active"] else "❌"
+        price_str = f"{int(p['price'])}₽" if float(p["price"]) == int(p["price"]) else f"{p['price']}₽"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{status} {p['name']} — {price_str}",
+                callback_data=f"adm:catalog:price:{p['key']}",
+            ),
+            InlineKeyboardButton(text="🔄", callback_data=f"adm:catalog:toggle:{p['key']}"),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="➕ Добавить товар", callback_data=f"adm:catalog:add:{category}"),
+    ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_settings_list(settings: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for s in settings:
+        label = _SETTING_LABELS.get(s["key"], s["key"])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{label}: {s['value']}",
+                callback_data=f"adm:settings:edit:{s['key']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _format_user_row(u: dict) -> str:
@@ -3599,6 +3933,299 @@ async def cb_adm_close(call: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == "adm:noop")
 async def cb_adm_noop(call: CallbackQuery) -> None:
     await call.answer()
+
+
+# =====================================================================
+# Управление каталогом и настройками (модератор)
+# =====================================================================
+
+@dp.callback_query(F.data == "adm:main")
+async def cb_adm_main(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    await send_or_edit(call, "<b>🛠️ Админ-панель</b>\n\nВыберите действие:", kb_admin_main())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:catalog")
+async def cb_adm_catalog(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    await send_or_edit(
+        call,
+        "<b>🛒 Каталог и курсы</b>\n\nВыберите категорию или откройте настройки:",
+        kb_catalog_categories(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:cat:"))
+async def cb_adm_catalog_cat(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    category = call.data.split(":", 3)[3]
+    await state.update_data(catalog_category=category)
+    all_prods = await db_all_products()
+    cat_prods = [p for p in all_prods if p["category"] == category]
+    label = _CATEGORY_LABELS.get(category, category)
+    if not cat_prods:
+        text = f"<b>{label}</b>\n\nТоваров пока нет."
+    else:
+        lines = []
+        for p in cat_prods:
+            status = "✅" if p["active"] else "❌"
+            lines.append(f"{status} {p['name']} — {p['price']}₽")
+        text = f"<b>{label}</b>\n\n" + "\n".join(lines) + "\n\n✅ = активен  ❌ = скрыт\nНажмите на товар, чтобы изменить цену.\n🔄 — переключить активность."
+    await send_or_edit(call, text, kb_catalog_products(cat_prods, category))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:toggle:"))
+async def cb_adm_catalog_toggle(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    key = call.data.split(":", 3)[3]
+    new_state = await db_toggle_product(key)
+    status_text = "активирован ✅" if new_state else "скрыт ❌"
+    await call.answer(f"Товар {status_text}", show_alert=True)
+    # Обновляем список — определяем категорию через БД
+    all_prods = await db_all_products()
+    prod = next((p for p in all_prods if p["key"] == key), None)
+    if prod:
+        category = prod["category"]
+        cat_prods = [p for p in all_prods if p["category"] == category]
+        label = _CATEGORY_LABELS.get(category, category)
+        lines = [
+            ("✅" if p["active"] else "❌") + f" {p['name']} — {p['price']}₽"
+            for p in cat_prods
+        ]
+        text = (f"<b>{label}</b>\n\n" + "\n".join(lines) +
+                "\n\n✅ = активен  ❌ = скрыт\nНажмите на товар, чтобы изменить цену.\n🔄 — переключить активность.")
+        try:
+            await call.message.edit_text(text, reply_markup=kb_catalog_products(cat_prods, category), parse_mode="HTML")
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:price:"))
+async def cb_adm_catalog_price(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, current_price, _ = product
+    await state.set_state(AdminStates.waiting_edit_product_price)
+    await state.update_data(edit_product_key=key, edit_product_name=name)
+    await send_or_edit(
+        call,
+        f"✏️ <b>Изменение цены: {escape(name)}</b>\n\n"
+        f"Текущая цена: <b>{current_price}₽</b>\n\n"
+        "Введите новую цену в рублях (целое число):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catalog:cat:none")],
+        ]),
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_edit_product_price)
+async def msg_adm_edit_product_price(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    price = parse_positive_int(message.text)
+    if price is None or price <= 0:
+        await message.answer("⚠️ Введите положительное целое число (цену в рублях).")
+        return
+    data = await state.get_data()
+    key = data.get("edit_product_key", "")
+    name = data.get("edit_product_name", key)
+    await state.clear()
+    await db_update_product_price(key, float(price))
+    await message.answer(
+        f"✅ Цена <b>{escape(name)}</b> обновлена: <b>{price}₽</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_main(),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:add:"))
+async def cb_adm_catalog_add(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    category = call.data.split(":", 3)[3]
+    await state.set_state(AdminStates.waiting_new_product_key)
+    await state.update_data(new_product_category=category)
+    label = _CATEGORY_LABELS.get(category, category)
+    await send_or_edit(
+        call,
+        f"➕ <b>Новый товар в «{label}»</b>\n\n"
+        "Шаг 1/4. Введите <b>уникальный ключ</b> товара (латинские буквы, цифры, _).\n"
+        "Пример: <code>rb_5000</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_new_product_key)
+async def msg_adm_new_product_key(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip()
+    if not raw or not all(c.isalnum() or c == "_" for c in raw):
+        await message.answer("⚠️ Ключ может содержать только латинские буквы, цифры и _.\nПопробуйте ещё раз:")
+        return
+    await state.update_data(new_product_key=raw)
+    await state.set_state(AdminStates.waiting_new_product_name)
+    await message.answer(
+        "Шаг 2/4. Введите <b>название</b> товара (отображается покупателям).\n"
+        "Пример: <code>5000 робуксов</code>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminStates.waiting_new_product_name)
+async def msg_adm_new_product_name(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        return
+    await state.update_data(new_product_name=name)
+    await state.set_state(AdminStates.waiting_new_product_price)
+    await message.answer("Шаг 3/4. Введите <b>цену</b> в рублях (целое число):", parse_mode="HTML")
+
+
+@dp.message(AdminStates.waiting_new_product_price)
+async def msg_adm_new_product_price(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    price = parse_positive_int(message.text)
+    if price is None or price <= 0:
+        await message.answer("⚠️ Введите положительное целое число. Попробуйте ещё раз:")
+        return
+    await state.update_data(new_product_price=price)
+    await state.set_state(AdminStates.waiting_new_product_delivery)
+    await message.answer(
+        "Шаг 4/4. Введите <b>способ выдачи</b> товара.\n"
+        "Пример: <code>моментально</code>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminStates.waiting_new_product_delivery)
+async def msg_adm_new_product_delivery(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    delivery = (message.text or "").strip()
+    if not delivery:
+        await message.answer("⚠️ Способ выдачи не может быть пустым. Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    category = data.get("new_product_category", "roblox_instant")
+    key = data.get("new_product_key", "")
+    name = data.get("new_product_name", "")
+    price = float(data.get("new_product_price", 0))
+    await state.clear()
+    ok = await db_add_product(category, key, name, price, delivery)
+    if ok:
+        await message.answer(
+            f"✅ Товар <b>{escape(name)}</b> добавлен!\n"
+            f"Ключ: <code>{key}</code>  Цена: <b>{int(price)}₽</b>",
+            parse_mode="HTML",
+            reply_markup=kb_admin_main(),
+        )
+    else:
+        await message.answer(
+            f"❌ Товар с ключом <code>{key}</code> уже существует. Выберите другой ключ.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_main(),
+        )
+
+
+# ---- Настройки (курсы и лимиты) ----
+
+@dp.callback_query(F.data == "adm:settings")
+async def cb_adm_settings(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    settings = await db_all_settings()
+    lines = [
+        f"• {_SETTING_LABELS.get(s['key'], s['key'])}: <b>{s['value']}</b>"
+        for s in settings
+    ]
+    text = "<b>⚙️ Курсы и лимиты</b>\n\n" + "\n".join(lines) + "\n\nНажмите на строку, чтобы изменить значение."
+    await send_or_edit(call, text, kb_settings_list(settings))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:settings:edit:"))
+async def cb_adm_settings_edit(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    key = call.data.split(":", 3)[3]
+    current = await db_get_setting(key, "—")
+    label = _SETTING_LABELS.get(key, key)
+    await state.set_state(AdminStates.waiting_edit_setting_value)
+    await state.update_data(edit_setting_key=key, edit_setting_label=label)
+    await send_or_edit(
+        call,
+        f"✏️ <b>{escape(label)}</b>\n\n"
+        f"Текущее значение: <b>{current}</b>\n\n"
+        "Введите новое значение (число, можно дробное через точку):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:settings")],
+        ]),
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_edit_setting_value)
+async def msg_adm_edit_setting(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        val = float(raw)
+        if val <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("⚠️ Введите положительное число (например: 1.5 или 10). Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    key = data.get("edit_setting_key", "")
+    label = data.get("edit_setting_label", key)
+    await state.clear()
+    # Для целочисленных настроек сохраняем без дробной части
+    save_val = str(int(val)) if val == int(val) else str(val)
+    await db_set_setting(key, save_val)
+    await message.answer(
+        f"✅ <b>{escape(label)}</b> обновлено: <b>{save_val}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_main(),
+    )
 
 
 @dp.callback_query(F.data.startswith("adm:users:"))
@@ -5084,23 +5711,31 @@ async def cb_mod_done(call: CallbackQuery) -> None:
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⭐ Оставить отзыв",
-                        callback_data=f"review:{order_id}",
+                        text="✅ Подтвердить получение",
+                        callback_data=f"confirm_receipt:{order_id}",
                     )
                 ],
-                [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
-                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отклонить",
+                        callback_data=f"reject_receipt:{order_id}",
+                    )
+                ],
             ]
         )
         await bot.send_message(
             tg_id,
             f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
-            "Спасибо за покупку. Будем рады видеть вас снова.\n\n"
-            "⭐ Если вам понравилось — оставьте, пожалуйста, отзыв. "
-            "Это поможет другим покупателям и нам стать лучше.",
+            "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
+            "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
+            "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
+            "прислать скриншот из игры в качестве доказательства.\n\n"
+            "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
             parse_mode="HTML",
             reply_markup=user_kb,
         )
+        await db_set_confirm_pending(order_id, True)
+        asyncio.create_task(_auto_confirm_receipt(order_id, tg_id))
     except Exception:
         pass
 
