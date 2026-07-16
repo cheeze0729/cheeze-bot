@@ -362,6 +362,10 @@ async def db_init() -> None:
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS "
             "discount_pct INTEGER NOT NULL DEFAULT 0"
         )
+        await conn.execute(
+            "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS "
+            "max_uses INTEGER DEFAULT NULL"
+        )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS referral_purchases (
                 id          SERIAL PRIMARY KEY,
@@ -808,15 +812,16 @@ async def db_create_promo(
     starts_at: str | None = None,
     expires_at: str | None = None,
     discount_pct: int = 0,
+    max_uses: int | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
     pool = await get_pool()
     promo_id = await pool.fetchval(
         "INSERT INTO promo_codes (code, game, product_title, promo_price, discount_pct,"
-        " starts_at, expires_at, is_active, created_at)"
-        " VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8) RETURNING id",
+        " starts_at, expires_at, is_active, created_at, max_uses)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9) RETURNING id",
         code.upper(), game, product_title, promo_price, discount_pct,
-        starts_at, expires_at, now,
+        starts_at, expires_at, now, max_uses,
     )
     return promo_id
 
@@ -875,21 +880,57 @@ async def db_claim_promo(tg_id: int, promo_id: int) -> bool:
 
 
 async def db_use_promo(tg_id: int, promo_id: int) -> bool:
-    """Помечает промокод как использованный. False — уже использован."""
+    """Помечает промокод как использованный.
+    Если достигнут лимит max_uses — автоматически деактивирует промокод.
+    Возвращает False, если уже использован или лимит исчерпан."""
     now = datetime.now(timezone.utc).isoformat()
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Проверяем, не использован ли уже промокод этим пользователем
             row = await conn.fetchrow(
                 "SELECT used_at FROM user_promos WHERE tg_id = $1 AND promo_id = $2",
                 tg_id, promo_id,
             )
             if not row or row["used_at"] is not None:
                 return False
+            # Получаем лимит активаций (с блокировкой строки)
+            promo_row = await conn.fetchrow(
+                "SELECT max_uses FROM promo_codes WHERE id = $1 FOR UPDATE",
+                promo_id,
+            )
+            max_uses = promo_row["max_uses"] if promo_row else None
+            # Проверяем лимит до записи
+            if max_uses is not None:
+                used_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM user_promos "
+                    "WHERE promo_id = $1 AND used_at IS NOT NULL",
+                    promo_id,
+                )
+                if int(used_count) >= max_uses:
+                    # Лимит исчерпан — деактивируем и отказываем
+                    await conn.execute(
+                        "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
+                        promo_id,
+                    )
+                    return False
+            # Помечаем как использованный
             await conn.execute(
                 "UPDATE user_promos SET used_at = $1 WHERE tg_id = $2 AND promo_id = $3",
                 now, tg_id, promo_id,
             )
+            # Проверяем, исчерпан ли лимит теперь — деактивируем автоматически
+            if max_uses is not None:
+                new_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM user_promos "
+                    "WHERE promo_id = $1 AND used_at IS NOT NULL",
+                    promo_id,
+                )
+                if int(new_count) >= max_uses:
+                    await conn.execute(
+                        "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
+                        promo_id,
+                    )
             return True
 
 
@@ -1229,6 +1270,7 @@ class PromoStates(StatesGroup):
     waiting_price = State()
     waiting_discount_pct = State()
     waiting_dates = State()
+    waiting_max_uses = State()
 
 
 # =====================================================================
@@ -5106,9 +5148,20 @@ async def cb_adm_promo_dates_forever(call: CallbackQuery, state: FSMContext) -> 
     await call.answer()
     if not _is_moderator(call.from_user.id):
         return
+    await state.update_data(promo_starts_at=None, promo_expires_at=None)
+    await state.set_state(PromoStates.waiting_max_uses)
     data = await state.get_data()
-    await state.clear()
-    await _save_promo_and_confirm(call, data, starts_at=None, expires_at=None)
+    code = data.get("promo_code", "?")
+    await send_or_edit(
+        call,
+        f"Код: <code>{escape(code)}</code>  |  Срок: ♾️ Бессрочно\n\n"
+        "🔢 Введите <b>лимит активаций</b> (сколько раз можно использовать этот промокод).\n\n"
+        "Или нажмите кнопку, если промокод без ограничений:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ]),
+    )
 
 
 @dp.message(PromoStates.waiting_dates)
@@ -5140,8 +5193,19 @@ async def msg_promo_dates(message: Message, state: FSMContext) -> None:
             )
             return
     data = await state.get_data()
-    await state.clear()
-    await _save_promo_and_confirm_msg(message, data, starts_at=starts_at, expires_at=expires_at)
+    await state.update_data(promo_starts_at=starts_at, promo_expires_at=expires_at)
+    await state.set_state(PromoStates.waiting_max_uses)
+    code = data.get("promo_code", "?")
+    await message.answer(
+        f"Код: <code>{escape(code)}</code>  |  Срок установлен.\n\n"
+        "🔢 Введите <b>лимит активаций</b> (сколько раз можно использовать этот промокод).\n\n"
+        "Или нажмите кнопку, если промокод без ограничений:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ]),
+    )
 
 
 async def _save_promo_and_confirm(
@@ -5149,6 +5213,7 @@ async def _save_promo_and_confirm(
     data: dict,
     starts_at: str | None,
     expires_at: str | None,
+    max_uses: int | None = None,
 ) -> None:
     code = data.get("promo_code")
     game = data.get("promo_game")
@@ -5164,8 +5229,10 @@ async def _save_promo_and_confirm(
         0 if is_pct else int(price),
         starts_at, expires_at,
         discount_pct=int(discount_pct) if is_pct else 0,
+        max_uses=max_uses,
     )
     dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    uses_str = f"<b>{max_uses}</b>" if max_uses is not None else "♾️ без ограничений"
     if is_pct:
         detail_line = f"💸 Скидка: <b>{discount_pct}%</b>\n"
     else:
@@ -5177,6 +5244,7 @@ async def _save_promo_and_confirm(
         f"📦 Описание: {escape(product)}\n"
         f"{detail_line}"
         f"📅 Срок: {dates_str}\n"
+        f"🔢 Лимит активаций: {uses_str}\n"
         f"🆔 ID: {promo_id}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -5191,6 +5259,7 @@ async def _save_promo_and_confirm_msg(
     data: dict,
     starts_at: str | None,
     expires_at: str | None,
+    max_uses: int | None = None,
 ) -> None:
     code = data.get("promo_code")
     game = data.get("promo_game")
@@ -5206,8 +5275,10 @@ async def _save_promo_and_confirm_msg(
         0 if is_pct else int(price),
         starts_at, expires_at,
         discount_pct=int(discount_pct) if is_pct else 0,
+        max_uses=max_uses,
     )
     dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    uses_str = f"<b>{max_uses}</b>" if max_uses is not None else "♾️ без ограничений"
     if is_pct:
         detail_line = f"💸 Скидка: <b>{discount_pct}%</b>\n"
     else:
@@ -5219,6 +5290,7 @@ async def _save_promo_and_confirm_msg(
         f"📦 Описание: {escape(product)}\n"
         f"{detail_line}"
         f"📅 Срок: {dates_str}\n"
+        f"🔢 Лимит активаций: {uses_str}\n"
         f"🆔 ID: {promo_id}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -5226,6 +5298,41 @@ async def _save_promo_and_confirm_msg(
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")],
     ])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "adm:promo_maxuses:unlimited")
+async def cb_adm_promo_maxuses_unlimited(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    data = await state.get_data()
+    await state.clear()
+    starts_at = data.get("promo_starts_at")
+    expires_at = data.get("promo_expires_at")
+    await _save_promo_and_confirm(call, data, starts_at=starts_at, expires_at=expires_at, max_uses=None)
+
+
+@dp.message(PromoStates.waiting_max_uses)
+async def msg_promo_max_uses(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    val = parse_positive_int(message.text)
+    if val is None or val <= 0:
+        await message.answer(
+            "⚠️ Введите положительное целое число (например: <code>100</code>) "
+            "или нажмите кнопку «Без ограничений».",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+            ]),
+        )
+        return
+    data = await state.get_data()
+    await state.clear()
+    starts_at = data.get("promo_starts_at")
+    expires_at = data.get("promo_expires_at")
+    await _save_promo_and_confirm_msg(message, data, starts_at=starts_at, expires_at=expires_at, max_uses=val)
 
 
 @dp.callback_query(F.data.startswith("adm:promo:"))
@@ -5249,14 +5356,25 @@ async def cb_adm_promo_detail(call: CallbackQuery) -> None:
     toggle_text = "🔴 Отключить" if promo["is_active"] else "✅ Включить"
     dates_str = _fmt_promo_dates(promo)
     valid_now = _promo_is_valid_now(promo)
+    max_uses = promo.get("max_uses")
+    if max_uses is not None:
+        uses_line = f"🔢 Использовано: <b>{usage_cnt} / {max_uses}</b>"
+    else:
+        uses_line = f"🔢 Использовано: <b>{usage_cnt}</b>  (♾️ без лимита)"
+    is_pct = promo.get("game") == "pct_discount"
+    price_line = (
+        f"💸 Скидка: <b>{promo['discount_pct']}%</b>"
+        if is_pct and promo.get("discount_pct", 0) > 0
+        else f"💰 Цена: <b>{promo['promo_price']}₽</b>"
+    )
     text = (
         f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
         f"📦 Товар: {escape(promo['product_title'])}\n"
-        f"💰 Цена: <b>{promo['promo_price']}₽</b>\n"
+        f"{price_line}\n"
         f"📅 Срок: {dates_str}\n"
         f"📊 Статус: {status_text}  |  Сейчас: {'🟢 работает' if valid_now else '🔴 не работает'}\n"
-        f"🛒 Использовано: <b>{usage_cnt}</b> раз"
+        f"{uses_line}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=toggle_text, callback_data=f"adm:promo_toggle:{promo_id}")],
