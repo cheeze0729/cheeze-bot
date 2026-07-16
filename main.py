@@ -45,6 +45,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BufferedInputFile,
@@ -1243,6 +1244,7 @@ class ShopStates(StatesGroup):
     waiting_review_photo = State()
     waiting_review_text = State()
     waiting_reject_screenshot = State()
+    waiting_email_code = State()
 
 
 class AdminStates(StatesGroup):
@@ -5891,12 +5893,33 @@ async def cb_mod_req_email_code(call: CallbackQuery) -> None:
             f"📧 <b>Требуется код из письма</b>\n\n"
             f"По вашему заказу <b>#{order_id}</b> модератор ожидает код подтверждения,\n"
             "который был отправлен на вашу электронную почту.\n\n"
-            "Пожалуйста, откройте письмо и пришлите код сюда следующим сообщением.",
+            "Пожалуйста, откройте письмо и пришлите код следующим сообщением.",
             parse_mode="HTML",
         )
+        # Ставим покупателю состояние ожидания кода удалённо
+        buyer_key = StorageKey(bot_id=bot.id, chat_id=tg_id, user_id=tg_id)
+        buyer_fsm = FSMContext(storage=dp.storage, key=buyer_key)
+        await buyer_fsm.set_state(ShopStates.waiting_email_code)
+        await buyer_fsm.update_data(email_code_order_id=order_id)
         await call.answer("Запрос отправлен покупателю.", show_alert=True)
     except Exception:
         await call.answer("Не удалось отправить уведомление покупателю.", show_alert=True)
+
+
+@dp.message(ShopStates.waiting_email_code)
+async def msg_email_code(message: Message, state: FSMContext) -> None:
+    """Покупатель прислал код из почты — пересылаем модератору."""
+    data = await state.get_data()
+    order_id = data.get("email_code_order_id", "?")
+    await state.clear()
+
+    await notify_moderator(
+        f"📧 <b>Код из почты по заказу #{order_id}</b>\n\n"
+        f"<code>{escape(message.text or '(нет текста)')}</code>"
+    )
+    await message.answer(
+        "✅ Код отправлен модератору. Ожидайте выполнения заказа.",
+    )
 
 
 @dp.callback_query(F.data.startswith("mod:refund:"))
