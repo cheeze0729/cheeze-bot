@@ -2319,6 +2319,8 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     admin_rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="✅ Завершить заказ",
                               callback_data=f"ordone:{order_id}:{user.id}")],
+        [InlineKeyboardButton(text="📧 Запросить код из почты",
+                              callback_data=f"mod:req_email:{order_id}:{user.id}")],
         [InlineKeyboardButton(text="💸 Возврат",
                               callback_data=f"mod:refund:{order_id}")],
     ]
@@ -5786,6 +5788,7 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
     )
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"✅ Выполнен #{order_id}", callback_data=f"mod:done:{order_id}")],
+        [InlineKeyboardButton(text="📧 Запросить код из почты", callback_data=f"mod:req_email:{order_id}:{user.id}")],
         [InlineKeyboardButton(text="💸 Возврат", callback_data=f"mod:refund:{order_id}")],
     ])
     await notify_moderator_order(admin_text, reply_markup=admin_kb)
@@ -5867,6 +5870,33 @@ async def cb_mod_done(call: CallbackQuery) -> None:
         await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
     except Exception:
         pass
+
+
+@dp.callback_query(F.data.startswith("mod:req_email:"))
+async def cb_mod_req_email_code(call: CallbackQuery) -> None:
+    """Модератор запрашивает у покупателя код из письма на почте."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        parts = call.data.split(":")
+        order_id = int(parts[2])
+        tg_id = int(parts[3])
+    except (ValueError, IndexError):
+        return
+
+    try:
+        await bot.send_message(
+            tg_id,
+            f"📧 <b>Требуется код из письма</b>\n\n"
+            f"По вашему заказу <b>#{order_id}</b> модератор ожидает код подтверждения,\n"
+            "который был отправлен на вашу электронную почту.\n\n"
+            "Пожалуйста, откройте письмо и пришлите код сюда следующим сообщением.",
+            parse_mode="HTML",
+        )
+        await call.answer("Запрос отправлен покупателю.", show_alert=True)
+    except Exception:
+        await call.answer("Не удалось отправить уведомление покупателю.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("mod:refund:"))
