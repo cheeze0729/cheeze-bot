@@ -119,6 +119,8 @@ SECTION_IMAGES: dict[str, str | None] = {
     # Карточки товаров (общие для всех товаров категории):
     "card_roblox_instant": None,
     "card_brawl": None,
+    # Динамические категории из админки:
+    "pubg": "images/pubg.png",
 }
 
 # Курсы и лимиты теперь хранятся в таблице settings (управляются через /admin → Каталог и курсы).
@@ -1784,36 +1786,40 @@ async def show_section(
 
     if image and len(text) <= 1024:
         if isinstance(image, str) and not image.startswith(("http://", "https://")):
-            local_path = image
-            if not os.path.isabs(local_path):
-                local_path = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    local_path,
-                )
+            # Пробуем найти файл относительно скрипта, затем relative to CWD
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            local_path = image if os.path.isabs(image) else os.path.join(script_dir, image)
+            if not os.path.exists(local_path):
+                local_path = os.path.abspath(image)
             if os.path.exists(local_path):
-                photo = FSInputFile(local_path)
+                try:
+                    with open(local_path, "rb") as _f:
+                        photo = BufferedInputFile(_f.read(), filename=os.path.basename(local_path))
+                except Exception:
+                    photo = None
             else:
-                photo = image
+                photo = None
         else:
             photo = image
 
-        chat_id = call.message.chat.id
-        try:
-            await call.message.delete()
-        except Exception:
-            pass
+        if photo is not None:
+            chat_id = call.message.chat.id
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
 
-        try:
-            sent = await bot.send_photo(
-                chat_id,
-                photo=photo,
-                caption=text,
-                reply_markup=kb,
-                parse_mode="HTML",
-            )
-            return sent
-        except Exception as e:
-            logging.warning(f"Не удалось отправить картинку '{key}': {e}")
+            try:
+                sent = await bot.send_photo(
+                    chat_id,
+                    photo=photo,
+                    caption=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+                return sent
+            except Exception as e:
+                logging.warning(f"Не удалось отправить картинку '{key}': {e}")
 
     return await send_or_edit(call, text, kb)
 
