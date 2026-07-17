@@ -111,7 +111,8 @@ SECTION_IMAGES: dict[str, str | None] = {
     "tgstars": "https://i.ibb.co/N2JJ5SHb/42-E499-C6-7-FE1-4-E03-94-A4-47-E6-A705-FEAA.png",  # Telegram Stars
     "other": None,  # Другие приложения
     "profile": "https://i.ibb.co/5x2bNNJK/56-D6214-E-F8-F0-4-BFE-AF06-EBA573966-CD0.png",  # Профиль
-    "orders": "https://i.ibb.co/Gvpsmbnq/886-D71-D9-F7-B0-4-A9-E-A540-180-FFB450321.png",  # Мои заказы
+    "orders": "images/history.png",     # Мои заказы / История заказов
+    "tx_history": "images/history.png", # История транзакций (админ)
     "topup": None,  # Пополнение баланса
     "support": "https://i.ibb.co/pvcyff13/13-B5-AB68-5-FDA-4598-B1-D7-12-F98-A0188-D7.png",  # Поддержка
     "info": "https://i.ibb.co/n8gT4YRD/4-AF7623-F-D966-4130-9-D7-F-592-ED9-C22935.png",  # Информация о магазине
@@ -843,13 +844,21 @@ async def db_add_transaction(
     )
 
 
-async def db_get_transactions(tg_id: int, limit: int = 20) -> list[dict]:
+async def db_get_transactions(tg_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch(
-        "SELECT * FROM transactions WHERE tg_id = $1 ORDER BY id DESC LIMIT $2",
-        tg_id, limit,
+        "SELECT * FROM transactions WHERE tg_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3",
+        tg_id, limit, offset,
     )
     return [dict(r) for r in rows]
+
+
+async def db_transactions_count(tg_id: int) -> int:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT COUNT(*) FROM transactions WHERE tg_id = $1", tg_id
+    )
+    return int(val) if val else 0
 
 
 async def db_set_balance(tg_id: int, value: float) -> float:
@@ -883,11 +892,11 @@ async def db_find_user(tg_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-async def db_get_orders(tg_id: int, limit: int = 10) -> list[dict]:
+async def db_get_orders(tg_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch(
-        "SELECT * FROM orders WHERE tg_id = $1 ORDER BY id DESC LIMIT $2",
-        tg_id, limit,
+        "SELECT * FROM orders WHERE tg_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3",
+        tg_id, limit, offset,
     )
     return [dict(r) for r in rows]
 
@@ -1785,41 +1794,22 @@ async def show_section(
     image = SECTION_IMAGES.get(key)
 
     if image and len(text) <= 1024:
-        if isinstance(image, str) and not image.startswith(("http://", "https://")):
-            # Пробуем найти файл относительно скрипта, затем relative to CWD
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            local_path = image if os.path.isabs(image) else os.path.join(script_dir, image)
-            if not os.path.exists(local_path):
-                local_path = os.path.abspath(image)
-            if os.path.exists(local_path):
-                try:
-                    with open(local_path, "rb") as _f:
-                        photo = BufferedInputFile(_f.read(), filename=os.path.basename(local_path))
-                except Exception:
-                    photo = None
-            else:
-                photo = None
-        else:
-            photo = image
-
-        if photo is not None:
-            chat_id = call.message.chat.id
-            try:
-                await call.message.delete()
-            except Exception:
-                pass
-
-            try:
-                sent = await bot.send_photo(
-                    chat_id,
-                    photo=photo,
-                    caption=text,
-                    reply_markup=kb,
-                    parse_mode="HTML",
-                )
-                return sent
-            except Exception as e:
-                logging.warning(f"Не удалось отправить картинку '{key}': {e}")
+        chat_id = call.message.chat.id
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        try:
+            sent = await bot.send_photo(
+                chat_id,
+                photo=image,
+                caption=text,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return sent
+        except Exception as e:
+            logging.warning(f"Не удалось отправить картинку '{key}': {e}")
 
     return await send_or_edit(call, text, kb)
 
@@ -2819,46 +2809,64 @@ async def cb_profile(call: CallbackQuery) -> None:
     await call.answer()
 
 
-@dp.callback_query(F.data == "orders")
-async def cb_orders(call: CallbackQuery) -> None:
-    orders = await db_get_orders(call.from_user.id, limit=10)
+_ORDERS_PAGE_SIZE = 5
+_TX_PAGE_SIZE = 5
+
+
+async def _show_orders_page(call: CallbackQuery, tg_id: int, page: int) -> None:
+    total = await db_orders_count(tg_id)
+    total_pages = max(1, (total + _ORDERS_PAGE_SIZE - 1) // _ORDERS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    orders = await db_get_orders(tg_id, limit=_ORDERS_PAGE_SIZE, offset=page * _ORDERS_PAGE_SIZE)
 
     rows = []
-
-    if not orders:
+    if not orders and total == 0:
         text = "📦 <b>История заказов</b>\n\nУ вас пока нет заказов."
     else:
-        lines = ["📦 <b>История заказов</b>\n"]
+        lines = [f"📦 <b>История заказов</b>  {page + 1}/{total_pages}\n"]
         for o in orders:
             date = _fmt_msk(o["created_at"])
             lines.append(
-                f"<b>#{o['id']}</b>  •  {escape(o['title'])}\n"
-                f"Сумма: {o['price']}₽  •  Статус: {escape(o['status'])}\n"
-                f"<i>{date}</i>\n"
+                f"<b>#{o['id']}</b> • {escape(o['title'])}\n"
+                f"{o['price']}₽ • {escape(o['status'])}\n"
+                f"<i>{date}</i>"
             )
-
             if o["status"] != "Выполнен":
-                rows.append(
-                    [
-                        InlineKeyboardButton(
-                            text=f"⚙️ Действия по заказу #{o['id']}",
-                            callback_data=f"order_actions:{o['id']}",
-                        )
-                    ]
-                )
+                rows.append([InlineKeyboardButton(
+                    text=f"⚙️ Заказ #{o['id']}",
+                    callback_data=f"order_actions:{o['id']}",
+                )])
+        text = "\n\n".join(lines)
 
-        text = "\n".join(lines)
-
-    rows.append(
-        [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="profile"),
-            InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
-        ]
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
-    await show_section(call, "orders", text, kb)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"orders:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"orders:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="profile"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+    ])
+    await show_section(call, "orders", text, InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
+
+
+@dp.callback_query(F.data == "orders")
+async def cb_orders(call: CallbackQuery) -> None:
+    await _show_orders_page(call, call.from_user.id, 0)
+
+
+@dp.callback_query(F.data.startswith("orders:"))
+async def cb_orders_page(call: CallbackQuery) -> None:
+    try:
+        page = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        page = 0
+    await _show_orders_page(call, call.from_user.id, page)
 
 
 @dp.callback_query(F.data.startswith("order_actions:"))
@@ -2930,39 +2938,59 @@ def _format_tx_kind(kind: str) -> str:
     }.get(kind, kind)
 
 
-@dp.callback_query(F.data == "transactions")
-async def cb_transactions(call: CallbackQuery) -> None:
-    txs = await db_get_transactions(call.from_user.id, limit=20)
-    if not txs:
+async def _show_tx_page(call: CallbackQuery, tg_id: int, page: int) -> None:
+    total = await db_transactions_count(tg_id)
+    total_pages = max(1, (total + _TX_PAGE_SIZE - 1) // _TX_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    txs = await db_get_transactions(tg_id, limit=_TX_PAGE_SIZE, offset=page * _TX_PAGE_SIZE)
+
+    if not txs and total == 0:
         text = (
             "📜 <b>История транзакций</b>\n\n"
-            "Здесь будут отображаться все начисления и списания по "
-            "вашему балансу. Пока операций нет."
+            "Здесь будут отображаться все начисления и списания по вашему балансу. Пока операций нет."
         )
     else:
-        lines = ["📜 <b>История транзакций</b>\n"]
+        lines = [f"📜 <b>История транзакций</b>  {page + 1}/{total_pages}\n"]
         for t in txs:
             date = _fmt_msk(t["created_at"])
             sign = "➕" if t["amount"] > 0 else "➖"
             lines.append(
-                f"{sign} <b>{abs(t['amount'])}₽</b> — "
-                f"{escape(_format_tx_kind(t['kind']))}\n"
-                + (f"<i>{escape(t['reason'])}</i>\n" if t["reason"] else "")
-                + f"<i>{date}</i>\n"
+                f"{sign} <b>{abs(t['amount'])}₽</b> — {escape(_format_tx_kind(t['kind']))}"
+                + (f"\n<i>{escape(t['reason'])}</i>" if t["reason"] else "")
+                + f"\n<i>{date}</i>"
             )
-        text = "\n".join(lines)
-        if len(text) > 3800:
-            text = text[:3800] + "\n…"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="profile"),
-                InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
-            ],
-        ]
-    )
-    await show_section(call, "orders", text, kb)
+        text = "\n\n".join(lines)
+
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"transactions:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"transactions:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="profile"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+    ])
+    await show_section(call, "tx_history", text, InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
+
+
+@dp.callback_query(F.data == "transactions")
+async def cb_transactions(call: CallbackQuery) -> None:
+    await _show_tx_page(call, call.from_user.id, 0)
+
+
+@dp.callback_query(F.data.startswith("transactions:"))
+async def cb_transactions_page(call: CallbackQuery) -> None:
+    try:
+        page = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        page = 0
+    await _show_tx_page(call, call.from_user.id, page)
 
 
 # =====================================================================
@@ -5404,51 +5432,53 @@ async def cb_adm_unblock(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_adm_transactions(call: CallbackQuery) -> None:
     await call.answer()
     if not _is_moderator(call.from_user.id):
-        await call.answer("Только для модератора.", show_alert=True)
         return
+    parts = call.data.split(":")
+    # формат: adm:tx:<id> или adm:tx:<id>:<page>
     try:
-        target_id = int(call.data.split(":")[2])
+        target_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
     except (ValueError, IndexError):
         await call.answer("Некорректные данные.", show_alert=True)
         return
 
-    txs = await db_get_transactions(target_id, limit=30)
-    if not txs:
+    total = await db_transactions_count(target_id)
+    total_pages = max(1, (total + _TX_PAGE_SIZE - 1) // _TX_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    txs = await db_get_transactions(target_id, limit=_TX_PAGE_SIZE, offset=page * _TX_PAGE_SIZE)
+
+    if not txs and total == 0:
         text = (
             f"📜 <b>История транзакций</b>\n"
             f"Пользователь: <code>{target_id}</code>\n\n"
             "Операций нет."
         )
     else:
-        lines = [
-            f"📜 <b>История транзакций</b>",
-            f"Пользователь: <code>{target_id}</code>\n",
-        ]
+        lines = [f"📜 <b>История транзакций</b>  {page + 1}/{total_pages}\n"
+                 f"Пользователь: <code>{target_id}</code>"]
         for t in txs:
             date = _fmt_msk(t["created_at"])
             sign = "➕" if t["amount"] > 0 else "➖"
             lines.append(
-                f"{sign} <b>{abs(t['amount'])}₽</b> — "
-                f"{escape(_format_tx_kind(t['kind']))}\n"
-                + (f"<i>{escape(t['reason'])}</i>\n" if t["reason"] else "")
-                + f"<i>{date}</i>"
+                f"{sign} <b>{abs(t['amount'])}₽</b> — {escape(_format_tx_kind(t['kind']))}"
+                + (f"\n<i>{escape(t['reason'])}</i>" if t["reason"] else "")
+                + f"\n<i>{date}</i>"
             )
-        text = "\n".join(lines)
-        if len(text) > 3800:
-            text = text[:3800] + "\n…"
+        text = "\n\n".join(lines)
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ К пользователю",
-                    callback_data=f"adm:back:{target_id}",
-                )
-            ],
-            [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
-        ]
-    )
-    await send_or_edit(call, text, kb)
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm:tx:{target_id}:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"adm:tx:{target_id}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")])
+    await show_section(call, "tx_history", text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.callback_query(F.data.startswith("adm:back:"))
@@ -7567,10 +7597,57 @@ async def global_error_handler(event: ErrorEvent) -> bool:
     return True
 
 
+async def _preload_local_section_images() -> None:
+    """При старте загружает локальные файлы картинок в Telegram, кешируя file_id в БД.
+    После этого show_section использует file_id напрямую — надёжно и быстро."""
+    if not MODERATOR_CHAT_ID:
+        logging.warning("MODERATOR_CHAT_ID не задан — локальные картинки не будут загружены.")
+        return
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for key, path in list(SECTION_IMAGES.items()):
+        if not path:
+            continue
+        if isinstance(path, str) and path.startswith(("http://", "https://")):
+            continue  # URL — уже готово
+        # Локальный файл: ищем сначала относительно скрипта, потом CWD
+        abs_path = path if os.path.isabs(path) else os.path.join(script_dir, path)
+        if not os.path.exists(abs_path):
+            abs_path = os.path.abspath(path)
+        if not os.path.exists(abs_path):
+            logging.warning(f"Файл картинки не найден: {path} (секция '{key}')")
+            continue
+        # Проверяем кеш в БД
+        cache_key = f"img_file_id_{key}"
+        cached_fid = await db_get_setting(cache_key, "")
+        if cached_fid:
+            SECTION_IMAGES[key] = cached_fid
+            logging.info(f"Секция '{key}': file_id загружен из кеша.")
+            continue
+        # Загружаем в Telegram, получаем file_id
+        try:
+            with open(abs_path, "rb") as f:
+                msg = await bot.send_photo(
+                    MODERATOR_CHAT_ID,
+                    photo=BufferedInputFile(f.read(), filename=os.path.basename(abs_path)),
+                    caption=f"[img-cache:{key}]",
+                )
+            file_id = msg.photo[-1].file_id
+            await db_set_setting(cache_key, file_id)
+            SECTION_IMAGES[key] = file_id
+            try:
+                await bot.delete_message(MODERATOR_CHAT_ID, msg.message_id)
+            except Exception:
+                pass
+            logging.info(f"Секция '{key}': file_id получен и закеширован.")
+        except Exception as e:
+            logging.warning(f"Не удалось загрузить картинку для секции '{key}': {e}")
+
+
 async def main() -> None:
     _acquire_single_instance_lock()
     await db_init()
     logging.info("Бот запускается...")
+    await _preload_local_section_images()
     await bot.delete_webhook(drop_pending_updates=True)
     await asyncio.gather(
         dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
