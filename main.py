@@ -5777,14 +5777,29 @@ def kb_admin_promos(promos: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_promo_game_select() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+async def kb_promo_game_select() -> InlineKeyboardMarkup:
+    # Захардкоженные категории (ключи)
+    _HARDCODED_KEYS = {"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"}
+    rows = [
         [InlineKeyboardButton(text="🟦 Roblox", callback_data="adm:promo_game:Roblox")],
         [InlineKeyboardButton(text="⭐ Brawl Stars", callback_data="adm:promo_game:Brawl Stars")],
         [InlineKeyboardButton(text="✨ Telegram Stars", callback_data="adm:promo_game:Telegram Stars")],
         [InlineKeyboardButton(text="📦 Другое", callback_data="adm:promo_game:Другое")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
-    ])
+    ]
+    # Добавляем категории, созданные через админку (не зарезервированные, не отключённые)
+    try:
+        cats = await db_all_categories()
+        for cat in cats:
+            if cat["key"] not in _HARDCODED_KEYS and not cat.get("disabled"):
+                label = f"{cat['emoji']} {cat['name']}"
+                rows.append([InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"adm:promo_game:{cat['name']}",
+                )])
+    except Exception:
+        pass
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.callback_query(F.data == "adm:panel")
@@ -5913,7 +5928,7 @@ async def cb_adm_promo_type(call: CallbackQuery, state: FSMContext) -> None:
             call,
             f"Код: <code>{escape(code)}</code>\n\n"
             "🎮 Выберите <b>игру</b>, для которой действует промокод:",
-            kb_promo_game_select()
+            await kb_promo_game_select()
         )
 
 
