@@ -4791,44 +4791,6 @@ async def msg_adm_cat_login_hint(message: Message, state: FSMContext) -> None:
 # ---- Управление товарами (страница товара) ----
 
 
-@dp.callback_query(F.data.startswith("adm:prod:"))
-async def cb_adm_prod(call: CallbackQuery, state: FSMContext) -> None:
-    """Страница управления конкретным товаром."""
-    await call.answer()
-    if not _is_moderator(call.from_user.id):
-        return
-    parts = call.data.split(":", 2)
-    prod_key = parts[2]
-
-    # Вложенные действия маршрутизируются ниже через отдельные хендлеры;
-    # сюда попадают только прямые adm:prod:<key> без дополнительного сегмента.
-    if ":" in prod_key:
-        return  # маршрутизируется более специфичными хендлерами
-
-    product = await db_get_product_by_key(prod_key)
-    if not product:
-        await call.answer("Товар не найден.", show_alert=True)
-        return
-    key, name, price, delivery = product
-    # Определяем категорию
-    all_prods = await db_all_products()
-    prod_row = next((p for p in all_prods if p["key"] == prod_key), None)
-    cat_key = prod_row["category"] if prod_row else ""
-    cat = await db_get_category(cat_key) if cat_key else None
-    cat_label = f"{cat['emoji']} {cat['name']}" if cat else cat_key
-    status = "✅ активен" if (prod_row and prod_row.get("active")) else "❌ скрыт"
-    price_str = f"{int(price)}₽" if price == int(price) else f"{price}₽"
-    text = (
-        f"📦 <b>{escape(name)}</b>\n\n"
-        f"Цена: <b>{price_str}</b>\n"
-        f"Статус: {status}\n"
-        f"Выдача: {escape(delivery)}\n"
-        f"Категория: {escape(cat_label)}"
-    )
-    await send_or_edit(call, text, kb_product_manage(prod_key, cat_key))
-    await state.update_data(prod_manage_cat=cat_key)
-
-
 @dp.callback_query(F.data.startswith("adm:prod:rename:"))
 async def cb_adm_prod_rename(call: CallbackQuery, state: FSMContext) -> None:
     """Начало переименования товара."""
@@ -4924,6 +4886,39 @@ async def cb_adm_prod_delyes(call: CallbackQuery, state: FSMContext) -> None:
             [InlineKeyboardButton(text="⬅️ К списку товаров", callback_data=f"adm:catalog:cat:{cat_key}")],
         ]),
     )
+
+
+@dp.callback_query(F.data.startswith("adm:prod:"))
+async def cb_adm_prod(call: CallbackQuery, state: FSMContext) -> None:
+    """Страница управления конкретным товаром."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    parts = call.data.split(":", 2)
+    prod_key = parts[2]
+
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    key, name, price, delivery = product
+    # Определяем категорию
+    all_prods = await db_all_products()
+    prod_row = next((p for p in all_prods if p["key"] == prod_key), None)
+    cat_key = prod_row["category"] if prod_row else ""
+    cat = await db_get_category(cat_key) if cat_key else None
+    cat_label = f"{cat['emoji']} {cat['name']}" if cat else cat_key
+    status = "✅ активен" if (prod_row and prod_row.get("active")) else "❌ скрыт"
+    price_str = f"{int(price)}₽" if price == int(price) else f"{price}₽"
+    text = (
+        f"📦 <b>{escape(name)}</b>\n\n"
+        f"Цена: <b>{price_str}</b>\n"
+        f"Статус: {status}\n"
+        f"Выдача: {escape(delivery)}\n"
+        f"Категория: {escape(cat_label)}"
+    )
+    await send_or_edit(call, text, kb_product_manage(prod_key, cat_key))
+    await state.update_data(prod_manage_cat=cat_key)
 
 
 # ---- Переименование категории ----
