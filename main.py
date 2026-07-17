@@ -184,12 +184,12 @@ GUARANTEE_TEXT = (
 # отправить эти данные сообщением, сохранит их к заказу и перешлёт
 # модератору. Если оставить None — данные не запрашиваются.
 
+# login_hint для категорий со специальными хендлерами (не управляются через DB)
 LOGIN_HINTS = {
-    "roblox_instant": "Отправьте логин (никнейм) в Roblox.",
     "roblox_gamepass": "Отправьте ссылку на созданный геймпасс в Roblox.",
-    "brawl": "Отправьте почту, привязанную к вашему аккаунту и ожидайте код.",
     "tgstars": "Отправьте @username аккаунта Telegram для зачисления звёзд.",
 }
+# Стандартные категории из DB теперь хранят login_hint и needs_code в таблице categories
 
 # =====================================================================
 # КАТАЛОГ ТОВАРОВ
@@ -406,6 +406,34 @@ async def db_init() -> None:
                 ('min_tg_stars',                  '50')
             ON CONFLICT (key) DO NOTHING
         """)
+        # Таблица категорий (для динамического магазина)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                key             TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                emoji           TEXT NOT NULL DEFAULT '🎮',
+                sort_order      INTEGER NOT NULL DEFAULT 0,
+                disabled        BOOLEAN NOT NULL DEFAULT FALSE,
+                disabled_reason TEXT DEFAULT NULL,
+                login_hint      TEXT DEFAULT NULL,
+                needs_code      BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        await conn.execute("""
+            INSERT INTO categories (key, name, emoji, sort_order, disabled, login_hint, needs_code) VALUES
+                ('roblox_instant', 'Roblox — моментально', '🟦', 0, FALSE,
+                 'Отправьте логин (никнейм) в Roblox.', TRUE),
+                ('brawl', 'Brawl Stars', '⭐', 1, FALSE,
+                 'Отправьте почту, привязанную к вашему аккаунту и ожидайте код.', TRUE)
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Миграция: добавляем новые колонки категорий если таблица уже была
+        for col_sql in [
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS disabled_reason TEXT DEFAULT NULL",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS login_hint TEXT DEFAULT NULL",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS needs_code BOOLEAN NOT NULL DEFAULT FALSE",
+        ]:
+            await conn.execute(col_sql)
         # Заполняем каталог начальными товарами (не перезаписываем существующие)
         await conn.execute("""
             INSERT INTO products (category, key, name, price, delivery, sort_order) VALUES
@@ -648,6 +676,58 @@ async def db_all_settings() -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch("SELECT key, value FROM settings ORDER BY key")
     return [dict(r) for r in rows]
+
+
+async def db_all_categories() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code "
+        "FROM categories ORDER BY sort_order, key"
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_get_category(key: str) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code "
+        "FROM categories WHERE key = $1", key
+    )
+    return dict(row) if row else None
+
+
+async def db_create_category(key: str, name: str, emoji: str) -> None:
+    pool = await get_pool()
+    sort_max = await pool.fetchval("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories")
+    await pool.execute(
+        "INSERT INTO categories (key, name, emoji, sort_order) VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (key) DO NOTHING",
+        key, name, emoji, int(sort_max or 0),
+    )
+
+
+async def db_set_category_disabled(key: str, disabled: bool, reason: str | None = None) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE categories SET disabled = $1, disabled_reason = $2 WHERE key = $3",
+        disabled, reason, key,
+    )
+
+
+async def db_update_category_login_hint(key: str, text: str | None) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE categories SET login_hint = $1 WHERE key = $2", text, key
+    )
+
+
+async def db_toggle_category_needs_code(key: str) -> bool:
+    pool = await get_pool()
+    new_val = await pool.fetchval(
+        "UPDATE categories SET needs_code = NOT needs_code WHERE key = $1 RETURNING needs_code",
+        key,
+    )
+    return bool(new_val)
 
 
 async def db_get_order(order_id: int) -> dict | None:
@@ -1263,6 +1343,12 @@ class AdminStates(StatesGroup):
     waiting_new_product_name = State()     # название нового товара
     waiting_new_product_price = State()    # цена нового товара
     waiting_new_product_delivery = State() # способ выдачи нового товара
+    # Управление категориями
+    waiting_new_cat_key = State()          # ключ новой категории
+    waiting_new_cat_name = State()         # название новой категории
+    waiting_new_cat_emoji = State()        # эмодзи новой категории
+    waiting_cat_disabled_reason = State()  # причина отключения категории
+    waiting_cat_login_hint = State()       # текст после оплаты для категории
 
 
 class PromoStates(StatesGroup):
@@ -1300,34 +1386,22 @@ def kb_main_menu() -> InlineKeyboardMarkup:
     )
 
 
-def kb_shop() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🟦 Roblox, моментально", callback_data="cat:roblox_instant"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎮 Roblox, геймпассом (5 дней)",
-                    callback_data="cat:roblox_gamepass",
-                )
-            ],
-            [InlineKeyboardButton(text="⭐ Brawl Stars", callback_data="cat:brawl")],
-            [
-                InlineKeyboardButton(
-                    text="✨ Telegram Stars", callback_data="cat:tgstars"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📱 Другие приложения", callback_data="cat:other"
-                )
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main")],
-        ]
-    )
+async def kb_shop_dynamic() -> InlineKeyboardMarkup:
+    """Динамическая клавиатура магазина из таблицы categories + хардкод-категории."""
+    cats = await db_all_categories()
+    rows: list[list[InlineKeyboardButton]] = []
+    for cat in cats:
+        icon = "⚠️ " if cat["disabled"] else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{icon}{cat['emoji']} {cat['name']}",
+            callback_data=f"cat:{cat['key']}",
+        )])
+    # Специальные категории с собственными хендлерами (не управляются через DB)
+    rows.append([InlineKeyboardButton(text="🎮 Roblox, геймпассом (5 дней)", callback_data="cat:roblox_gamepass")])
+    rows.append([InlineKeyboardButton(text="✨ Telegram Stars", callback_data="cat:tgstars")])
+    rows.append([InlineKeyboardButton(text="📱 Другие приложения", callback_data="cat:other")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_back_main(back_cb: str = "shop") -> InlineKeyboardMarkup:
@@ -1522,50 +1596,41 @@ def kb_calc_actions(buy_cb: str, change_cb: str) -> InlineKeyboardMarkup:
     )
 
 
-def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
+async def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
     order_id = int(order["id"])
     category = order.get("category")
     rows = []
 
-    if order_needs_login(category):
+    needs_login = await order_needs_login(category)
+    needs_code  = await order_needs_code(category)
+
+    if needs_login:
         login_label = (
             "🔗 Отправить ссылку на геймпасс"
             if category == "roblox_gamepass"
             else "🔐 Отправить данные для входа"
         )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=login_label,
-                    callback_data=f"send_login:{order_id}:{1 if order_needs_code(category) else 0}",
-                )
-            ]
-        )
+        rows.append([InlineKeyboardButton(
+            text=login_label,
+            callback_data=f"send_login:{order_id}:{1 if needs_code else 0}",
+        )])
 
-    if order_needs_code(category):
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="📨 Отправить код для входа",
-                    callback_data=f"send_code:{order_id}",
-                )
-            ]
-        )
+    if needs_code:
+        rows.append([InlineKeyboardButton(
+            text="📨 Отправить код для входа",
+            callback_data=f"send_code:{order_id}",
+        )])
 
-    rows.extend(
+    rows.extend([
+        [InlineKeyboardButton(
+            text="💬 Связаться с модератором через бота",
+            callback_data=f"contact_mod:{order_id}",
+        )],
         [
-            [
-                InlineKeyboardButton(
-                    text="💬 Связаться с модератором через бота",
-                    callback_data=f"contact_mod:{order_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="orders"),
-                InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
-            ],
-        ]
-    )
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="orders"),
+            InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+        ],
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1574,12 +1639,24 @@ def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
 # =====================================================================
 
 
-def order_needs_login(category: str | None) -> bool:
-    return bool(category and LOGIN_HINTS.get(category))
+async def order_needs_login(category: str | None) -> bool:
+    """Нужно ли запрашивать данные для входа после покупки."""
+    if not category:
+        return False
+    if category in LOGIN_HINTS:          # специальные хардкод-категории
+        return True
+    cat = await db_get_category(category)
+    return bool(cat and cat.get("login_hint"))
 
 
-def order_needs_code(category: str | None) -> bool:
-    return category in ("roblox_instant", "brawl")
+async def order_needs_code(category: str | None) -> bool:
+    """Нужно ли показывать кнопку «Отправить код для входа»."""
+    if not category:
+        return False
+    cat = await db_get_category(category)
+    if cat is not None:
+        return bool(cat.get("needs_code"))
+    return False
 
 
 async def _try_delete(msg: Message) -> None:
@@ -1862,7 +1939,8 @@ async def cb_info(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_shop(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await show_section(
-        call, "shop", "<b>Купить донат</b>\n\nВыберите категорию:", kb_shop()
+        call, "shop", "<b>Купить донат</b>\n\nВыберите категорию:",
+        await kb_shop_dynamic(),
     )
     await call.answer()
 
@@ -1872,11 +1950,20 @@ async def cb_shop(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "cat:roblox_instant")
 async def cb_roblox_instant(call: CallbackQuery) -> None:
+    cat = await db_get_category("roblox_instant")
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        await show_section(call, "roblox_instant",
+            f"⚠️ <b>Категория временно недоступна.</b>\n\n{escape(reason)}",
+            kb_back_main("shop"))
+        await call.answer()
+        return
     products = await db_get_products("roblox_instant")
+    label = f"{cat['emoji']} {cat['name']}" if cat else "Roblox — моментально"
     await show_section(
         call,
         "roblox_instant",
-        "<b>Roblox — моментально</b>\n\nВыберите количество робуксов:",
+        f"<b>{label}</b>\n\nВыберите количество робуксов:",
         kb_product_list(products, "rbi"),
     )
     await call.answer()
@@ -1964,19 +2051,25 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "cat:brawl")
 async def cb_brawl(call: CallbackQuery) -> None:
+    cat = await db_get_category("brawl")
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        await show_section(call, "brawl",
+            f"⚠️ <b>Категория временно недоступна.</b>\n\n{escape(reason)}",
+            kb_back_main("shop"))
+        await call.answer()
+        return
     brawl_products = await db_get_products("brawl")
+    label = f"{cat['emoji']} {cat['name']}" if cat else "Brawl Stars"
     rows = [
         [InlineKeyboardButton(text=f"{n} — {p}₽", callback_data=f"bs:{k}")]
         for k, n, p, _ in brawl_products
     ]
-    rows.append(
-        [InlineKeyboardButton(text="🎁 Другие акции", callback_data="bs:promo")]
-    )
+    rows.append([InlineKeyboardButton(text="🎁 Другие акции", callback_data="bs:promo")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="shop")])
     await show_section(
-        call,
-        "brawl",
-        "<b>Brawl Stars</b>\n\nВыберите товар:",
+        call, "brawl",
+        f"<b>{label}</b>\n\nВыберите товар:",
         InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await call.answer()
@@ -2078,6 +2171,84 @@ async def cb_other(call: CallbackQuery) -> None:
         call, "other", text, kb_username_link(OTHER_APPS_USERNAME, "shop")
     )
     await call.answer()
+
+
+# --- Универсальный хендлер для DB-категорий (создаваемых через админку) ---
+
+
+# Набор ключей с собственными хендлерами — generic-хендлер их игнорирует
+_BUILTIN_CAT_KEYS = frozenset({"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"})
+
+
+@dp.callback_query(F.data.startswith("cat:"))
+async def cb_cat_generic(call: CallbackQuery) -> None:
+    key = call.data.split(":", 1)[1]
+    if key in _BUILTIN_CAT_KEYS:
+        return  # обрабатывается отдельными хендлерами выше
+    await call.answer()
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    name = f"{cat['emoji']} {cat['name']}"
+    if cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        await show_section(call, key,
+            f"⚠️ <b>{escape(name)}</b>\n\n<b>Категория временно недоступна.</b>\n\n{escape(reason)}",
+            kb_back_main("shop"))
+        return
+    products = await db_get_products(key)
+    if not products:
+        await show_section(call, key,
+            f"<b>{escape(name)}</b>\n\nТоваров пока нет.", kb_back_main("shop"))
+        return
+    await show_section(call, key,
+        f"<b>{escape(name)}</b>\n\nВыберите товар:",
+        kb_product_list(products, f"cp:{key}", "shop"))
+
+
+@dp.callback_query(F.data.startswith("cp:"))
+async def cb_cat_prod_card(call: CallbackQuery) -> None:
+    """Карточка товара из DB-категории."""
+    await call.answer()
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        return
+    cat_key, prod_key = parts[1], parts[2]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, delivery = product
+    cat = await db_get_category(cat_key)
+    cat_name = f"{cat['emoji']} {cat['name']}" if cat else cat_key
+    text = (
+        f"<b>{escape(name)}</b>\n\n"
+        f"Цена: <b>{price}₽</b>\n"
+        f"Способ выдачи: {escape(delivery)}\n"
+        "Способ оплаты: Оплата с внутреннего баланса бота\n\n"
+        "Для покупки на вашем внутреннем балансе должно быть достаточно средств."
+    )
+    await show_section(call, f"card_{cat_key}", text,
+        kb_product_card(f"buy_cp:{cat_key}:{prod_key}", f"cat:{cat_key}"))
+
+
+@dp.callback_query(F.data.startswith("buy_cp:"))
+async def cb_buy_cat_prod(call: CallbackQuery, state: FSMContext) -> None:
+    """Оплата товара из DB-категории."""
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        return
+    cat_key, prod_key = parts[1], parts[2]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    cat = await db_get_category(cat_key)
+    _, name, price, _ = product
+    cat_name = cat["name"] if cat else cat_key
+    title = f"{cat_name} — {name}"
+    await perform_purchase(call, title, float(price), category=cat_key, state=state)
 
 
 # =====================================================================
@@ -2249,8 +2420,17 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
         _processing_payments.discard(user.id)
 
     new_balance = await db_get_balance(user.id)
-    login_hint = LOGIN_HINTS.get(category) if category else None
-    needs_code = category in ("roblox_instant", "brawl")
+    # Текст после оплаты: для специальных категорий — хардкод, для DB-категорий — из таблицы
+    if category in LOGIN_HINTS:
+        login_hint = LOGIN_HINTS.get(category)
+        needs_code = False
+    elif category:
+        _cat_obj = await db_get_category(category)
+        login_hint = _cat_obj.get("login_hint") if _cat_obj else None
+        needs_code = bool(_cat_obj.get("needs_code")) if _cat_obj else False
+    else:
+        login_hint = None
+        needs_code = False
     login_label = "🔐 Отправить данные для входа"
 
     disc_line = ""
@@ -2698,7 +2878,7 @@ async def cb_order_actions(call: CallbackQuery) -> None:
         f"Статус: <b>{escape(order['status'])}</b>\n\n"
         "Выберите действие по заказу:"
     )
-    await send_or_edit(call, text, kb_order_actions(order))
+    await send_or_edit(call, text, await kb_order_actions(order))
     await call.answer()
 
 
@@ -3746,11 +3926,6 @@ def kb_admin_main() -> InlineKeyboardMarkup:
 
 # ---- вспомогательные словари для каталога ----
 
-_CATEGORY_LABELS: dict[str, str] = {
-    "roblox_instant": "🎮 Roblox — моментально",
-    "brawl":          "⚔️ Brawl Stars",
-}
-
 _SETTING_LABELS: dict[str, str] = {
     "robux_gamepass_rate":            "💎 Курс геймпасс (₽/робукс)",
     "robux_gamepass_pass_price_rate": "🎮 Делитель цены геймпасса",
@@ -3760,17 +3935,23 @@ _SETTING_LABELS: dict[str, str] = {
 }
 
 
-def kb_catalog_categories() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=label, callback_data=f"adm:catalog:cat:{cat}")]
-        for cat, label in _CATEGORY_LABELS.items()
-    ]
+async def kb_catalog_categories() -> InlineKeyboardMarkup:
+    cats = await db_all_categories()
+    rows: list[list[InlineKeyboardButton]] = []
+    for cat in cats:
+        status = "⚠️ " if cat["disabled"] else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{status}{cat['emoji']} {cat['name']}",
+            callback_data=f"adm:catalog:cat:{cat['key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Создать категорию", callback_data="adm:catalog:new_cat")])
     rows.append([InlineKeyboardButton(text="⚙️ Курсы и лимиты", callback_data="adm:settings")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_catalog_products(products: list[dict], category: str) -> InlineKeyboardMarkup:
+def kb_catalog_products_admin(products: list[dict], category: str) -> InlineKeyboardMarkup:
+    """Клавиатура товаров категории + кнопка настроек категории."""
     rows = []
     for p in products:
         status = "✅" if p["active"] else "❌"
@@ -3782,10 +3963,27 @@ def kb_catalog_products(products: list[dict], category: str) -> InlineKeyboardMa
             ),
             InlineKeyboardButton(text="🔄", callback_data=f"adm:catalog:toggle:{p['key']}"),
         ])
-    rows.append([
-        InlineKeyboardButton(text="➕ Добавить товар", callback_data=f"adm:catalog:add:{category}"),
-    ])
+    rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data=f"adm:catalog:add:{category}")])
+    rows.append([InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{category}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
+    """Клавиатура настроек категории."""
+    key = cat["key"]
+    disabled = cat.get("disabled", False)
+    needs_code = cat.get("needs_code", False)
+    login_hint = cat.get("login_hint") or "—"
+    rows: list[list[InlineKeyboardButton]] = []
+    if disabled:
+        rows.append([InlineKeyboardButton(text="✅ Включить категорию", callback_data=f"adm:catdis:enable:{key}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔴 Отключить категорию", callback_data=f"adm:catdis:start:{key}")])
+    rows.append([InlineKeyboardButton(text="📝 Изменить текст после оплаты", callback_data=f"adm:catlogin:{key}")])
+    nc_label = "🔔 Выключить запрос кода" if needs_code else "🔔 Включить запрос кода"
+    rows.append([InlineKeyboardButton(text=nc_label, callback_data=f"adm:catnc:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К товарам", callback_data=f"adm:catalog:cat:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -4004,7 +4202,7 @@ async def cb_adm_catalog(call: CallbackQuery, state: FSMContext) -> None:
     await send_or_edit(
         call,
         "<b>🛒 Каталог и курсы</b>\n\nВыберите категорию или откройте настройки:",
-        kb_catalog_categories(),
+        await kb_catalog_categories(),
     )
     await call.answer()
 
@@ -4016,18 +4214,21 @@ async def cb_adm_catalog_cat(call: CallbackQuery, state: FSMContext) -> None:
         return
     category = call.data.split(":", 3)[3]
     await state.update_data(catalog_category=category)
+    cat = await db_get_category(category)
+    label = f"{cat['emoji']} {cat['name']}" if cat else category
     all_prods = await db_all_products()
     cat_prods = [p for p in all_prods if p["category"] == category]
-    label = _CATEGORY_LABELS.get(category, category)
+    dis_note = "\n⚠️ <i>Категория отключена</i>" if cat and cat.get("disabled") else ""
     if not cat_prods:
-        text = f"<b>{label}</b>\n\nТоваров пока нет."
+        text = f"<b>{escape(label)}</b>{dis_note}\n\nТоваров пока нет."
     else:
-        lines = []
-        for p in cat_prods:
-            status = "✅" if p["active"] else "❌"
-            lines.append(f"{status} {p['name']} — {p['price']}₽")
-        text = f"<b>{label}</b>\n\n" + "\n".join(lines) + "\n\n✅ = активен  ❌ = скрыт\nНажмите на товар, чтобы изменить цену.\n🔄 — переключить активность."
-    await send_or_edit(call, text, kb_catalog_products(cat_prods, category))
+        lines = [
+            ("✅" if p["active"] else "❌") + f" {p['name']} — {p['price']}₽"
+            for p in cat_prods
+        ]
+        text = (f"<b>{escape(label)}</b>{dis_note}\n\n" + "\n".join(lines) +
+                "\n\n✅ = активен  ❌ = скрыт\nНажмите на товар, чтобы изменить цену.\n🔄 — переключить активность.")
+    await send_or_edit(call, text, kb_catalog_products_admin(cat_prods, category))
     await call.answer()
 
 
@@ -4040,21 +4241,19 @@ async def cb_adm_catalog_toggle(call: CallbackQuery) -> None:
     new_state = await db_toggle_product(key)
     status_text = "активирован ✅" if new_state else "скрыт ❌"
     await call.answer(f"Товар {status_text}", show_alert=True)
-    # Обновляем список — определяем категорию через БД
     all_prods = await db_all_products()
     prod = next((p for p in all_prods if p["key"] == key), None)
     if prod:
         category = prod["category"]
+        cat = await db_get_category(category)
+        label = f"{cat['emoji']} {cat['name']}" if cat else category
         cat_prods = [p for p in all_prods if p["category"] == category]
-        label = _CATEGORY_LABELS.get(category, category)
-        lines = [
-            ("✅" if p["active"] else "❌") + f" {p['name']} — {p['price']}₽"
-            for p in cat_prods
-        ]
-        text = (f"<b>{label}</b>\n\n" + "\n".join(lines) +
+        dis_note = "\n⚠️ <i>Категория отключена</i>" if cat and cat.get("disabled") else ""
+        lines = [("✅" if p["active"] else "❌") + f" {p['name']} — {p['price']}₽" for p in cat_prods]
+        text = (f"<b>{escape(label)}</b>{dis_note}\n\n" + "\n".join(lines) +
                 "\n\n✅ = активен  ❌ = скрыт\nНажмите на товар, чтобы изменить цену.\n🔄 — переключить активность.")
         try:
-            await call.message.edit_text(text, reply_markup=kb_catalog_products(cat_prods, category), parse_mode="HTML")
+            await call.message.edit_text(text, reply_markup=kb_catalog_products_admin(cat_prods, category), parse_mode="HTML")
         except Exception:
             pass
 
@@ -4113,10 +4312,11 @@ async def cb_adm_catalog_add(call: CallbackQuery, state: FSMContext) -> None:
     category = call.data.split(":", 3)[3]
     await state.set_state(AdminStates.waiting_new_product_key)
     await state.update_data(new_product_category=category)
-    label = _CATEGORY_LABELS.get(category, category)
+    cat = await db_get_category(category)
+    label = f"{cat['emoji']} {cat['name']}" if cat else category
     await send_or_edit(
         call,
-        f"➕ <b>Новый товар в «{label}»</b>\n\n"
+        f"➕ <b>Новый товар в «{escape(label)}»</b>\n\n"
         "Шаг 1/4. Введите <b>уникальный ключ</b> товара (латинские буквы, цифры, _).\n"
         "Пример: <code>rb_5000</code>",
         InlineKeyboardMarkup(inline_keyboard=[
@@ -4205,6 +4405,340 @@ async def msg_adm_new_product_delivery(message: Message, state: FSMContext) -> N
             parse_mode="HTML",
             reply_markup=kb_admin_main(),
         )
+
+
+# ---- Управление категориями ----
+
+
+@dp.callback_query(F.data == "adm:catalog:new_cat")
+async def cb_adm_catalog_new_cat(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало создания новой категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_new_cat_key)
+    await send_or_edit(
+        call,
+        "➕ <b>Новая категория — Шаг 1/3</b>\n\n"
+        "Введите <b>уникальный ключ</b> категории (латинские буквы, цифры, _).\n"
+        "Это внутренний идентификатор, покупатели его не видят.\n"
+        "Пример: <code>minecraft</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_new_cat_key)
+async def msg_adm_new_cat_key(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip().lower()
+    reserved = {"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"}
+    if not raw or not all(c.isalnum() or c == "_" for c in raw):
+        await message.answer(
+            "⚠️ Ключ может содержать только латинские буквы, цифры и _. Попробуйте ещё раз:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+            ]),
+        )
+        return
+    if raw in reserved:
+        await message.answer(
+            f"⚠️ Ключ <code>{raw}</code> зарезервирован. Выберите другой:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+            ]),
+        )
+        return
+    existing = await db_get_category(raw)
+    if existing:
+        await message.answer(
+            f"⚠️ Категория с ключом <code>{raw}</code> уже существует.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+            ]),
+        )
+        return
+    await state.update_data(new_cat_key=raw)
+    await state.set_state(AdminStates.waiting_new_cat_name)
+    await message.answer(
+        f"Ключ: <code>{raw}</code>\n\n"
+        "➕ <b>Новая категория — Шаг 2/3</b>\n\n"
+        "Введите <b>название категории</b> (видят покупатели).\n"
+        "Пример: <code>Minecraft</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_new_cat_name)
+async def msg_adm_new_cat_name(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        return
+    await state.update_data(new_cat_name=name)
+    await state.set_state(AdminStates.waiting_new_cat_emoji)
+    data = await state.get_data()
+    await message.answer(
+        f"Ключ: <code>{data['new_cat_key']}</code>  Название: <b>{escape(name)}</b>\n\n"
+        "➕ <b>Новая категория — Шаг 3/3</b>\n\n"
+        "Введите <b>эмодзи</b> для категории (одним символом).\n"
+        "Пример: <code>⛏️</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Пропустить (по умолчанию)", callback_data="adm:newcat:emoji_default")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "adm:newcat:emoji_default")
+async def cb_adm_newcat_emoji_default(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await _finish_create_category(call, state, emoji="🎮")
+
+
+@dp.message(AdminStates.waiting_new_cat_emoji)
+async def msg_adm_new_cat_emoji(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    emoji = (message.text or "").strip()
+    if not emoji:
+        emoji = "🎮"
+    await _finish_create_category(message, state, emoji=emoji)
+
+
+async def _finish_create_category(target, state: FSMContext, emoji: str) -> None:
+    data = await state.get_data()
+    key = data.get("new_cat_key", "")
+    name = data.get("new_cat_name", "")
+    await state.clear()
+    await db_create_category(key, name, emoji)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 В каталог", callback_data="adm:catalog")],
+        [InlineKeyboardButton(text="⚙️ Настроить категорию", callback_data=f"adm:catcfg:{key}")],
+    ])
+    msg_text = (
+        f"✅ <b>Категория создана!</b>\n\n"
+        f"Ключ: <code>{key}</code>\n"
+        f"Название: <b>{escape(name)}</b>\n"
+        f"Эмодзи: {emoji}\n\n"
+        "Теперь добавьте товары и настройте текст после оплаты."
+    )
+    if hasattr(target, "message"):  # CallbackQuery
+        await send_or_edit(target, msg_text, kb)
+    else:
+        await target.answer(msg_text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("adm:catcfg:"))
+async def cb_adm_catcfg(call: CallbackQuery, state: FSMContext) -> None:
+    """Страница настроек категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    dis_icon = "⚠️ " if cat["disabled"] else "✅ "
+    hint_preview = (cat.get("login_hint") or "—")[:60]
+    if len(cat.get("login_hint") or "") > 60:
+        hint_preview += "…"
+    nc_icon = "🔔✅" if cat["needs_code"] else "🔔❌"
+    text = (
+        f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+        f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
+        f"Текст после оплаты: <i>{escape(hint_preview)}</i>\n"
+        f"Кнопка кода: {nc_icon} {'включена' if cat['needs_code'] else 'выключена'}"
+    )
+    if cat["disabled"] and cat.get("disabled_reason"):
+        text += f"\nПричина отключения: <i>{escape(cat['disabled_reason'])}</i>"
+    await send_or_edit(call, text, kb_cat_config(cat))
+
+
+@dp.callback_query(F.data.startswith("adm:catdis:enable:"))
+async def cb_adm_catdis_enable(call: CallbackQuery) -> None:
+    """Включить категорию."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await db_set_category_disabled(key, False, None)
+    await call.answer("✅ Категория включена.", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: ✅ активна"
+        ), kb_cat_config(cat))
+
+
+@dp.callback_query(F.data.startswith("adm:catdis:start:"))
+async def cb_adm_catdis_start(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало отключения категории — запрашиваем причину."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await state.set_state(AdminStates.waiting_cat_disabled_reason)
+    await state.update_data(cat_disable_key=key)
+    await send_or_edit(
+        call,
+        "🔴 <b>Отключение категории</b>\n\n"
+        "Введите <b>причину</b>, которую увидит покупатель при попытке открыть эту категорию.\n\n"
+        "Или нажмите кнопку, чтобы отключить без объяснения:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Без объяснения", callback_data=f"adm:catdis:noreason:{key}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catdis:noreason:"))
+async def cb_adm_catdis_noreason(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await state.clear()
+    await db_set_category_disabled(key, True, None)
+    await call.answer("🔴 Категория отключена.", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: ⚠️ отключена"
+        ), kb_cat_config(cat))
+
+
+@dp.message(AdminStates.waiting_cat_disabled_reason)
+async def msg_adm_cat_disabled_reason(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer("⚠️ Введите причину или нажмите «Без объяснения».")
+        return
+    data = await state.get_data()
+    key = data.get("cat_disable_key", "")
+    await state.clear()
+    await db_set_category_disabled(key, True, reason)
+    cat = await db_get_category(key)
+    name = f"{cat['emoji']} {cat['name']}" if cat else key
+    await message.answer(
+        f"🔴 Категория <b>{escape(name)}</b> отключена.\n"
+        f"Причина: <i>{escape(reason)}</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catnc:"))
+async def cb_adm_cat_needscode(call: CallbackQuery) -> None:
+    """Переключить флаг 'нужен код' для категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    new_val = await db_toggle_category_needs_code(key)
+    label = "включён ✅" if new_val else "выключен ❌"
+    await call.answer(f"Запрос кода {label}", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Кнопка «Отправить код»: {'✅ включена' if new_val else '❌ выключена'}"
+        ), kb_cat_config(cat))
+
+
+@dp.callback_query(F.data.startswith("adm:catlogin:"))
+async def cb_adm_catlogin(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало изменения текста после оплаты."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    current = cat.get("login_hint") or "—"
+    await state.set_state(AdminStates.waiting_cat_login_hint)
+    await state.update_data(cat_login_key=key)
+    await send_or_edit(
+        call,
+        f"📝 <b>Текст после оплаты: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+        f"Текущий текст:\n<i>{escape(current)}</i>\n\n"
+        "Введите новый текст. Он появится в сообщении покупателю после успешной оплаты "
+        "рядом с кнопкой «Отправить данные для входа».\n\n"
+        "Если текст пустой — кнопка входа не показывается.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Убрать текст (кнопка пропадёт)", callback_data=f"adm:catlogin:clear:{key}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catlogin:clear:"))
+async def cb_adm_catlogin_clear(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await state.clear()
+    await db_update_category_login_hint(key, None)
+    await call.answer("🗑 Текст убран.", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            "Текст после оплаты: —"
+        ), kb_cat_config(cat))
+
+
+@dp.message(AdminStates.waiting_cat_login_hint)
+async def msg_adm_cat_login_hint(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("⚠️ Введите текст или нажмите «Убрать текст».")
+        return
+    data = await state.get_data()
+    key = data.get("cat_login_key", "")
+    await state.clear()
+    await db_update_category_login_hint(key, text)
+    cat = await db_get_category(key)
+    name = f"{cat['emoji']} {cat['name']}" if cat else key
+    await message.answer(
+        f"✅ Текст после оплаты для <b>{escape(name)}</b> обновлён:\n\n"
+        f"<i>{escape(text)}</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
 
 
 # ---- Настройки (курсы и лимиты) ----
