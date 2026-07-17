@@ -657,6 +657,35 @@ async def db_add_product(
         return False
 
 
+async def db_rename_product(key: str, name: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE products SET name = $1 WHERE key = $2", name, key)
+
+
+async def db_delete_product(key: str) -> None:
+    pool = await get_pool()
+    await pool.execute("DELETE FROM products WHERE key = $1", key)
+
+
+async def db_rename_category(key: str, name: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE categories SET name = $1 WHERE key = $2", name, key)
+
+
+async def db_set_category_emoji(key: str, emoji: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE categories SET emoji = $1 WHERE key = $2", emoji, key)
+
+
+async def db_delete_category(key: str) -> None:
+    """Удаляет категорию и все её товары (в одной транзакции)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM products WHERE category = $1", key)
+            await conn.execute("DELETE FROM categories WHERE key = $1", key)
+
+
 async def db_get_setting(key: str, default: str = "") -> str:
     pool = await get_pool()
     val = await pool.fetchval("SELECT value FROM settings WHERE key = $1", key)
@@ -1349,6 +1378,10 @@ class AdminStates(StatesGroup):
     waiting_new_cat_emoji = State()        # эмодзи новой категории
     waiting_cat_disabled_reason = State()  # причина отключения категории
     waiting_cat_login_hint = State()       # текст после оплаты для категории
+    waiting_rename_product = State()       # новое название товара
+    waiting_rename_cat_name = State()      # новое название категории
+    waiting_rename_cat_emoji = State()     # новый эмодзи категории
+    waiting_cat_delete_confirm = State()   # подтверждение удаления категории (текст)
 
 
 class PromoStates(StatesGroup):
@@ -3959,7 +3992,7 @@ def kb_catalog_products_admin(products: list[dict], category: str) -> InlineKeyb
         rows.append([
             InlineKeyboardButton(
                 text=f"{status} {p['name']} — {price_str}",
-                callback_data=f"adm:catalog:price:{p['key']}",
+                callback_data=f"adm:prod:{p['key']}",
             ),
             InlineKeyboardButton(text="🔄", callback_data=f"adm:catalog:toggle:{p['key']}"),
         ])
@@ -3969,12 +4002,21 @@ def kb_catalog_products_admin(products: list[dict], category: str) -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def kb_product_manage(prod_key: str, cat_key: str) -> InlineKeyboardMarkup:
+    """Клавиатура управления конкретным товаром."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:prod:rename:{prod_key}")],
+        [InlineKeyboardButton(text="💰 Изменить цену",  callback_data=f"adm:catalog:price:{prod_key}")],
+        [InlineKeyboardButton(text="🗑 Удалить товар",  callback_data=f"adm:prod:delask:{prod_key}")],
+        [InlineKeyboardButton(text="⬅️ Назад к товарам", callback_data=f"adm:catalog:cat:{cat_key}")],
+    ])
+
+
 def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
     """Клавиатура настроек категории."""
     key = cat["key"]
     disabled = cat.get("disabled", False)
     needs_code = cat.get("needs_code", False)
-    login_hint = cat.get("login_hint") or "—"
     rows: list[list[InlineKeyboardButton]] = []
     if disabled:
         rows.append([InlineKeyboardButton(text="✅ Включить категорию", callback_data=f"adm:catdis:enable:{key}")])
@@ -3983,6 +4025,11 @@ def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="📝 Изменить текст после оплаты", callback_data=f"adm:catlogin:{key}")])
     nc_label = "🔔 Выключить запрос кода" if needs_code else "🔔 Включить запрос кода"
     rows.append([InlineKeyboardButton(text=nc_label, callback_data=f"adm:catnc:{key}")])
+    rows.append([
+        InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:catname:{key}"),
+        InlineKeyboardButton(text="🖼 Эмодзи",        callback_data=f"adm:catemoji:{key}"),
+    ])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"adm:catdel:ask:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ К товарам", callback_data=f"adm:catalog:cat:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -4736,6 +4783,305 @@ async def msg_adm_cat_login_hint(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+# ---- Управление товарами (страница товара) ----
+
+
+@dp.callback_query(F.data.startswith("adm:prod:"))
+async def cb_adm_prod(call: CallbackQuery, state: FSMContext) -> None:
+    """Страница управления конкретным товаром."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    parts = call.data.split(":", 2)
+    prod_key = parts[2]
+
+    # Вложенные действия маршрутизируются ниже через отдельные хендлеры;
+    # сюда попадают только прямые adm:prod:<key> без дополнительного сегмента.
+    if ":" in prod_key:
+        return  # маршрутизируется более специфичными хендлерами
+
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    key, name, price, delivery = product
+    # Определяем категорию
+    all_prods = await db_all_products()
+    prod_row = next((p for p in all_prods if p["key"] == prod_key), None)
+    cat_key = prod_row["category"] if prod_row else ""
+    cat = await db_get_category(cat_key) if cat_key else None
+    cat_label = f"{cat['emoji']} {cat['name']}" if cat else cat_key
+    status = "✅ активен" if (prod_row and prod_row.get("active")) else "❌ скрыт"
+    price_str = f"{int(price)}₽" if price == int(price) else f"{price}₽"
+    text = (
+        f"📦 <b>{escape(name)}</b>\n\n"
+        f"Цена: <b>{price_str}</b>\n"
+        f"Статус: {status}\n"
+        f"Выдача: {escape(delivery)}\n"
+        f"Категория: {escape(cat_label)}"
+    )
+    await send_or_edit(call, text, kb_product_manage(prod_key, cat_key))
+    await state.update_data(prod_manage_cat=cat_key)
+
+
+@dp.callback_query(F.data.startswith("adm:prod:rename:"))
+async def cb_adm_prod_rename(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало переименования товара."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, current_name, _, _ = product
+    await state.set_state(AdminStates.waiting_rename_product)
+    await state.update_data(rename_prod_key=prod_key)
+    await send_or_edit(
+        call,
+        f"✏️ <b>Переименование товара</b>\n\n"
+        f"Текущее название: <b>{escape(current_name)}</b>\n\n"
+        "Введите новое название:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:prod:{prod_key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_rename_product)
+async def msg_adm_rename_product(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    prod_key = data.get("rename_prod_key", "")
+    cat_key = data.get("prod_manage_cat", "")
+    await state.clear()
+    await db_rename_product(prod_key, new_name)
+    await message.answer(
+        f"✅ Товар переименован: <b>{escape(new_name)}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 К товару", callback_data=f"adm:prod:{prod_key}")],
+            [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adm:catalog:cat:{cat_key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:prod:delask:"))
+async def cb_adm_prod_delask(call: CallbackQuery, state: FSMContext) -> None:
+    """Подтверждение удаления товара."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, _ = product
+    price_str = f"{int(price)}₽" if price == int(price) else f"{price}₽"
+    await send_or_edit(
+        call,
+        f"🗑 <b>Удалить товар?</b>\n\n"
+        f"<b>{escape(name)}</b> — {price_str}\n\n"
+        "⚠️ Это действие необратимо. Все данные о товаре будут удалены.\n"
+        "История заказов на этот товар сохранится.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"adm:prod:delyes:{prod_key}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:prod:{prod_key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:prod:delyes:"))
+async def cb_adm_prod_delyes(call: CallbackQuery, state: FSMContext) -> None:
+    """Выполнить удаление товара."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    name = product[1] if product else prod_key
+    all_prods = await db_all_products()
+    prod_row = next((p for p in all_prods if p["key"] == prod_key), None)
+    cat_key = prod_row["category"] if prod_row else ""
+    await db_delete_product(prod_key)
+    await send_or_edit(
+        call,
+        f"🗑 Товар <b>{escape(name)}</b> удалён.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К списку товаров", callback_data=f"adm:catalog:cat:{cat_key}")],
+        ]),
+    )
+
+
+# ---- Переименование категории ----
+
+
+@dp.callback_query(F.data.startswith("adm:catname:"))
+async def cb_adm_catname(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало переименования категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_rename_cat_name)
+    await state.update_data(rename_cat_key=key)
+    await send_or_edit(
+        call,
+        f"✏️ <b>Переименование категории</b>\n\n"
+        f"Текущее название: <b>{escape(cat['name'])}</b>\n\n"
+        "Введите новое название (покупатели увидят его в магазине):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_rename_cat_name)
+async def msg_adm_rename_cat_name(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    key = data.get("rename_cat_key", "")
+    await state.clear()
+    await db_rename_category(key, new_name)
+    cat = await db_get_category(key)
+    label = f"{cat['emoji']} {new_name}" if cat else new_name
+    await message.answer(
+        f"✅ Категория переименована: <b>{escape(label)}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catemoji:"))
+async def cb_adm_catemoji(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало смены эмодзи категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_rename_cat_emoji)
+    await state.update_data(rename_cat_key=key)
+    await send_or_edit(
+        call,
+        f"🖼 <b>Эмодзи категории</b>\n\n"
+        f"Текущий эмодзи: {cat['emoji']}\n\n"
+        "Отправьте новый эмодзи одним сообщением:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_rename_cat_emoji)
+async def msg_adm_rename_cat_emoji(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    emoji = (message.text or "").strip()
+    if not emoji:
+        await message.answer("⚠️ Эмодзи не может быть пустым. Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    key = data.get("rename_cat_key", "")
+    await state.clear()
+    await db_set_category_emoji(key, emoji)
+    cat = await db_get_category(key)
+    label = f"{emoji} {cat['name']}" if cat else emoji
+    await message.answer(
+        f"✅ Эмодзи категории обновлён: <b>{escape(label)}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+# ---- Удаление категории ----
+
+
+@dp.callback_query(F.data.startswith("adm:catdel:ask:"))
+async def cb_adm_catdel_ask(call: CallbackQuery, state: FSMContext) -> None:
+    """Предупреждение перед удалением категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    all_prods = await db_all_products()
+    prod_count = sum(1 for p in all_prods if p["category"] == key)
+    await state.set_state(AdminStates.waiting_cat_delete_confirm)
+    await state.update_data(catdel_key=key)
+    await send_or_edit(
+        call,
+        f"🗑 <b>Удаление категории: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+        f"Вместе с категорией будут удалены <b>{prod_count} товаров</b>.\n"
+        "История заказов сохранится.\n\n"
+        "⚠️ Это действие <b>необратимо</b>.\n\n"
+        "Для подтверждения напишите слово <code>УДАЛИТЬ</code>:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_cat_delete_confirm)
+async def msg_adm_catdel_confirm(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    data = await state.get_data()
+    key = data.get("catdel_key", "")
+    if (message.text or "").strip() != "УДАЛИТЬ":
+        await message.answer(
+            "⚠️ Неверное слово. Напишите ровно <code>УДАЛИТЬ</code> для подтверждения:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+            ]),
+        )
+        return
+    cat = await db_get_category(key)
+    name = f"{cat['emoji']} {cat['name']}" if cat else key
+    await state.clear()
+    await db_delete_category(key)
+    await message.answer(
+        f"🗑 Категория <b>{escape(name)}</b> и все её товары удалены.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
         ]),
     )
