@@ -2362,6 +2362,77 @@ async def cb_buy_cat_prod(call: CallbackQuery, state: FSMContext) -> None:
 # =====================================================================
 
 
+
+async def _find_reminder_promo(tg_id: int, already_applied_id) -> dict | None:
+    """Ищет первый подходящий неиспользованный промокод на скидку в профиле
+    пользователя (discount_pct > 0, promo_price == 0, не использован, активен).
+    Исключает already_applied_id — тот уже учтён при расчёте."""
+    user_promos = await db_get_user_promos(tg_id)
+    for p in user_promos:
+        if p.get("used_at") is not None:
+            continue
+        if not p.get("is_active"):
+            continue
+        if not (p.get("discount_pct") or 0) > 0:
+            continue
+        if (p.get("promo_price") or 0) > 0:          # фиксированная цена — пропускаем
+            continue
+        if p["promo_id"] == already_applied_id:       # уже применён автоматически
+            continue
+        if not _promo_is_valid_now(p):
+            continue
+        return p
+    return None
+
+
+async def _show_purchase_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    """Рендерит экран подтверждения оплаты по данным из FSM (_pnd_*)."""
+    data = await state.get_data()
+    title: str = data.get("_pnd_title") or ""
+    final_price: float = data.get("_pnd_final") or 0.0
+    original_price: float = data.get("_pnd_orig") or 0.0
+    level_disc: int = data.get("_pnd_ldsc") or 0
+    promo_disc: int = data.get("_pnd_pdsc") or 0
+
+    balance = await db_get_balance(call.from_user.id)
+
+    if level_disc or promo_disc:
+        disc_parts = []
+        if level_disc:
+            disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
+        if promo_disc:
+            disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
+        price_block = (
+            f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+            + "\n".join(disc_parts) + "\n"
+            + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+        )
+    else:
+        price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
+
+    enough = balance >= final_price
+    text = (
+        "🛒 <b>Подтверждение оплаты</b>\n\n"
+        f"📦 {escape(title)}\n\n"
+        f"{price_block}\n"
+        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+        + ("✅ Баланса достаточно для оплаты." if enough
+           else "❌ Недостаточно средств на балансе!")
+    )
+    if enough:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить оплату",
+                                  callback_data="confirm_purchase")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+    await send_or_edit(call, text, kb)
+
+
 async def perform_purchase(
     call: CallbackQuery,
     title: str,
@@ -2426,43 +2497,83 @@ async def perform_purchase(
             _pnd_pid=applied_ref_promo_id,
         )
 
-    balance = await db_get_balance(user.id)
+    # Напоминание о неиспользованном промокоде на скидку.
+    # Показываем только если прomo-скидка ВЫГОДНЕЕ текущей реф.-уровневой.
+    # Скидки не суммируются: промо заменяет реф. уровень.
+    if state is not None and promo_disc == 0:
+        reminder = await _find_reminder_promo(user.id, applied_ref_promo_id)
+        if reminder:
+            disc = reminder["discount_pct"]
+            # Не показываем напоминание, если реф. уровень уже даёт бо́льшую скидку
+            if disc <= level_disc:
+                reminder = None
+        if reminder:
+            disc = reminder["discount_pct"]
+            code = reminder["code"]
+            pid  = reminder["promo_id"]
+            level_note = (
+                f"\n<i>Ваша скидка по реф. уровню ({level_disc}%) будет заменена.</i>"
+                if level_disc > 0 else ""
+            )
+            remind_text = (
+                "🎟️ <b>У вас есть неиспользованный промокод!</b>\n\n"
+                f"Код: <code>{escape(code)}</code>\n"
+                f"Скидка: <b>-{disc}%</b>{level_note}\n\n"
+                "Хотите применить его к этой покупке?\n"
+                "<i>Если откажетесь — промокод останется в вашем профиле.</i>"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"✅ Применить скидку -{disc}%",
+                    callback_data=f"promo_reminder:apply:{pid}",
+                )],
+                [InlineKeyboardButton(
+                    text="➡️ Купить без скидки",
+                    callback_data="promo_reminder:skip",
+                )],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+            ])
+            await send_or_edit(call, remind_text, kb)
+            return
 
-    if level_disc or promo_disc:
-        disc_parts = []
-        if level_disc:
-            disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
-        if promo_disc:
-            disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
-        price_block = (
-            f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
-            + "\n".join(disc_parts) + "\n"
-            + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+    await _show_purchase_confirm(call, state) if state is not None else None
+    if state is None:
+        # state не передан — рендерим напрямую (старый путь)
+        balance = await db_get_balance(user.id)
+        if level_disc or promo_disc:
+            disc_parts = []
+            if level_disc:
+                disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
+            if promo_disc:
+                disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
+            price_block = (
+                f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+                + "\n".join(disc_parts) + "\n"
+                + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+            )
+        else:
+            price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
+        enough = balance >= final_price
+        text = (
+            "🛒 <b>Подтверждение оплаты</b>\n\n"
+            f"📦 {escape(title)}\n\n"
+            f"{price_block}\n"
+            f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+            + ("✅ Баланса достаточно для оплаты." if enough
+               else "❌ Недостаточно средств на балансе!")
         )
-    else:
-        price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
-
-    enough = balance >= final_price
-    text = (
-        "🛒 <b>Подтверждение оплаты</b>\n\n"
-        f"📦 {escape(title)}\n\n"
-        f"{price_block}\n"
-        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
-        + ("✅ Баланса достаточно для оплаты." if enough
-           else "❌ Недостаточно средств на балансе!")
-    )
-    if enough:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Подтвердить оплату",
-                                  callback_data="confirm_purchase")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
-        ])
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-        ])
-    await send_or_edit(call, text, kb)
+        if enough:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Подтвердить оплату",
+                                      callback_data="confirm_purchase")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+            ])
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ])
+        await send_or_edit(call, text, kb)
 
 
 @dp.callback_query(F.data == "confirm_purchase")
@@ -2635,6 +2746,61 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
         if gp_price:
             admin_text += f"\nЦена геймпасса: <b>{gp_price} R$</b> (допуск ±5 R$)"
     await notify_moderator_order(admin_text, reply_markup=admin_kb)
+
+@dp.callback_query(F.data.startswith("promo_reminder:apply:"))
+async def cb_promo_reminder_apply(call: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал применить найденный промокод на скидку."""
+    await call.answer()
+    parts = call.data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    promo_id = int(parts[2])
+    data = await state.get_data()
+
+    if not data.get("_pnd_title"):
+        await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+
+    # Проверяем промокод ещё раз (вдруг использовали в другой вкладке)
+    user_promos = await db_get_user_promos(call.from_user.id)
+    up = next(
+        (p for p in user_promos
+         if p["promo_id"] == promo_id and p.get("used_at") is None),
+        None,
+    )
+    if not up or not _promo_is_valid_now(up):
+        await call.answer(
+            "❌ Промокод уже использован или истёк.", show_alert=True
+        )
+        await _show_purchase_confirm(call, state)
+        return
+
+    disc = up["discount_pct"]
+    original_price: float = data.get("_pnd_orig") or 0.0
+    # Скидки не суммируются: промокод заменяет реф. уровень
+    final_price = original_price * (1 - disc / 100)
+
+    await state.update_data(
+        _pnd_final=final_price,
+        _pnd_pdsc=disc,
+        _pnd_pid=promo_id,
+        _pnd_ldsc=0,   # реф. уровень снят — применяется промокод
+    )
+    await _show_purchase_confirm(call, state)
+
+
+@dp.callback_query(F.data == "promo_reminder:skip")
+async def cb_promo_reminder_skip(call: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь отказался применять промокод — промокод остаётся в профиле."""
+    await call.answer()
+    if not (await state.get_data()).get("_pnd_title"):
+        await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+    await _show_purchase_confirm(call, state)
+
+
 
 
 # --- Запрос данных для входа ---
