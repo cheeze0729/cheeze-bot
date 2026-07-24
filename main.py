@@ -605,6 +605,32 @@ async def db_add_balance(tg_id: int, amount: float) -> float:
     return await db_get_balance(tg_id)
 
 
+async def db_credit_balance(
+    tg_id: int, amount: float, kind: str, reason: str | None = None
+) -> float:
+    """Атомарно начисляет/списывает баланс и записывает транзакцию.
+    Оба действия выполняются в одной БД-транзакции — никакого расхождения при сбое.
+    amount: положительное — начисление, отрицательное — списание.
+    Возвращает новый баланс."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1 WHERE tg_id = $2",
+                amount, tg_id,
+            )
+            await conn.execute(
+                "INSERT INTO transactions (tg_id, amount, kind, reason, created_at)"
+                " VALUES ($1, $2, $3, $4, $5)",
+                tg_id, amount, kind, reason,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+            row = await conn.fetchrow(
+                "SELECT balance FROM users WHERE tg_id = $1", tg_id
+            )
+            return float(row["balance"]) if row else 0.0
+
+
 async def db_try_charge(tg_id: int, amount: float) -> bool:
     """Списывает amount с баланса, если денег достаточно. Возвращает True/False."""
     pool = await get_pool()
@@ -784,6 +810,22 @@ async def db_all_settings() -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch("SELECT key, value FROM settings ORDER BY key")
     return [dict(r) for r in rows]
+
+
+async def db_get_image(key: str) -> str | None:
+    """Возвращает file_id картинки по ключу (cat:{key} или prod:{key}), или None."""
+    val = await db_get_setting(f"img:{key}", "")
+    return val or None
+
+
+async def db_set_image(key: str, file_id: str) -> None:
+    """Сохраняет file_id картинки по ключу."""
+    await db_set_setting(f"img:{key}", file_id)
+
+
+async def db_delete_image(key: str) -> None:
+    """Удаляет картинку по ключу."""
+    await db_set_setting(f"img:{key}", "")
 
 
 async def db_all_categories() -> list[dict]:
@@ -1441,6 +1483,7 @@ class ShopStates(StatesGroup):
     waiting_review_text = State()
     waiting_reject_screenshot = State()
     waiting_email_code = State()
+    waiting_pre_purchase_login = State()  # ввод данных для входа ДО оплаты
 
 
 class AdminStates(StatesGroup):
@@ -1469,7 +1512,7 @@ class AdminStates(StatesGroup):
     waiting_rename_cat_name = State()      # новое название категории
     waiting_rename_cat_emoji = State()     # новый эмодзи категории
     waiting_cat_delete_confirm = State()   # подтверждение удаления категории (текст)
-    waiting_emoji_id = State()            # новый emoji_id для кастомного слота
+    waiting_image_photo = State()          # ожидание фото для картинки категории/товара
 
 
 class PromoStates(StatesGroup):
@@ -1729,7 +1772,7 @@ async def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
         login_label = (
             "🔗 Отправить ссылку на геймпасс"
             if category == "roblox_gamepass"
-            else "🔐 Отправить данные для входа"
+            else "✏️ Изменить данные для входа"
         )
         rows.append([InlineKeyboardButton(
             text=login_label,
@@ -1761,13 +1804,21 @@ async def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
 
 
 async def order_needs_login(category: str | None) -> bool:
-    """Нужно ли запрашивать данные для входа после покупки."""
+    """Нужно ли запрашивать данные для входа (общая проверка)."""
     if not category:
         return False
-    if category in LOGIN_HINTS:          # специальные хардкод-категории
+    if category in LOGIN_HINTS:
         return True
     cat = await db_get_category(category)
     return bool(cat and cat.get("login_hint"))
+
+
+async def _needs_pre_purchase_login(category: str | None) -> bool:
+    """Нужно ли запрашивать данные для входа ДО оплаты.
+    Для roblox_gamepass — ссылка создаётся после, поэтому False."""
+    if not category or category == "roblox_gamepass":
+        return False
+    return await order_needs_login(category)
 
 
 async def order_needs_code(category: str | None) -> bool:
@@ -1865,10 +1916,11 @@ async def send_or_edit(target, text: str,
 
 
 async def show_section(
-    call: CallbackQuery, key: str, text: str, kb: InlineKeyboardMarkup
+    call: CallbackQuery, key: str, text: str, kb: InlineKeyboardMarkup,
+    photo: str | None = None,
 ) -> Message:
     """Всегда удаляет старое сообщение и открывает новое. Возвращает Message."""
-    image = SECTION_IMAGES.get(key)
+    image = photo or SECTION_IMAGES.get(key)
 
     if image and len(text) <= 1024:
         chat_id = call.message.chat.id
@@ -2308,9 +2360,11 @@ async def cb_cat_generic(call: CallbackQuery) -> None:
         await show_section(call, key,
             f"<b>{escape(name)}</b>\n\nТоваров пока нет.", kb_back_main("shop"))
         return
+    cat_image = await db_get_image(f"cat:{key}")
     await show_section(call, key,
         f"<b>{escape(name)}</b>\n\nВыберите товар:",
-        kb_product_list(products, f"cp:{key}", "shop"))
+        kb_product_list(products, f"cp:{key}", "shop"),
+        photo=cat_image)
 
 
 @dp.callback_query(F.data.startswith("cp:"))
@@ -2335,8 +2389,11 @@ async def cb_cat_prod_card(call: CallbackQuery) -> None:
         "Способ оплаты: Оплата с внутреннего баланса бота\n\n"
         "Для покупки на вашем внутреннем балансе должно быть достаточно средств."
     )
+    prod_image = await db_get_image(f"prod:{prod_key}")
+    cat_image = await db_get_image(f"cat:{cat_key}")
     await show_section(call, f"card_{cat_key}", text,
-        kb_product_card(f"buy_cp:{cat_key}:{prod_key}", f"cat:{cat_key}"))
+        kb_product_card(f"buy_cp:{cat_key}:{prod_key}", f"cat:{cat_key}"),
+        photo=prod_image or cat_image)
 
 
 @dp.callback_query(F.data.startswith("buy_cp:"))
@@ -2442,9 +2499,52 @@ async def perform_purchase(
     state: FSMContext | None = None,
 ) -> None:
     """Показывает экран подтверждения с итоговой ценой (с учётом реф. скидки).
+    Если категория требует данные для входа — сначала запрашивает их.
     Фактическое списание происходит в confirm_purchase."""
     await call.answer()
     user = call.from_user
+
+    # Если нужны данные для входа — запрашиваем ДО оплаты
+    if state is not None and await _needs_pre_purchase_login(category):
+        fsm_data = await state.get_data()
+        pre_login = fsm_data.get("_pnd_pre_login")
+        if not pre_login:
+            # Сохраняем намерение покупки в FSM
+            await state.update_data(
+                _pre_title=title,
+                _pre_price=price,
+                _pre_cat=category,
+                _pre_extra=extra,
+            )
+            await state.set_state(ShopStates.waiting_pre_purchase_login)
+            # Определяем подсказку для пользователя (редактируется в админ-панели)
+            login_hint = LOGIN_HINTS.get(category or "", "")
+            if not login_hint:
+                cat_obj = await db_get_category(category or "")
+                login_hint = (cat_obj.get("login_hint") or "") if cat_obj else ""
+            if login_hint:
+                prompt = (
+                    "🔐 <b>Данные для входа</b>\n\n"
+                    f"{escape(login_hint)}\n\n"
+                    "Отправьте данные одним сообщением прямо сюда.\n"
+                    "<i>Модератор получит их для выполнения заказа.</i>"
+                )
+            else:
+                prompt = (
+                    "🔐 <b>Данные для входа</b>\n\n"
+                    "Перед оплатой отправьте данные для входа одним сообщением.\n"
+                    "<i>Модератор получит их для выполнения заказа.</i>"
+                )
+            cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")]
+            ])
+            sent = await send_or_edit(call, prompt, cancel_kb)
+            await state.update_data(
+                _prompt_chat_id=sent.chat.id,
+                _prompt_msg_id=sent.message_id,
+            )
+            return
+
     user_row, _ = await db_get_or_create_user(user)
 
     original_price = float(price)
@@ -2627,11 +2727,18 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
             await db_use_promo(user.id, applied_ref_promo_id)
             await db_set_active_ref_promo(user.id, None)
 
-        # Сбрасываем pending-данные, оставляем прочее состояние FSM
+        # Сохраняем данные для входа, введённые ДО оплаты
+        pre_login = data.get("_pnd_pre_login")
+        if pre_login:
+            await db_set_order_login(order_id, pre_login)
+
+        # Сбрасываем pending-данные и FSM-состояние (могло остаться waiting_pre_purchase_login)
+        await state.set_state(None)
         await state.update_data(
             _pnd_title=None, _pnd_final=None, _pnd_orig=None,
             _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
-            _pnd_pdsc=None, _pnd_pid=None,
+            _pnd_pdsc=None, _pnd_pid=None, _pnd_pre_login=None,
+            _pre_title=None, _pre_price=None, _pre_cat=None, _pre_extra=None,
         )
     finally:
         _processing_payments.discard(user.id)
@@ -2648,7 +2755,13 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     else:
         login_hint = None
         needs_code = False
-    login_label = "🔐 Отправить данные для входа"
+    # Определяем метку кнопки данных для входа
+    if category == "roblox_gamepass":
+        login_label = "🔗 Отправить ссылку на геймпасс"
+    elif pre_login:
+        login_label = "✏️ Изменить данные для входа"
+    else:
+        login_label = "🔐 Отправить данные для входа"
 
     disc_line = ""
     if level_disc:
@@ -2668,7 +2781,6 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     )
 
     if category == "roblox_gamepass":
-        login_label = "🔗 Отправить ссылку на геймпасс"
         if extra:
             gp_price = extra.get("gamepass_price")
             if gp_price:
@@ -2678,6 +2790,18 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
             "«Отправить ссылку на геймпасс» — пришлите ссылку одним "
             "сообщением. Никакие данные от аккаунта и коды отправлять не нужно."
         )
+    elif pre_login and login_hint:
+        # Данные уже получены до оплаты
+        text += (
+            "✅ <b>Данные для входа получены.</b>\n"
+            "Модератор уже их видит. При необходимости измените их кнопкой ниже."
+        )
+        if needs_code:
+            text += (
+                "\n\n📨 Если на почту придёт код подтверждения, когда "
+                "модератор будет заходить — пришлите его кнопкой "
+                "«Отправить код для входа»."
+            )
     elif login_hint:
         text += (
             "🔐 <b>Для выполнения заказа нужны данные для входа.</b>\n"
@@ -2745,6 +2869,9 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
         gp_price = extra.get("gamepass_price")
         if gp_price:
             admin_text += f"\nЦена геймпасса: <b>{gp_price} R$</b> (допуск ±5 R$)"
+    # Данные для входа, введённые ДО оплаты — включаем прямо в уведомление о заказе
+    if pre_login:
+        admin_text += f"\n\n🔐 <b>Данные для входа:</b>\n<pre>{escape(pre_login)}</pre>"
     await notify_moderator_order(admin_text, reply_markup=admin_kb)
 
 @dp.callback_query(F.data.startswith("promo_reminder:apply:"))
@@ -2803,7 +2930,116 @@ async def cb_promo_reminder_skip(call: CallbackQuery, state: FSMContext) -> None
 
 
 
-# --- Запрос данных для входа ---
+# --- Ввод данных для входа ДО оплаты ---
+
+@dp.message(ShopStates.waiting_pre_purchase_login)
+async def msg_pre_purchase_login(message: Message, state: FSMContext) -> None:
+    """Пользователь присылает данные для входа до оплаты."""
+    await _try_delete(message)
+    payload = (message.text or "").strip()
+    if not payload:
+        await _edit_prompt(
+            state,
+            "⚠️ Пустое сообщение. Пришлите данные для входа текстом.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")]
+            ]),
+        )
+        return
+
+    data = await state.get_data()
+    title = data.get("_pre_title", "")
+    price = float(data.get("_pre_price") or 0)
+    category = data.get("_pre_cat")
+    extra = data.get("_pre_extra")
+
+    # Сохраняем данные в FSM — perform_purchase подхватит их
+    await state.update_data(_pnd_pre_login=payload)
+
+    # Рассчитываем цену с учётом скидок (дублируем логику perform_purchase)
+    user_row, _ = await db_get_or_create_user(message.from_user)
+    original_price = price
+
+    _active_promo_id = user_row.get("active_ref_promo") if category != "tgstars" else None
+    _active_promo = await db_get_promo_by_id(_active_promo_id) if _active_promo_id else None
+    _has_active_pct = (
+        _active_promo is not None
+        and _active_promo.get("game") == "pct_discount"
+        and _active_promo.get("discount_pct", 0) > 0
+    )
+    level = (user_row.get("referral_level") or 0) if (category != "tgstars" and not _has_active_pct) else 0
+    level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
+
+    promo_disc = 0
+    applied_ref_promo_id = None
+    if category != "tgstars" and _active_promo_id:
+        if _active_promo and _active_promo.get("discount_pct", 0) > 0:
+            user_promo_list = await db_get_user_promos(message.from_user.id)
+            up = next(
+                (p for p in user_promo_list
+                 if p["promo_id"] == _active_promo_id and p.get("used_at") is None),
+                None,
+            )
+            if up:
+                promo_disc = _active_promo["discount_pct"]
+                applied_ref_promo_id = _active_promo_id
+
+    final_price = original_price * (1 - level_disc / 100) * (1 - promo_disc / 100)
+
+    await state.update_data(
+        _pnd_title=title,
+        _pnd_final=final_price,
+        _pnd_orig=original_price,
+        _pnd_cat=category,
+        _pnd_extra=extra,
+        _pnd_ldsc=level_disc,
+        _pnd_pdsc=promo_disc,
+        _pnd_pid=applied_ref_promo_id,
+    )
+
+    # Показываем экран подтверждения
+    balance = await db_get_balance(message.from_user.id)
+    if level_disc or promo_disc:
+        disc_parts = []
+        if level_disc:
+            disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
+        if promo_disc:
+            disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
+        price_block = (
+            f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+            + "\n".join(disc_parts) + "\n"
+            + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+        )
+    else:
+        price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
+
+    enough = balance >= final_price
+    confirm_text = (
+        "🛒 <b>Подтверждение оплаты</b>\n\n"
+        f"📦 {escape(title)}\n\n"
+        f"{price_block}\n"
+        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+        + ("✅ Баланса достаточно для оплаты." if enough
+           else "❌ Недостаточно средств на балансе!")
+    )
+    if enough:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить оплату",
+                                  callback_data="confirm_purchase")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+    await message.answer(confirm_text, reply_markup=kb, parse_mode="HTML")
+    # Сбрасываем FSM-состояние: пользователь уже ввёл данные и видит кнопку "Подтвердить".
+    # Без этого любой следующий текст снова запустит хендлер и перезапишет данные.
+    await state.set_state(None)
+
+
+# --- Запрос / изменение данных для входа после покупки ---
 
 
 @dp.callback_query(F.data.startswith("send_login:"))
@@ -3376,14 +3612,8 @@ async def cb_topup_admin_confirm(call: CallbackQuery) -> None:
         await call.answer("Некорректные данные.", show_alert=True)
         return
 
-    new_balance = await db_add_balance(target_id, amount)
     reason = f"Пополнение баланса (код: {code})" if code else "Пополнение баланса"
-    await db_add_transaction(
-        target_id,
-        amount,
-        kind="topup",
-        reason=reason,
-    )
+    new_balance = await db_credit_balance(target_id, amount, kind="topup", reason=reason)
 
     try:
         old = call.message.text or call.message.caption or ""
@@ -4229,7 +4459,7 @@ def kb_admin_main() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="adm:promos")],
             [InlineKeyboardButton(text="🛒 Каталог и курсы", callback_data="adm:catalog")],
-            [InlineKeyboardButton(text="🎭 Кастомные эмодзи", callback_data="adm:emoji")],
+            [InlineKeyboardButton(text="🖼️ Картинки", callback_data="adm:images")],
             [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
         ]
     )
@@ -5580,8 +5810,7 @@ async def msg_adm_credit(message: Message, state: FSMContext) -> None:
     if not target_id:
         await message.answer("Не указан пользователь.", reply_markup=kb_admin_main())
         return
-    new_balance = await db_add_balance(target_id, amount)
-    await db_add_transaction(
+    new_balance = await db_credit_balance(
         target_id, amount, kind="admin_add", reason="Начисление администратором"
     )
     try:
@@ -7116,8 +7345,7 @@ async def cb_mod_refund(call: CallbackQuery) -> None:
     refund_amount = float(order["price"])
 
     await db_update_order_status(order_id, "Возврат")
-    await db_add_balance(tg_id, refund_amount)
-    await db_add_transaction(
+    await db_credit_balance(
         tg_id, refund_amount, kind="refund",
         reason=f"Возврат по заказу #{order_id}"
     )
@@ -7843,107 +8071,219 @@ async def global_error_handler(event: ErrorEvent) -> bool:
 
 
 # =====================================================================
-# АДМИН — управление кастомными эмодзи
+# АДМИН — управление картинками категорий и товаров
 # =====================================================================
 
-def kb_emoji_list() -> InlineKeyboardMarkup:
-    rows = []
-    for key, (fallback, label) in _EMOJI_SLOTS.items():
-        cur = _EMOJIS.get(key, fallback)
-        rows.append([InlineKeyboardButton(
-            text=f"{cur}  {label}",
-            callback_data=f"adm:emoji:edit:{key}",
-        )])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:admin")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
-@dp.callback_query(F.data == "adm:emoji")
-async def cb_adm_emoji(call: CallbackQuery, state: FSMContext) -> None:
+@dp.callback_query(F.data == "adm:images")
+async def cb_adm_images(call: CallbackQuery, state: FSMContext) -> None:
     if not _is_moderator(call.from_user.id):
         return
     await state.clear()
+    await call.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📂 Картинки категорий", callback_data="adm:images:cats")],
+        [InlineKeyboardButton(text="🎁 Картинки товаров", callback_data="adm:images:prods")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:admin")],
+    ])
     await send_or_edit(
         call,
-        "<b>🎭 Кастомные эмодзи</b>\n\n"
-        "Нажмите на эмодзи, чтобы изменить его.\n"
-        "Слот примет ваш custom emoji_id; оставьте пустым — сбросить к встроенному.",
-        kb_emoji_list(),
+        "<b>🖼️ Управление картинками</b>\n\n"
+        "Выберите, для чего хотите задать картинку.\n\n"
+        "Картинки категорий показываются при выборе категории в магазине.\n"
+        "Картинки товаров показываются на карточке товара.",
+        kb,
     )
-    await call.answer()
 
 
-@dp.callback_query(F.data.startswith("adm:emoji:edit:"))
-async def cb_adm_emoji_edit(call: CallbackQuery, state: FSMContext) -> None:
+@dp.callback_query(F.data == "adm:images:cats")
+async def cb_adm_images_cats(call: CallbackQuery) -> None:
     if not _is_moderator(call.from_user.id):
         return
-    key = call.data.split(":", 3)[3]
-    if key not in _EMOJI_SLOTS:
-        await call.answer("Неизвестный слот.", show_alert=True)
-        return
-    fallback, label = _EMOJI_SLOTS[key]
-    cur_id = await db_get_setting(f"emoji:{key}", "")
-    builtin_id = _BUILTIN_EMOJI_IDS.get(key, "—")
-    cur_display = _EMOJIS.get(key, fallback)
-    text = (
-        f"<b>🎭 Эмодзи: {label}</b>\n\n"
-        f"Текущее: {cur_display}\n"
-        f"Текущий ID в БД: <code>{cur_id or '(не задан)'}</code>\n"
-        f"Встроенный ID: <code>{builtin_id}</code>\n\n"
-        "Отправьте новый <b>custom_emoji_id</b> (числовой ID из Telegram).\n"
-        "Отправьте <b>0</b> — сбросить к встроенному.\n"
-        "Отправьте <b>reset</b> — убрать вообще (вернуть обычный эмодзи)."
-    )
-    await state.set_state(AdminStates.waiting_emoji_id)
-    await state.update_data(emoji_slot_key=key)
-    await send_or_edit(call, text, InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:emoji")]
-    ]))
     await call.answer()
+    cats = await db_all_categories()
+    rows = []
+    for cat in cats:
+        has_img = bool(await db_get_image(f"cat:{cat['key']}"))
+        icon = "🖼️ " if has_img else "⬜ "
+        rows.append([InlineKeyboardButton(
+            text=f"{icon}{cat['emoji']} {cat['name']}",
+            callback_data=f"adm:images:cat:{cat['key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:images")])
+    await send_or_edit(
+        call,
+        "<b>📂 Картинки категорий</b>\n\n"
+        "🖼️ — картинка задана   ⬜ — картинки нет\n\n"
+        "Нажмите на категорию, чтобы задать или удалить картинку.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
-@dp.message(AdminStates.waiting_emoji_id)
-async def msg_adm_emoji_id(message: Message, state: FSMContext) -> None:
+@dp.callback_query(F.data.startswith("adm:images:cat:"))
+async def cb_adm_images_cat(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    cat_key = call.data.split(":", 3)[3]
+    cat = await db_get_category(cat_key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    name = f"{cat['emoji']} {cat['name']}"
+    existing = await db_get_image(f"cat:{cat_key}")
+    status = "🖼️ Картинка уже задана." if existing else "⬜ Картинки пока нет."
+    await state.set_state(AdminStates.waiting_image_photo)
+    await state.update_data(image_target=f"cat:{cat_key}", image_label=name)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        *([[InlineKeyboardButton(
+            text="🗑️ Удалить картинку",
+            callback_data=f"adm:images:del:cat:{cat_key}",
+        )]] if existing else []),
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:images:cats")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>🖼️ Картинка: {escape(name)}</b>\n\n"
+        f"{status}\n\n"
+        "Пришлите фото в этот чат — бот установит его как картинку категории.\n"
+        "<i>Только одна картинка, текстовые сообщения игнорируются.</i>",
+        kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:del:cat:"))
+async def cb_adm_images_del_cat(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    cat_key = call.data.split(":", 4)[4]
+    await db_delete_image(f"cat:{cat_key}")
+    await call.answer("✅ Картинка категории удалена.", show_alert=False)
+    # Обновляем список
+    await cb_adm_images_cats(call)
+
+
+@dp.callback_query(F.data == "adm:images:prods")
+async def cb_adm_images_prods(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    cats = await db_all_categories()
+    rows = []
+    for cat in cats:
+        rows.append([InlineKeyboardButton(
+            text=f"{cat['emoji']} {cat['name']}",
+            callback_data=f"adm:images:prodcat:{cat['key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:images")])
+    await send_or_edit(
+        call,
+        "<b>🎁 Картинки товаров</b>\n\n"
+        "Выберите категорию, чтобы увидеть её товары.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:prodcat:"))
+async def cb_adm_images_prodcat(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    cat_key = call.data.split(":", 3)[3]
+    cat = await db_get_category(cat_key)
+    cat_name = f"{cat['emoji']} {cat['name']}" if cat else cat_key
+    products = await db_get_products(cat_key)
+    if not products:
+        await call.answer("В этой категории нет товаров.", show_alert=True)
+        return
+    rows = []
+    for key, name, price, _ in products:
+        has_img = bool(await db_get_image(f"prod:{key}"))
+        icon = "🖼️ " if has_img else "⬜ "
+        rows.append([InlineKeyboardButton(
+            text=f"{icon}{name} — {price}₽",
+            callback_data=f"adm:images:prod:{key}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:images:prods")])
+    await send_or_edit(
+        call,
+        f"<b>🎁 Товары: {escape(cat_name)}</b>\n\n"
+        "🖼️ — картинка задана   ⬜ — нет\n\n"
+        "Нажмите на товар, чтобы задать картинку.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:prod:"))
+async def cb_adm_images_prod(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, prod_name, price, _ = product
+    existing = await db_get_image(f"prod:{prod_key}")
+    status = "🖼️ Картинка уже задана." if existing else "⬜ Картинки пока нет."
+    await state.set_state(AdminStates.waiting_image_photo)
+    await state.update_data(image_target=f"prod:{prod_key}", image_label=prod_name)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        *([[InlineKeyboardButton(
+            text="🗑️ Удалить картинку",
+            callback_data=f"adm:images:del:prod:{prod_key}",
+        )]] if existing else []),
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:images:prods")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>🖼️ Картинка товара: {escape(prod_name)}</b>\n\n"
+        f"{status}\n\n"
+        "Пришлите фото в этот чат — бот установит его как картинку товара.\n"
+        "<i>Только одна картинка, текстовые сообщения игнорируются.</i>",
+        kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:del:prod:"))
+async def cb_adm_images_del_prod(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    prod_key = call.data.split(":", 4)[4]
+    await db_delete_image(f"prod:{prod_key}")
+    await call.answer("✅ Картинка товара удалена.", show_alert=False)
+    await cb_adm_images_prods(call)
+
+
+@dp.message(AdminStates.waiting_image_photo)
+async def msg_adm_image_photo(message: Message, state: FSMContext) -> None:
+    """Модератор присылает фото — бот сохраняет file_id в БД."""
     if not _is_moderator(message.from_user.id):
         return
-    await _try_delete(message)
+    if not message.photo:
+        # Игнорируем текст и другие типы сообщений
+        return
     data = await state.get_data()
-    key = data.get("emoji_slot_key", "")
-    if key not in _EMOJI_SLOTS:
-        await state.clear()
-        return
-    fallback, label = _EMOJI_SLOTS[key]
-    raw = (message.text or "").strip()
-
-    if raw.lower() == "reset":
-        await db_set_setting(f"emoji:{key}", "")
-        _EMOJIS[key] = fallback
-        result_text = f"✅ Эмодзи <b>{label}</b> сброшен к обычному символу: {fallback}"
-    elif raw == "0":
-        await db_set_setting(f"emoji:{key}", "")
-        builtin_id = _BUILTIN_EMOJI_IDS.get(key, "")
-        if builtin_id:
-            _EMOJIS[key] = tg_emoji(builtin_id, fallback)
-            result_text = f"✅ Эмодзи <b>{label}</b> сброшен к встроенному: {_EMOJIS[key]}"
-        else:
-            _EMOJIS[key] = fallback
-            result_text = f"✅ Эмодзи <b>{label}</b> сброшен к символу по умолчанию: {fallback}"
-    elif raw.isdigit() and len(raw) >= 10:
-        await db_set_setting(f"emoji:{key}", raw)
-        _EMOJIS[key] = tg_emoji(raw, fallback)
-        result_text = f"✅ Эмодзи <b>{label}</b> обновлён: {_EMOJIS[key]}"
-    else:
-        await message.answer(
-            "⚠️ Некорректный ID. Введите числовой emoji_id (≥10 цифр), <b>0</b> или <b>reset</b>.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:emoji")]
-            ])
-        )
-        return
-
+    target = data.get("image_target", "")
+    label = data.get("image_label", target)
     await state.clear()
-    await message.answer(result_text, parse_mode="HTML", reply_markup=kb_emoji_list())
+
+    file_id = message.photo[-1].file_id
+    await db_set_image(target, file_id)
+
+    await message.answer(
+        f"✅ <b>Картинка для «{escape(label)}» сохранена!</b>\n\n"
+        "Теперь она будет показываться пользователям при просмотре этого раздела.\n\n"
+        "Чтобы поменять — откройте раздел снова и пришлите новое фото.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🖼️ К картинкам", callback_data="adm:images")],
+            [InlineKeyboardButton(text="🛠️ Админ-панель", callback_data="adm:admin")],
+        ]),
+    )
 
 async def _preload_local_section_images() -> None:
     """При старте загружает картинки в Telegram и кеширует file_id в БД.
