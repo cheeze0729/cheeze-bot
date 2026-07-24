@@ -1618,10 +1618,11 @@ def kb_product_list(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_product_card(buy_cb: str, back_cb: str) -> InlineKeyboardMarkup:
+def kb_product_card(buy_cb: str, back_cb: str, needs_login: bool = False) -> InlineKeyboardMarkup:
+    buy_label = "✏️ Ввести данные и оплатить" if needs_login else "✅ Оплатить с баланса"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Оплатить с баланса", callback_data=buy_cb)],
+            [InlineKeyboardButton(text=buy_label, callback_data=buy_cb)],
             [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
             [
                 InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb),
@@ -1889,6 +1890,40 @@ async def _edit_prompt(state: FSMContext, text: str,
     # Если не получилось отредактировать — шлём новым сообщением
     sent = await bot.send_message(
         chat_id or 0,
+        text,
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
+
+
+async def _state_edit(message: Message, state: FSMContext, text: str,
+                      kb: InlineKeyboardMarkup) -> None:
+    """Удаляет сообщение пользователя и редактирует/отправляет ответ бота.
+    Сохраняет ID нового сообщения бота для следующего шага."""
+    await _try_delete(message)
+    data = await state.get_data()
+    chat_id = data.get("_prompt_chat_id") or message.chat.id
+    msg_id = data.get("_prompt_msg_id")
+    if msg_id and chat_id:
+        try:
+            edited = await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await state.update_data(_prompt_chat_id=chat_id,
+                                    _prompt_msg_id=edited.message_id)
+            return
+        except Exception:
+            pass
+    sent = await bot.send_message(
+        chat_id,
         text,
         reply_markup=kb,
         parse_mode="HTML",
@@ -2172,7 +2207,7 @@ async def cb_roblox_instant_card(call: CallbackQuery) -> None:
         call,
         "card_roblox_instant",
         text,
-        kb_product_card(f"buy:rbi:{key}", "cat:roblox_instant"),
+        kb_product_card(f"buy:rbi:{key}", "cat:roblox_instant", needs_login=True),
         photo=prod_photo,
     )
     await call.answer()
@@ -2293,7 +2328,7 @@ async def cb_brawl_card(call: CallbackQuery) -> None:
     )
     prod_photo = await db_get_image(f"prod:{key}") or await db_get_image("cat:brawl")
     await show_section(
-        call, "card_brawl", text, kb_product_card(f"buy:bs:{key}", "cat:brawl"),
+        call, "card_brawl", text, kb_product_card(f"buy:bs:{key}", "cat:brawl", needs_login=True),
         photo=prod_photo,
     )
     await call.answer()
@@ -2426,8 +2461,10 @@ async def cb_cat_prod_card(call: CallbackQuery) -> None:
     )
     prod_image = await db_get_image(f"prod:{prod_key}")
     cat_image = await db_get_image(f"cat:{cat_key}")
+    cat_needs_login = await order_needs_login(cat_key)
     await show_section(call, f"card_{cat_key}", text,
-        kb_product_card(f"buy_cp:{cat_key}:{prod_key}", f"cat:{cat_key}"),
+        kb_product_card(f"buy_cp:{cat_key}:{prod_key}", f"cat:{cat_key}",
+                        needs_login=cat_needs_login),
         photo=prod_image or cat_image)
 
 
@@ -3068,7 +3105,7 @@ async def msg_pre_purchase_login(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
             [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
         ])
-    await message.answer(confirm_text, reply_markup=kb, parse_mode="HTML")
+    await _edit_prompt(state, confirm_text, kb)
     # Сбрасываем FSM-состояние: пользователь уже ввёл данные и видит кнопку "Подтвердить".
     # Без этого любой следующий текст снова запустит хендлер и перезапишет данные.
     await state.set_state(None)
@@ -3130,12 +3167,9 @@ async def msg_login_data(message: Message, state: FSMContext) -> None:
             "может прийти код подтверждения. Пришлите его кнопкой "
             "<b>«Отправить код для входа»</b> ниже."
         )
-    await message.answer(
-        text,
-        reply_markup=kb_after_purchase(
-            order_id, needs_login=False, needs_code=needs_code
-        ),
-        parse_mode="HTML",
+    await _state_edit(
+        message, state, text,
+        kb_after_purchase(order_id, needs_login=False, needs_code=needs_code),
     )
 
 
@@ -3179,12 +3213,12 @@ async def msg_login_code(message: Message, state: FSMContext) -> None:
         f"Telegram ID: <code>{user.id}</code>"
     )
 
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"✅ Спасибо! Код по заказу <b>#{order_id}</b> передан модератору.\n\n"
         "Если придёт ещё один код — пришлите его той же кнопкой "
         "<b>«Отправить код для входа»</b>.",
-        reply_markup=kb_after_purchase(order_id, needs_login=False, needs_code=True),
-        parse_mode="HTML",
+        kb_after_purchase(order_id, needs_login=False, needs_code=True),
     )
 
 
@@ -4390,13 +4424,18 @@ async def msg_gp_price_cancel(message: Message, state: FSMContext) -> None:
 async def msg_gp_price_input(message: Message, state: FSMContext) -> None:
     if not _is_moderator(message.from_user.id):
         return
+    await _try_delete(message)
     raw = (message.text or "").strip().replace(",", ".")
     try:
         gp_price = int(round(float(raw)))
         if gp_price <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("Введите положительное целое число (R$).")
+        await _state_edit(
+            message, state,
+            "Введите положительное целое число (R$) или /cancel для отмены.",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
         return
 
     data = await state.get_data()
@@ -4880,17 +4919,23 @@ async def msg_adm_edit_product_price(message: Message, state: FSMContext) -> Non
     await _try_delete(message)
     price = parse_positive_int(message.text)
     if price is None or price <= 0:
-        await message.answer("⚠️ Введите положительное целое число (цену в рублях).")
+        await _state_edit(
+            message, state,
+            "⚠️ Введите положительное целое число (цену в рублях).",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog:cat:none")]
+            ]),
+        )
         return
     data = await state.get_data()
     key = data.get("edit_product_key", "")
     name = data.get("edit_product_name", key)
     await state.clear()
     await db_update_product_price(key, float(price))
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"✅ Цена <b>{escape(name)}</b> обновлена: <b>{price}₽</b>",
-        parse_mode="HTML",
-        reply_markup=kb_admin_main(),
+        kb_admin_main(),
     )
 
 
@@ -4904,7 +4949,7 @@ async def cb_adm_catalog_add(call: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(new_product_category=category)
     cat = await db_get_category(category)
     label = f"{cat['emoji']} {cat['name']}" if cat else category
-    await send_or_edit(
+    sent = await send_or_edit(
         call,
         f"➕ <b>Новый товар в «{escape(label)}»</b>\n\n"
         "Шаг 1/4. Введите <b>уникальный ключ</b> товара (латинские буквы, цифры, _).\n"
@@ -4913,6 +4958,7 @@ async def cb_adm_catalog_add(call: CallbackQuery, state: FSMContext) -> None:
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
         ]),
     )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
@@ -4922,15 +4968,23 @@ async def msg_adm_new_product_key(message: Message, state: FSMContext) -> None:
         return
     await _try_delete(message)
     raw = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
     if not raw or not all(c.isalnum() or c == "_" for c in raw):
-        await message.answer("⚠️ Ключ может содержать только латинские буквы, цифры и _.\nПопробуйте ещё раз:")
+        await _state_edit(
+            message, state,
+            "⚠️ Ключ может содержать только латинские буквы, цифры и _.\nПопробуйте ещё раз:",
+            _cancel_kb,
+        )
         return
     await state.update_data(new_product_key=raw)
     await state.set_state(AdminStates.waiting_new_product_name)
-    await message.answer(
+    await _state_edit(
+        message, state,
         "Шаг 2/4. Введите <b>название</b> товара (отображается покупателям).\n"
         "Пример: <code>5000 робуксов</code>",
-        parse_mode="HTML",
+        _cancel_kb,
     )
 
 
@@ -4940,12 +4994,15 @@ async def msg_adm_new_product_name(message: Message, state: FSMContext) -> None:
         return
     await _try_delete(message)
     name = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
     if not name:
-        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        await _state_edit(message, state, "⚠️ Название не может быть пустым. Попробуйте ещё раз:", _cancel_kb)
         return
     await state.update_data(new_product_name=name)
     await state.set_state(AdminStates.waiting_new_product_price)
-    await message.answer("Шаг 3/4. Введите <b>цену</b> в рублях (целое число):", parse_mode="HTML")
+    await _state_edit(message, state, "Шаг 3/4. Введите <b>цену</b> в рублях (целое число):", _cancel_kb)
 
 
 @dp.message(AdminStates.waiting_new_product_price)
@@ -4954,15 +5011,19 @@ async def msg_adm_new_product_price(message: Message, state: FSMContext) -> None
         return
     await _try_delete(message)
     price = parse_positive_int(message.text)
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
     if price is None or price <= 0:
-        await message.answer("⚠️ Введите положительное целое число. Попробуйте ещё раз:")
+        await _state_edit(message, state, "⚠️ Введите положительное целое число. Попробуйте ещё раз:", _cancel_kb)
         return
     await state.update_data(new_product_price=price)
     await state.set_state(AdminStates.waiting_new_product_delivery)
-    await message.answer(
+    await _state_edit(
+        message, state,
         "Шаг 4/4. Введите <b>способ выдачи</b> товара.\n"
         "Пример: <code>моментально</code>",
-        parse_mode="HTML",
+        _cancel_kb,
     )
 
 
@@ -4972,8 +5033,11 @@ async def msg_adm_new_product_delivery(message: Message, state: FSMContext) -> N
         return
     await _try_delete(message)
     delivery = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
     if not delivery:
-        await message.answer("⚠️ Способ выдачи не может быть пустым. Попробуйте ещё раз:")
+        await _state_edit(message, state, "⚠️ Способ выдачи не может быть пустым. Попробуйте ещё раз:", _cancel_kb)
         return
     data = await state.get_data()
     category = data.get("new_product_category", "roblox_instant")
@@ -4983,17 +5047,17 @@ async def msg_adm_new_product_delivery(message: Message, state: FSMContext) -> N
     await state.clear()
     ok = await db_add_product(category, key, name, price, delivery)
     if ok:
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"✅ Товар <b>{escape(name)}</b> добавлен!\n"
             f"Ключ: <code>{key}</code>  Цена: <b>{int(price)}₽</b>",
-            parse_mode="HTML",
-            reply_markup=kb_admin_main(),
+            kb_admin_main(),
         )
     else:
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"❌ Товар с ключом <code>{key}</code> уже существует. Выберите другой ключ.",
-            parse_mode="HTML",
-            reply_markup=kb_admin_main(),
+            kb_admin_main(),
         )
 
 
@@ -5007,7 +5071,7 @@ async def cb_adm_catalog_new_cat(call: CallbackQuery, state: FSMContext) -> None
     if not _is_moderator(call.from_user.id):
         return
     await state.set_state(AdminStates.waiting_new_cat_key)
-    await send_or_edit(
+    sent = await send_or_edit(
         call,
         "➕ <b>Новая категория — Шаг 1/3</b>\n\n"
         "Введите <b>уникальный ключ</b> категории (латинские буквы, цифры, _).\n"
@@ -5017,6 +5081,7 @@ async def cb_adm_catalog_new_cat(call: CallbackQuery, state: FSMContext) -> None
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
         ]),
     )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
 
 
 @dp.message(AdminStates.waiting_new_cat_key)
@@ -5026,44 +5091,40 @@ async def msg_adm_new_cat_key(message: Message, state: FSMContext) -> None:
     await _try_delete(message)
     raw = (message.text or "").strip().lower()
     reserved = {"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"}
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+    ])
     if not raw or not all(c.isalnum() or c == "_" for c in raw):
-        await message.answer(
+        await _state_edit(
+            message, state,
             "⚠️ Ключ может содержать только латинские буквы, цифры и _. Попробуйте ещё раз:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
-            ]),
+            _cancel_kb,
         )
         return
     if raw in reserved:
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"⚠️ Ключ <code>{raw}</code> зарезервирован. Выберите другой:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
-            ]),
+            _cancel_kb,
         )
         return
     existing = await db_get_category(raw)
     if existing:
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"⚠️ Категория с ключом <code>{raw}</code> уже существует.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
-            ]),
+            _cancel_kb,
         )
         return
     await state.update_data(new_cat_key=raw)
     await state.set_state(AdminStates.waiting_new_cat_name)
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"Ключ: <code>{raw}</code>\n\n"
         "➕ <b>Новая категория — Шаг 2/3</b>\n\n"
         "Введите <b>название категории</b> (видят покупатели).\n"
         "Пример: <code>Minecraft</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
-        ]),
+        _cancel_kb,
     )
 
 
@@ -5073,19 +5134,22 @@ async def msg_adm_new_cat_name(message: Message, state: FSMContext) -> None:
         return
     await _try_delete(message)
     name = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
     if not name:
-        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        await _state_edit(message, state, "⚠️ Название не может быть пустым. Попробуйте ещё раз:", _cancel_kb)
         return
     await state.update_data(new_cat_name=name)
     await state.set_state(AdminStates.waiting_new_cat_emoji)
     data = await state.get_data()
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"Ключ: <code>{data['new_cat_key']}</code>  Название: <b>{escape(name)}</b>\n\n"
         "➕ <b>Новая категория — Шаг 3/3</b>\n\n"
         "Введите <b>эмодзи</b> для категории (одним символом).\n"
         "Пример: <code>⛏️</code>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎮 Пропустить (по умолчанию)", callback_data="adm:newcat:emoji_default")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
         ]),
@@ -5223,7 +5287,13 @@ async def msg_adm_cat_disabled_reason(message: Message, state: FSMContext) -> No
     await _try_delete(message)
     reason = (message.text or "").strip()
     if not reason:
-        await message.answer("⚠️ Введите причину или нажмите «Без объяснения».")
+        await _state_edit(
+            message, state,
+            "⚠️ Введите причину или нажмите «Без объяснения».",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Без объяснения", callback_data=f"adm:catdis:noreason:{(await state.get_data()).get('cat_disable_key', '')}")]
+            ]),
+        )
         return
     data = await state.get_data()
     key = data.get("cat_disable_key", "")
@@ -5231,11 +5301,11 @@ async def msg_adm_cat_disabled_reason(message: Message, state: FSMContext) -> No
     await db_set_category_disabled(key, True, reason)
     cat = await db_get_category(key)
     name = f"{cat['emoji']} {cat['name']}" if cat else key
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"🔴 Категория <b>{escape(name)}</b> отключена.\n"
         f"Причина: <i>{escape(reason)}</i>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
             [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
         ]),
@@ -5775,10 +5845,10 @@ async def msg_adm_user_id(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_row = await db_find_user(target_id)
     if not user_row:
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"❌ Пользователь с ID <code>{target_id}</code> не найден.",
-            reply_markup=kb_admin_main(),
-            parse_mode="HTML",
+            kb_admin_main(),
         )
         return
     blocked = bool(user_row.get("is_blacklisted"))
@@ -5792,10 +5862,10 @@ async def msg_adm_user_id(message: Message, state: FSMContext) -> None:
         f"Заказов: <b>{orders_cnt}</b>\n"
         f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
     )
-    await message.answer(
+    await _state_edit(
+        message, state,
         text,
-        reply_markup=kb_admin_user(target_id, blocked, from_list_page=None),
-        parse_mode="HTML",
+        kb_admin_user(target_id, blocked, from_list_page=None),
     )
 
 
@@ -5859,10 +5929,10 @@ async def msg_adm_credit(message: Message, state: FSMContext) -> None:
         pass
     from_list_page = saved_source if saved_source is not None else None
     from_list_page = int(from_list_page) if from_list_page is not None else None
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"✅ Начислено {_fmt_price(amount)}₽. Новый баланс: <b>{_fmt_price(new_balance)}₽</b>",
-        parse_mode="HTML",
-        reply_markup=kb_admin_user(
+        kb_admin_user(
             target_id,
             await db_is_blacklisted(target_id),
             from_list_page=from_list_page,
@@ -6395,7 +6465,7 @@ async def cb_adm_promo_create(call: CallbackQuery, state: FSMContext) -> None:
     if not _is_moderator(call.from_user.id):
         return
     await state.set_state(PromoStates.waiting_code_input)
-    await send_or_edit(
+    sent = await send_or_edit(
         call,
         "📝 <b>Создание промокода</b>\n\n"
         "Введите <b>код промокода</b> (только латинские буквы, цифры и знак «_», без пробелов).\n\n"
@@ -6404,6 +6474,7 @@ async def cb_adm_promo_create(call: CallbackQuery, state: FSMContext) -> None:
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
         ])
     )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
 
 
 @dp.message(PromoStates.waiting_code_input)
@@ -6411,35 +6482,35 @@ async def msg_promo_code_input(message: Message, state: FSMContext) -> None:
     if not _is_moderator(message.from_user.id):
         return
     code = (message.text or "").strip().upper()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
     if not code or not code.replace("_", "").isalnum():
-        await message.answer(
+        await _state_edit(
+            message, state,
             "⚠️ Код может содержать только латинские буквы, цифры и «_». Попробуйте ещё раз.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
-            ])
+            _cancel_kb,
         )
         return
     existing = await db_get_promo_by_code(code)
     if existing:
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"⚠️ Промокод <code>{escape(code)}</code> уже существует. Введите другой.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
-            ])
+            _cancel_kb,
         )
         return
     await state.update_data(promo_code=code)
     await state.set_state(PromoStates.waiting_discount_type)
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"Код: <code>{escape(code)}</code>\n\n"
         "📋 Выберите <b>тип промокода</b>:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🏷️ Фиксированная цена", callback_data="adm:promo_type:price")],
             [InlineKeyboardButton(text="💸 Скидка %", callback_data="adm:promo_type:pct")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
-        ])
+        ]),
     )
 
 
@@ -6502,8 +6573,11 @@ async def msg_promo_product(message: Message, state: FSMContext) -> None:
     if not _is_moderator(message.from_user.id):
         return
     product = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
     if not product:
-        await message.answer("⚠️ Название товара не может быть пустым. Введите ещё раз.")
+        await _state_edit(message, state, "⚠️ Название товара не может быть пустым. Введите ещё раз.", _cancel_kb)
         return
     await state.update_data(promo_product=product)
     data = await state.get_data()
@@ -6512,25 +6586,21 @@ async def msg_promo_product(message: Message, state: FSMContext) -> None:
 
     if game == "pct_discount":
         await state.set_state(PromoStates.waiting_discount_pct)
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"Код: <code>{escape(code)}</code>  |  Тип: <b>Скидка %</b>\n"
             f"Описание: <b>{escape(product)}</b>\n\n"
             "💸 Введите <b>размер скидки в процентах</b> (целое число, например: <code>10</code>):",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
-            ])
+            _cancel_kb,
         )
     else:
         await state.set_state(PromoStates.waiting_price)
-        await message.answer(
+        await _state_edit(
+            message, state,
             f"Код: <code>{escape(code)}</code>  |  Игра: <b>{escape(game)}</b>\n"
             f"Товар: <b>{escape(product)}</b>\n\n"
             "💰 Введите <b>цену по промокоду</b> (целое число в рублях, например: <code>150</code>):",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
-            ])
+            _cancel_kb,
         )
 
 
@@ -6539,22 +6609,25 @@ async def msg_promo_discount_pct(message: Message, state: FSMContext) -> None:
     if not _is_moderator(message.from_user.id):
         return
     pct = parse_positive_int(message.text)
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
     if pct is None or pct > 99:
-        await message.answer("⚠️ Введите корректное значение от 1 до 99.")
+        await _state_edit(message, state, "⚠️ Введите корректное значение от 1 до 99.", _cancel_kb)
         return
     await state.update_data(promo_discount_pct=pct)
     await state.set_state(PromoStates.waiting_dates)
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"Скидка: <b>{pct}%</b>\n\n"
         "📅 Введите <b>срок действия</b> промокода:\n\n"
         "• Дата окончания: <code>31.12.2026</code>\n"
         "• Диапазон дат: <code>01.07.2026 - 31.12.2026</code>\n"
         "• Или нажмите кнопку ниже, если промокод бессрочный:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="♾️ Бессрочно", callback_data="adm:promo_dates:forever")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
-        ])
+        ]),
     )
 
 
@@ -6563,21 +6636,24 @@ async def msg_promo_price_input(message: Message, state: FSMContext) -> None:
     if not _is_moderator(message.from_user.id):
         return
     price = parse_positive_int(message.text)
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
     if price is None:
-        await message.answer("⚠️ Введите корректную сумму (целое число больше 0).")
+        await _state_edit(message, state, "⚠️ Введите корректную сумму (целое число больше 0).", _cancel_kb)
         return
     await state.update_data(promo_price=price)
     await state.set_state(PromoStates.waiting_dates)
-    await message.answer(
+    await _state_edit(
+        message, state,
         "📅 Введите <b>срок действия</b> промокода:\n\n"
         "• Дата окончания: <code>31.12.2026</code>\n"
         "• Диапазон дат: <code>01.07.2026 - 31.12.2026</code>\n"
         "• Или нажмите кнопку ниже, если промокод бессрочный:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="♾️ Бессрочно", callback_data="adm:promo_dates:forever")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
-        ])
+        ]),
     )
 
 
@@ -6609,6 +6685,9 @@ async def msg_promo_dates(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     starts_at = None
     expires_at = None
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
     separators = [" - ", "–", "—", " — "]
     sep_found = next((s for s in separators if s in text), None)
     if sep_found:
@@ -6616,25 +6695,28 @@ async def msg_promo_dates(message: Message, state: FSMContext) -> None:
         starts_at = _parse_date_iso(parts[0])
         expires_at = _parse_date_iso(parts[1])
         if not starts_at or not expires_at:
-            await message.answer(
+            await _state_edit(
+                message, state,
                 "⚠️ Не удалось распознать даты. Используйте формат:\n"
                 "<code>01.07.2026 - 31.12.2026</code>",
-                parse_mode="HTML"
+                _cancel_kb,
             )
             return
     else:
         expires_at = _parse_date_iso(text)
         if not expires_at:
-            await message.answer(
+            await _state_edit(
+                message, state,
                 "⚠️ Не удалось распознать дату. Введите в формате <code>31.12.2026</code>.",
-                parse_mode="HTML"
+                _cancel_kb,
             )
             return
     data = await state.get_data()
     await state.update_data(promo_starts_at=starts_at, promo_expires_at=expires_at)
     await state.set_state(PromoStates.waiting_max_uses)
     code = data.get("promo_code", "?")
-    await message.answer(
+    await _state_edit(
+        message, state,
         f"Код: <code>{escape(code)}</code>  |  Срок установлен.\n\n"
         "🔢 Введите <b>лимит активаций</b> (сколько раз можно использовать этот промокод).\n\n"
         "Или нажмите кнопку, если промокод без ограничений:",
@@ -6698,6 +6780,7 @@ async def _save_promo_and_confirm_msg(
     starts_at: str | None,
     expires_at: str | None,
     max_uses: int | None = None,
+    state: FSMContext | None = None,
 ) -> None:
     code = data.get("promo_code")
     game = data.get("promo_game")
@@ -6705,8 +6788,14 @@ async def _save_promo_and_confirm_msg(
     price = data.get("promo_price")
     discount_pct = data.get("promo_discount_pct", 0)
     is_pct = game == "pct_discount"
+    _kb_err = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Начать заново", callback_data="adm:promo_create")]
+    ])
     if not all([code, game, product]) or (not is_pct and not price):
-        await message.answer("❌ Ошибка: данные утеряны. Начните заново.")
+        if state:
+            await _state_edit(message, state, "❌ Ошибка: данные утеряны. Начните заново.", _kb_err)
+        else:
+            await message.answer("❌ Ошибка: данные утеряны. Начните заново.", reply_markup=_kb_err)
         return
     promo_id = await db_create_promo(
         code, game, product,
@@ -6735,7 +6824,10 @@ async def _save_promo_and_confirm_msg(
         [InlineKeyboardButton(text="🎟️ Все промокоды", callback_data="adm:promos")],
         [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")],
     ])
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    if state:
+        await _state_edit(message, state, text, kb)
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "adm:promo_maxuses:unlimited")
@@ -6756,11 +6848,11 @@ async def msg_promo_max_uses(message: Message, state: FSMContext) -> None:
         return
     val = parse_positive_int(message.text)
     if val is None or val <= 0:
-        await message.answer(
+        await _state_edit(
+            message, state,
             "⚠️ Введите положительное целое число (например: <code>100</code>) "
             "или нажмите кнопку «Без ограничений».",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
             ]),
@@ -6770,7 +6862,7 @@ async def msg_promo_max_uses(message: Message, state: FSMContext) -> None:
     await state.clear()
     starts_at = data.get("promo_starts_at")
     expires_at = data.get("promo_expires_at")
-    await _save_promo_and_confirm_msg(message, data, starts_at=starts_at, expires_at=expires_at, max_uses=val)
+    await _save_promo_and_confirm_msg(message, data, starts_at=starts_at, expires_at=expires_at, max_uses=val, state=state)
 
 
 @dp.callback_query(F.data.startswith("adm:promo:"))
@@ -6912,7 +7004,7 @@ async def cb_adm_promo_del_yes(call: CallbackQuery) -> None:
 async def cb_enter_promo(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     await state.set_state(ShopStates.waiting_promo_input)
-    await send_or_edit(
+    sent = await send_or_edit(
         call,
         "✏️ <b>Ввести промокод</b>\n\n"
         "Отправьте код промокода одним сообщением.\n"
@@ -6921,31 +7013,34 @@ async def cb_enter_promo(call: CallbackQuery, state: FSMContext) -> None:
             [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")]
         ])
     )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
 
 
 @dp.message(ShopStates.waiting_promo_input)
 async def msg_promo_input(message: Message, state: FSMContext) -> None:
     code = (message.text or "").strip()
-    if not code:
-        await message.answer("Введите код промокода.")
-        return
-
-    promo = await db_get_promo_by_code(code)
     kb_back = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")]
     ])
+    if not code:
+        await _state_edit(message, state, "Введите код промокода.", kb_back)
+        return
+
+    promo = await db_get_promo_by_code(code)
 
     if not promo:
-        await message.answer(
+        await _state_edit(
+            message, state,
             "❌ Промокод не найден. Проверьте правильность написания.",
-            reply_markup=kb_back
+            kb_back,
         )
         return
 
     if not _promo_is_valid_now(promo):
-        await message.answer(
+        await _state_edit(
+            message, state,
             "❌ Этот промокод недействителен или истёк.",
-            reply_markup=kb_back
+            kb_back,
         )
         return
 
