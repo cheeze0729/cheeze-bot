@@ -365,8 +365,11 @@ async def get_pool() -> asyncpg.Pool:
     """Возвращает глобальный пул соединений с Neon PostgreSQL."""
     global _pool
     if _pool is None:
+        dsn = os.environ.get("CONNECTION_STRING") or os.environ.get("DATABASE_URL")
+        if not dsn:
+            raise RuntimeError("Не задан CONNECTION_STRING или DATABASE_URL")
         _pool = await asyncpg.create_pool(
-            os.environ["CONNECTION_STRING"],
+            dsn,
             min_size=1,
             max_size=5,
         )
@@ -1518,6 +1521,7 @@ class AdminStates(StatesGroup):
     waiting_unblock_reason = State()
     waiting_gp_price = State()
     waiting_mod_reply = State()        # ответ покупателю из чата модератора
+    waiting_refund_reason = State()    # причина возврата (модератор вводит текст)
     waiting_broadcast = State()        # рассылка всем пользователям
     waiting_edit_product_price = State()   # изменение цены товара
     waiting_edit_setting_value = State()   # изменение настройки (курс/лимит)
@@ -3756,7 +3760,9 @@ async def cb_topup_admin_reject(call: CallbackQuery) -> None:
 RECEIPT_CONFIRM_TIMEOUT = 30 * 60  # секунд
 
 
-async def _auto_confirm_receipt(order_id: int, tg_id: int) -> None:
+async def _auto_confirm_receipt(
+    order_id: int, tg_id: int, confirm_msg_id: int | None = None
+) -> None:
     """Через 30 минут автоматически подтверждает заказ, если покупатель не ответил."""
     await asyncio.sleep(RECEIPT_CONFIRM_TIMEOUT)
     still_pending = await db_get_confirm_pending(order_id)
@@ -3775,27 +3781,51 @@ async def _auto_confirm_receipt(order_id: int, tg_id: int) -> None:
     except Exception as e:
         logging.warning(f"Не удалось уведомить модератора об авто-подтверждении: {e}")
 
-    # Сообщаем покупателю
+    # Редактируем исходное сообщение с кнопками — убираем кнопки, ставим статус авто-подтверждения
+    has_review = await db_has_review(order_id)
+    review_btn = [] if has_review else [
+        [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review:{order_id}")]
+    ]
+    kb_after = InlineKeyboardMarkup(inline_keyboard=review_btn + [
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    auto_text = (
+        f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+        "⏱ <b>Получение подтверждено автоматически</b> — вы не ответили в течение 30 минут.\n\n"
+        + ("⭐ Если хотите — оставьте отзыв о заказе." if not has_review else "")
+    )
+    if confirm_msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=tg_id,
+                message_id=confirm_msg_id,
+                text=auto_text,
+                parse_mode="HTML",
+                reply_markup=kb_after,
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось отредактировать сообщение подтверждения: {e}")
+            # Fallback — шлём новое сообщение
+            try:
+                await bot.send_message(tg_id, auto_text, parse_mode="HTML", reply_markup=kb_after)
+            except Exception:
+                pass
+    else:
+        try:
+            await bot.send_message(tg_id, auto_text, parse_mode="HTML", reply_markup=kb_after)
+        except Exception as e:
+            logging.warning(f"Не удалось отправить авто-подтверждение пользователю {tg_id}: {e}")
+
+    # Отдельное короткое уведомление — чтобы покупатель точно заметил
     try:
-        order = await db_get_order(order_id)
-        has_review = await db_has_review(order_id)
-        review_btn = [] if has_review else [
-            [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review:{order_id}")]
-        ]
-        kb = InlineKeyboardMarkup(inline_keyboard=review_btn + [
-            [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-        ])
         await bot.send_message(
             tg_id,
-            f"⏱ <b>Заказ #{order_id} подтверждён автоматически.</b>\n\n"
-            "Вы не выбрали ответ в течение 30 минут, поэтому получение засчитано автоматически.\n\n"
-            + ("⭐ Если хотите — оставьте отзыв о заказе." if not has_review else ""),
+            f"ℹ️ Заказ <b>#{order_id}</b> закрыт автоматически после 30 минут ожидания.",
             parse_mode="HTML",
-            reply_markup=kb,
         )
-    except Exception as e:
-        logging.warning(f"Не удалось отправить авто-подтверждение пользователю {tg_id}: {e}")
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -7375,7 +7405,7 @@ async def cb_mod_done(call: CallbackQuery) -> None:
                 ],
             ]
         )
-        await bot.send_message(
+        confirm_msg = await bot.send_message(
             tg_id,
             f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
             "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
@@ -7387,7 +7417,9 @@ async def cb_mod_done(call: CallbackQuery) -> None:
             reply_markup=user_kb,
         )
         await db_set_confirm_pending(order_id, True)
-        asyncio.create_task(_auto_confirm_receipt(order_id, tg_id))
+        asyncio.create_task(
+            _auto_confirm_receipt(order_id, tg_id, confirm_msg.message_id)
+        )
     except Exception:
         pass
 
@@ -7452,8 +7484,8 @@ async def msg_email_code(message: Message, state: FSMContext) -> None:
 
 
 @dp.callback_query(F.data.startswith("mod:refund:"))
-async def cb_mod_refund(call: CallbackQuery) -> None:
-    """Модератор делает возврат средств по заказу."""
+async def cb_mod_refund(call: CallbackQuery, state: FSMContext) -> None:
+    """Модератор инициирует возврат — запрашивает причину."""
     await call.answer()
     if not _is_moderator(call.from_user.id):
         return
@@ -7466,51 +7498,117 @@ async def cb_mod_refund(call: CallbackQuery) -> None:
     if not order:
         await call.answer("Заказ не найден.", show_alert=True)
         return
-
     if order.get("status") == "Возврат":
         await call.answer("Возврат по этому заказу уже был выполнен.", show_alert=True)
         return
 
-    tg_id = order["tg_id"]
-    refund_amount = float(order["price"])
-
-    await db_update_order_status(order_id, "Возврат")
-    await db_credit_balance(
-        tg_id, refund_amount, kind="refund",
-        reason=f"Возврат по заказу #{order_id}"
+    # Сохраняем данные и переходим в состояние ожидания причины
+    await state.set_state(AdminStates.waiting_refund_reason)
+    await state.update_data(
+        refund_order_id=order_id,
+        refund_tg_id=order["tg_id"],
+        refund_amount=float(order["price"]),
+        refund_msg_chat_id=call.message.chat.id,
+        refund_msg_id=call.message.message_id,
+    )
+    await call.message.reply(
+        f"💸 <b>Возврат по заказу #{order_id}</b>\n\n"
+        f"Сумма: <b>{_fmt_price(float(order['price']))}₽</b>\n\n"
+        "Введите <b>причину возврата</b> — она будет отправлена покупателю.\n"
+        "Или нажмите кнопку, чтобы отменить.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="mod:refund_cancel")]
+        ]),
     )
 
+
+@dp.callback_query(F.data == "mod:refund_cancel")
+async def cb_mod_refund_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    """Отмена ввода причины возврата."""
+    await call.answer()
+    await state.clear()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+
+@dp.message(AdminStates.waiting_refund_reason)
+async def msg_mod_refund_reason(message: Message, state: FSMContext) -> None:
+    """Модератор ввёл причину — выполняем возврат."""
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer(
+            "⚠️ Причина не может быть пустой. Введите текст причины возврата.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="mod:refund_cancel")]
+            ]),
+        )
+        return
+
+    data = await state.get_data()
+    order_id: int = data["refund_order_id"]
+    tg_id: int = data["refund_tg_id"]
+    refund_amount: float = data["refund_amount"]
+    orig_chat_id: int = data["refund_msg_chat_id"]
+    orig_msg_id: int = data["refund_msg_id"]
+    await state.clear()
+
+    # Проверяем — вдруг уже сделан другим модератором
+    order = await db_get_order(order_id)
+    if not order or order.get("status") == "Возврат":
+        await message.answer("⚠️ Возврат по этому заказу уже был выполнен.")
+        return
+
+    await db_update_order_status(order_id, "Возврат")
+    await db_credit_balance(tg_id, refund_amount, kind="refund",
+                             reason=f"Возврат по заказу #{order_id}: {reason}")
+
+    # Уведомление покупателю с причиной
     try:
         await bot.send_message(
             tg_id,
             f"💸 <b>Возврат по заказу #{order_id}</b>\n\n"
             f"На ваш баланс возвращено <b>{_fmt_price(refund_amount)}₽</b>.\n\n"
-            "Если у вас остались вопросы — обратитесь в поддержку.",
+            f"📝 <b>Причина:</b> {escape(reason)}\n\n"
+            "Если остались вопросы — обратитесь в поддержку.",
             parse_mode="HTML",
         )
     except Exception:
         pass
 
-    await call.answer(
-        f"Возврат {_fmt_price(refund_amount)}₽ по заказу #{order_id} выполнен.",
-        show_alert=True,
+    # Редактируем оригинальное сообщение модератора — убираем кнопки, добавляем статус
+    try:
+        orig_msg = await bot.edit_message_reply_markup(
+            chat_id=orig_chat_id, message_id=orig_msg_id, reply_markup=None
+        )
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            orig_chat_id,
+            f"💸 <b>Возврат по заказу #{order_id} выполнен</b>\n"
+            f"Сумма: <b>{_fmt_price(refund_amount)}₽</b>\n"
+            f"Причина: {escape(reason)}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    try:
+        await bot.unpin_chat_message(orig_chat_id, orig_msg_id)
+    except Exception:
+        pass
+
+    await message.answer(
+        f"✅ Возврат {_fmt_price(refund_amount)}₽ по заказу #{order_id} выполнен.",
+        parse_mode="HTML",
     )
-    try:
-        await call.message.edit_text(
-            call.message.text + f"\n\n💸 <b>Возврат выполнен</b> модератором.",
-            parse_mode="HTML",
-            reply_markup=None,
-        )
-    except Exception:
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-    try:
-        await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
-    except Exception:
-        pass
 
 
 # =====================================================================
