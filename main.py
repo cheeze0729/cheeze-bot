@@ -378,27 +378,8 @@ dp.message.middleware(BlacklistMiddleware())
 dp.callback_query.middleware(BlacklistMiddleware())
 
 
-class StaffAuditMiddleware(BaseMiddleware):
-    """Записывает действия сотрудников без сохранения текста сообщений."""
-
-    async def __call__(self, handler, event, data):
-        user = getattr(event, "from_user", None)
-        if user is not None and _STAFF_ROLES.get(user.id) in STAFF_ROLES:
-            action = getattr(event, "data", None)
-            if action:
-                action = f"callback:{str(action).split(':', 1)[0]}"
-            else:
-                text = getattr(event, "text", None) or ""
-                action = f"message:{text.split()[0][:40]}" if text else "message"
-            try:
-                await db_audit_staff_action(user.id, action)
-            except Exception as exc:
-                logging.warning(f"Не удалось записать действие сотрудника: {exc}")
-        return await handler(event, data)
-
-
-dp.message.middleware(StaffAuditMiddleware())
-dp.callback_query.middleware(StaffAuditMiddleware())
+# StaffAuditMiddleware удалён: важные действия логируются явно в обработчиках
+# (claim_order, complete_order, blacklist_user, credit_balance и др.)
 
 
 class MaintenanceMiddleware(BaseMiddleware):
@@ -1260,17 +1241,23 @@ def _action_label(action: str) -> str:
     return action
 
 
+_SIGNIFICANT_ACTIONS: tuple[str, ...] = tuple(_ACTION_LABELS.keys())
+
+
 async def db_get_staff_journal(
     page: int = 0,
     staff_filter: int | None = None,
 ) -> tuple[list[dict], int]:
-    """Возвращает (записи, total_count) из staff_audit_log."""
+    """Возвращает (записи, total_count) из staff_audit_log.
+    Показывает только значимые действия (из _ACTION_LABELS).
+    """
     pool = await get_pool()
     offset = page * JOURNAL_PAGE_SIZE
     if staff_filter is not None:
         total = await pool.fetchval(
-            "SELECT COUNT(*) FROM staff_audit_log WHERE staff_id = $1",
-            staff_filter,
+            "SELECT COUNT(*) FROM staff_audit_log "
+            "WHERE staff_id = $1 AND action = ANY($2::text[])",
+            staff_filter, list(_SIGNIFICANT_ACTIONS),
         )
         rows = await pool.fetch(
             "SELECT sal.id, sal.staff_id, sal.role, sal.action, "
@@ -1278,20 +1265,24 @@ async def db_get_staff_journal(
             "sm.username, sm.first_name "
             "FROM staff_audit_log sal "
             "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
-            "WHERE sal.staff_id = $1 "
-            "ORDER BY sal.id DESC LIMIT $2 OFFSET $3",
-            staff_filter, JOURNAL_PAGE_SIZE, offset,
+            "WHERE sal.staff_id = $1 AND sal.action = ANY($2::text[]) "
+            "ORDER BY sal.id DESC LIMIT $3 OFFSET $4",
+            staff_filter, list(_SIGNIFICANT_ACTIONS), JOURNAL_PAGE_SIZE, offset,
         )
     else:
-        total = await pool.fetchval("SELECT COUNT(*) FROM staff_audit_log")
+        total = await pool.fetchval(
+            "SELECT COUNT(*) FROM staff_audit_log WHERE action = ANY($1::text[])",
+            list(_SIGNIFICANT_ACTIONS),
+        )
         rows = await pool.fetch(
             "SELECT sal.id, sal.staff_id, sal.role, sal.action, "
             "sal.entity_type, sal.entity_id, sal.created_at, "
             "sm.username, sm.first_name "
             "FROM staff_audit_log sal "
             "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
-            "ORDER BY sal.id DESC LIMIT $1 OFFSET $2",
-            JOURNAL_PAGE_SIZE, offset,
+            "WHERE sal.action = ANY($1::text[]) "
+            "ORDER BY sal.id DESC LIMIT $2 OFFSET $3",
+            list(_SIGNIFICANT_ACTIONS), JOURNAL_PAGE_SIZE, offset,
         )
     return [dict(r) for r in rows], int(total or 0)
 
