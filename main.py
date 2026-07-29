@@ -330,6 +330,9 @@ dp = Dispatcher(storage=MemoryStorage())
 # защита от двойного списания при повторном/двойном нажатии кнопки оплаты.
 _processing_payments: set[int] = set()
 
+# ---- Режим технических работ ----
+_maintenance: dict = {"active": False, "reason": ""}
+
 
 class BlacklistMiddleware(BaseMiddleware):
     """Блокирует все действия пользователей из чёрного списка.
@@ -396,6 +399,41 @@ class StaffAuditMiddleware(BaseMiddleware):
 
 dp.message.middleware(StaffAuditMiddleware())
 dp.callback_query.middleware(StaffAuditMiddleware())
+
+
+class MaintenanceMiddleware(BaseMiddleware):
+    """Блокирует все действия обычных пользователей во время тех. работ.
+    Персонал всегда пропускается.
+    """
+
+    async def __call__(self, handler, event, data):
+        if not _maintenance["active"]:
+            return await handler(event, data)
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        # Персонал пропускаем всегда
+        if _STAFF_ROLES.get(user.id) in STAFF_ROLES:
+            return await handler(event, data)
+        reason = _maintenance["reason"] or "Скоро вернёмся!"
+        text = (
+            "🔧 <b>Бот временно недоступен</b>\n\n"
+            f"<i>{escape(reason)}</i>\n\n"
+            "Приносим извинения за неудобства. Попробуйте позже."
+        )
+        try:
+            from aiogram.types import CallbackQuery as _CQ, Message as _MSG
+            if isinstance(event, _CQ):
+                await event.answer("🔧 Тех. работы. Попробуйте позже.", show_alert=True)
+            elif isinstance(event, _MSG):
+                await event.answer(text, parse_mode="HTML")
+        except Exception as exc:
+            logging.warning(f"MaintenanceMiddleware error: {exc}")
+        return None
+
+
+dp.message.middleware(MaintenanceMiddleware())
+dp.callback_query.middleware(MaintenanceMiddleware())
 
 # =====================================================================
 # База данных (PostgreSQL через asyncpg + Neon)
@@ -1189,6 +1227,119 @@ async def db_audit_staff_action(
     )
 
 
+JOURNAL_PAGE_SIZE = 10
+
+_ACTION_LABELS: dict[str, str] = {
+    "claim_order":      "📥 Взял заказ",
+    "complete_order":   "✅ Выполнил заказ",
+    "change_role":      "🔄 Сменил роль сотруднику",
+    "fire_staff":       "🔥 Уволил сотрудника",
+    "add_staff":        "➕ Добавил сотрудника",
+    "blacklist_user":   "🚫 Заблокировал пользователя",
+    "unblacklist_user": "🔓 Разблокировал пользователя",
+    "credit_balance":   "💰 Начислил баланс",
+    "reset_balance":    "♻️ Обнулил баланс",
+    "maintenance_on":   "🔒 Включил тех. работы",
+    "maintenance_off":  "🔓 Выключил тех. работы",
+}
+
+_ENTITY_LABELS: dict[str, str] = {
+    "order": "Заказ",
+    "user":  "Пользователь",
+    "staff": "Сотрудник",
+}
+
+
+def _action_label(action: str) -> str:
+    if action in _ACTION_LABELS:
+        return _ACTION_LABELS[action]
+    if action.startswith("callback:"):
+        return f"🖱 callback:{action[9:]}"
+    if action.startswith("message:"):
+        return f"💬 {action[8:]}"
+    return action
+
+
+async def db_get_staff_journal(
+    page: int = 0,
+    staff_filter: int | None = None,
+) -> tuple[list[dict], int]:
+    """Возвращает (записи, total_count) из staff_audit_log."""
+    pool = await get_pool()
+    offset = page * JOURNAL_PAGE_SIZE
+    if staff_filter is not None:
+        total = await pool.fetchval(
+            "SELECT COUNT(*) FROM staff_audit_log WHERE staff_id = $1",
+            staff_filter,
+        )
+        rows = await pool.fetch(
+            "SELECT sal.id, sal.staff_id, sal.role, sal.action, "
+            "sal.entity_type, sal.entity_id, sal.created_at, "
+            "sm.username, sm.first_name "
+            "FROM staff_audit_log sal "
+            "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
+            "WHERE sal.staff_id = $1 "
+            "ORDER BY sal.id DESC LIMIT $2 OFFSET $3",
+            staff_filter, JOURNAL_PAGE_SIZE, offset,
+        )
+    else:
+        total = await pool.fetchval("SELECT COUNT(*) FROM staff_audit_log")
+        rows = await pool.fetch(
+            "SELECT sal.id, sal.staff_id, sal.role, sal.action, "
+            "sal.entity_type, sal.entity_id, sal.created_at, "
+            "sm.username, sm.first_name "
+            "FROM staff_audit_log sal "
+            "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
+            "ORDER BY sal.id DESC LIMIT $1 OFFSET $2",
+            JOURNAL_PAGE_SIZE, offset,
+        )
+    return [dict(r) for r in rows], int(total or 0)
+
+
+async def db_staff_order_stats(staff_id: int) -> dict:
+    """Статистика сотрудника: взятые/выполненные заказы (всего, сегодня, неделя)."""
+    pool = await get_pool()
+    now_msk = datetime.now(MSK_TZ)
+    today_prefix = now_msk.strftime("%Y-%m-%d")
+    week_start = (now_msk - timedelta(days=now_msk.weekday())).strftime("%Y-%m-%d")
+
+    async def _count(action: str, since: str | None = None) -> int:
+        if since:
+            return int(await pool.fetchval(
+                "SELECT COUNT(*) FROM staff_audit_log "
+                "WHERE staff_id=$1 AND action=$2 AND created_at >= $3",
+                staff_id, action, since,
+            ) or 0)
+        return int(await pool.fetchval(
+            "SELECT COUNT(*) FROM staff_audit_log WHERE staff_id=$1 AND action=$2",
+            staff_id, action,
+        ) or 0)
+
+    return {
+        "claimed_total":     await _count("claim_order"),
+        "completed_total":   await _count("complete_order"),
+        "claimed_today":     await _count("claim_order",    today_prefix),
+        "completed_today":   await _count("complete_order", today_prefix),
+        "claimed_week":      await _count("claim_order",    week_start),
+        "completed_week":    await _count("complete_order", week_start),
+    }
+
+
+async def db_get_order_history(order_id: int) -> list[dict]:
+    """Все записи аудита по конкретному заказу."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT sal.staff_id, sal.role, sal.action, sal.created_at, "
+        "sm.username, sm.first_name "
+        "FROM staff_audit_log sal "
+        "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
+        "WHERE sal.entity_type = 'order' AND sal.entity_id = $1 "
+        "ORDER BY sal.id ASC",
+        str(order_id),
+    )
+    return [dict(r) for r in rows]
+
+
 # ---- Тикеты поддержки ----
 
 async def db_create_ticket(
@@ -1917,6 +2068,8 @@ class AdminStates(StatesGroup):
     waiting_staff_add_id = State()         # добавление сотрудника — ввод TG ID
     waiting_staff_fire_confirm = State()   # увольнение — подтверждение
     waiting_ticket_reply = State()         # сотрудник отвечает на тикет
+    waiting_maintenance_reason = State()   # Founder вводит причину тех. работ
+    waiting_maintenance_confirm = State()  # подтверждение включения тех. работ
 
 
 class PromoStates(StatesGroup):
@@ -2463,6 +2616,9 @@ def _staff_order_keyboard(order: dict) -> InlineKeyboardMarkup:
         )],
         [InlineKeyboardButton(
             text="💸 Возврат", callback_data=f"mod:refund:{order_id}"
+        )],
+        [InlineKeyboardButton(
+            text="📋 История заказа", callback_data=f"ord:history:{order_id}"
         )],
     ]
     if order.get("category") == "roblox_gamepass" and order.get("gamepass_price"):
@@ -5018,6 +5174,9 @@ async def cb_order_done(call: CallbackQuery) -> None:
         return
 
     await db_set_order_status(order_id, "Выполнен")
+    await db_audit_staff_action(
+        call.from_user.id, "complete_order", "order", str(order_id)
+    )
 
     # Обработка реферальной программы
     referrer_id, level_up, new_level, _ = await db_process_referral(target_id)
@@ -5104,6 +5263,49 @@ async def cb_order_done(call: CallbackQuery) -> None:
         pass
 
     await call.answer("Заказ выполнен")
+
+
+# =====================================================================
+# История конкретного заказа (для персонала)
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("ord:history:"))
+async def cb_order_history(call: CallbackQuery) -> None:
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        order_id = int(call.data.split(":", 2)[2])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    history = await db_get_order_history(order_id)
+    if not history:
+        await call.answer(f"История заказа #{order_id} пуста.", show_alert=True)
+        return
+
+    lines = [f"<b>📋 История заказа #{order_id}</b>\n"]
+    for entry in history:
+        staff_name = entry.get("first_name") or (
+            f"@{entry['username']}" if entry.get("username") else f"id{entry['staff_id']}"
+        )
+        role_label = STAFF_ROLE_LABELS.get(entry["role"], entry["role"])
+        action_label = _action_label(entry["action"])
+        ts = _fmt_msk(entry["created_at"])
+        lines.append(
+            f"<b>{escape(staff_name)}</b> [{role_label}]\n"
+            f"  {action_label}\n"
+            f"  <i>{ts}</i>\n"
+        )
+    text = "\n".join(lines)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+    ])
+    await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
 
 
 # =====================================================================
@@ -5731,6 +5933,16 @@ def kb_admin_main(user_id: int = 0) -> InlineKeyboardMarkup:
     ]
     if _is_founder(user_id):
         rows.append([InlineKeyboardButton(text="👥 Персонал", callback_data="adm:staff")])
+        if _maintenance["active"]:
+            rows.append([InlineKeyboardButton(
+                text="🔓 Открыть бота (тех. работы активны)",
+                callback_data="adm:maintenance:off",
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text="🔒 Закрыть бота (тех. работы)",
+                callback_data="adm:maintenance",
+            )])
     rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -5872,17 +6084,9 @@ def kb_admin_users(users: list[dict], page: int, total: int) -> InlineKeyboardMa
 
 
 def kb_admin_user(
-    target_id: int, blocked: bool, from_list_page: int | None = None
+    target_id: int, blocked: bool, from_list_page: int | None = None,
+    viewer_id: int = 0,
 ) -> InlineKeyboardMarkup:
-    block_btn = (
-        InlineKeyboardButton(
-            text="✅ Убрать из ЧС", callback_data=f"adm:unblock:{target_id}"
-        )
-        if blocked
-        else InlineKeyboardButton(
-            text="🚫 В чёрный список", callback_data=f"adm:block:{target_id}"
-        )
-    )
     if from_list_page is not None:
         nav_row = [
             InlineKeyboardButton(
@@ -5897,19 +6101,32 @@ def kb_admin_user(
             ),
             InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close"),
         ]
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="➕ Начислить баланс", callback_data=f"adm:credit:{target_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="♻️ Обнулить баланс", callback_data=f"adm:reset:{target_id}"
+            )
+        ],
+    ]
+    # Блокировка — только Founder и Administrator
+    if _senior_staff(viewer_id):
+        block_btn = (
+            InlineKeyboardButton(
+                text="✅ Убрать из ЧС", callback_data=f"adm:unblock:{target_id}"
+            )
+            if blocked
+            else InlineKeyboardButton(
+                text="🚫 В чёрный список", callback_data=f"adm:block:{target_id}"
+            )
+        )
+        rows.append([block_btn])
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Начислить баланс", callback_data=f"adm:credit:{target_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="♻️ Обнулить баланс", callback_data=f"adm:reset:{target_id}"
-                )
-            ],
-            [block_btn],
+        inline_keyboard=rows + [
             [
                 InlineKeyboardButton(
                     text="📜 История транзакций",
@@ -5970,7 +6187,7 @@ async def _send_admin_user_card(
         f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
     )
     await send_or_edit(
-        call, text, kb_admin_user(target_id, blocked, from_list_page)
+        call, text, kb_admin_user(target_id, blocked, from_list_page, viewer_id=call.from_user.id)
     )
 
 
@@ -6017,6 +6234,92 @@ async def cb_adm_close(call: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == "adm:noop")
 async def cb_adm_noop(call: CallbackQuery) -> None:
     await call.answer()
+
+
+# =====================================================================
+# Режим технических работ (только Founder)
+# =====================================================================
+
+@dp.callback_query(F.data == "adm:maintenance")
+async def cb_adm_maintenance(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:main")],
+    ])
+    await send_or_edit(
+        call,
+        "🔒 <b>Закрыть бота на тех. работы</b>\n\n"
+        "Введите причину, которую увидят пользователи.\n"
+        "<i>Например: «Обновление — ждите 15 минут»</i>",
+        kb_cancel,
+    )
+    await state.set_state(AdminStates.waiting_maintenance_reason)
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_maintenance_reason)
+async def msg_maintenance_reason(message: Message, state: FSMContext) -> None:
+    if not _is_founder(message.from_user.id):
+        return
+    await _try_delete(message)
+    reason = (message.text or "").strip()
+    if not reason:
+        await state.set_state(AdminStates.waiting_maintenance_reason)
+        return
+    await state.update_data(maintenance_reason=reason)
+    await state.set_state(AdminStates.waiting_maintenance_confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="adm:maintenance:confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="adm:main"),
+        ],
+    ])
+    await message.answer(
+        f"🔒 <b>Закрыть бота?</b>\n\n"
+        f"Причина: <i>{escape(reason)}</i>\n\n"
+        "После подтверждения все пользователи (не персонал) получат уведомление о недоступности бота при любом действии.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data == "adm:maintenance:confirm")
+async def cb_adm_maintenance_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    data = await state.get_data()
+    reason = data.get("maintenance_reason", "Технические работы")
+    _maintenance["active"] = True
+    _maintenance["reason"] = reason
+    await state.clear()
+    await db_audit_staff_action(call.from_user.id, "maintenance_on", None, None)
+    await send_or_edit(
+        call,
+        f"🔒 <b>Бот закрыт на тех. работы</b>\n\n"
+        f"Причина: <i>{escape(reason)}</i>\n\n"
+        "Пользователи видят сообщение о недоступности. Персонал работает в штатном режиме.",
+        kb_admin_main(call.from_user.id),
+    )
+    await call.answer("Тех. работы активированы", show_alert=True)
+
+
+@dp.callback_query(F.data == "adm:maintenance:off")
+async def cb_adm_maintenance_off(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    _maintenance["active"] = False
+    _maintenance["reason"] = ""
+    await db_audit_staff_action(call.from_user.id, "maintenance_off", None, None)
+    await send_or_edit(
+        call,
+        "✅ <b>Бот открыт</b>\n\nРежим тех. работ отключён. Все пользователи снова имеют доступ.",
+        kb_admin_main(call.from_user.id),
+    )
+    await call.answer("Тех. работы отключены", show_alert=True)
 
 
 # =====================================================================
@@ -7121,7 +7424,7 @@ async def msg_adm_user_id(message: Message, state: FSMContext) -> None:
         await _state_edit(
             message, state,
             text,
-            kb_admin_user(target_id, blocked, from_list_page=None),
+            kb_admin_user(target_id, blocked, from_list_page=None, viewer_id=message.from_user.id),
         )
 
 
@@ -7174,6 +7477,9 @@ async def msg_adm_credit(message: Message, state: FSMContext) -> None:
     new_balance = await db_credit_balance(
         target_id, amount, kind="admin_add", reason="Начисление администратором"
     )
+    await db_audit_staff_action(
+        message.from_user.id, "credit_balance", "user", str(target_id)
+    )
     try:
         await bot.send_message(
             target_id,
@@ -7192,6 +7498,7 @@ async def msg_adm_credit(message: Message, state: FSMContext) -> None:
             target_id,
             await db_is_blacklisted(target_id),
             from_list_page=from_list_page,
+            viewer_id=message.from_user.id,
         ),
     )
 
@@ -7204,6 +7511,9 @@ async def cb_adm_reset(call: CallbackQuery, state: FSMContext) -> None:
     target_id = int(call.data.split(":")[2])
     old_balance = await db_get_balance(target_id)
     await db_set_balance(target_id, 0)
+    await db_audit_staff_action(
+        call.from_user.id, "reset_balance", "user", str(target_id)
+    )
     if old_balance:
         await db_add_transaction(
             target_id,
@@ -7225,11 +7535,14 @@ async def cb_adm_reset(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("adm:block:"))
 async def cb_adm_block(call: CallbackQuery, state: FSMContext) -> None:
-    if not _is_moderator(call.from_user.id):
-        await call.answer()
+    if not _senior_staff(call.from_user.id):
+        await call.answer("Только Founder и Administrator.", show_alert=True)
         return
     target_id = int(call.data.split(":")[2])
     await db_set_blacklist(target_id, True)
+    await db_audit_staff_action(
+        call.from_user.id, "blacklist_user", "user", str(target_id)
+    )
     try:
         await bot.send_message(
             target_id,
@@ -7245,11 +7558,14 @@ async def cb_adm_block(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("adm:unblock:"))
 async def cb_adm_unblock(call: CallbackQuery, state: FSMContext) -> None:
-    if not _is_moderator(call.from_user.id):
-        await call.answer()
+    if not _senior_staff(call.from_user.id):
+        await call.answer("Только Founder и Administrator.", show_alert=True)
         return
     target_id = int(call.data.split(":")[2])
     await db_set_blacklist(target_id, False)
+    await db_audit_staff_action(
+        call.from_user.id, "unblacklist_user", "user", str(target_id)
+    )
     try:
         await bot.send_message(
             target_id,
@@ -10109,6 +10425,7 @@ def kb_staff_list(staff: list[dict], viewer_id: int) -> InlineKeyboardMarkup:
             callback_data=f"adm:staff:member:{s['tg_id']}",
         )])
     rows.append([InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="adm:staff:add")])
+    rows.append([InlineKeyboardButton(text="📋 Журнал действий", callback_data="adm:staff:journal")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -10321,6 +10638,152 @@ async def cb_adm_staff_addconfirm(call: CallbackQuery, state: FSMContext) -> Non
     staff = await db_list_staff()
     text = f"<b>👥 Персонал</b>\n\nВсего сотрудников: <b>{len(staff)}</b>"
     await send_or_edit(call, text, kb_staff_list(staff, call.from_user.id))
+
+
+# =====================================================================
+# Журнал действий персонала (только Founder)
+# =====================================================================
+
+def _journal_nav_kb(
+    page: int,
+    total: int,
+    staff_filter: int | None,
+    staff_list: list[dict],
+    viewer_id: int,
+) -> InlineKeyboardMarkup:
+    """Строит клавиатуру журнала: фильтр по сотруднику + пагинация."""
+    rows: list[list[InlineKeyboardButton]] = []
+    total_pages = max(1, (total + JOURNAL_PAGE_SIZE - 1) // JOURNAL_PAGE_SIZE)
+
+    # --- фильтр по сотруднику ---
+    filter_buttons: list[InlineKeyboardButton] = []
+    all_cb = f"adm:staff:journal:p:{page}" if staff_filter is not None else "adm:staff:journal"
+    # кнопка «Все»
+    all_mark = "" if staff_filter is not None else "✅ "
+    filter_buttons.append(InlineKeyboardButton(
+        text=f"{all_mark}Все", callback_data="adm:staff:journal",
+    ))
+    for s in staff_list:
+        sid = int(s["tg_id"])
+        if sid == viewer_id:
+            continue
+        name = s.get("first_name") or s.get("username") or str(sid)
+        mark = "✅ " if staff_filter == sid else ""
+        filter_buttons.append(InlineKeyboardButton(
+            text=f"{mark}{name}",
+            callback_data=f"adm:staff:journal:s:{sid}:p:0",
+        ))
+    # по 2 в ряд
+    for i in range(0, len(filter_buttons), 2):
+        rows.append(filter_buttons[i:i+2])
+
+    # --- пагинация ---
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        if staff_filter is not None:
+            prev_cb = f"adm:staff:journal:s:{staff_filter}:p:{page - 1}"
+        else:
+            prev_cb = f"adm:staff:journal:p:{page - 1}"
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=prev_cb))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if (page + 1) * JOURNAL_PAGE_SIZE < total:
+        if staff_filter is not None:
+            next_cb = f"adm:staff:journal:s:{staff_filter}:p:{page + 1}"
+        else:
+            next_cb = f"adm:staff:journal:p:{page + 1}"
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=next_cb))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="⬅️ К персоналу", callback_data="adm:staff")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_journal_text(
+    entries: list[dict],
+    total: int,
+    page: int,
+    staff_filter: int | None,
+    stats: dict | None = None,
+) -> str:
+    filter_label = f" (фильтр по сотруднику ID {staff_filter})" if staff_filter else ""
+    header = f"<b>📋 Журнал действий персонала{filter_label}</b>\nВсего записей: <b>{total}</b>"
+    if stats:
+        header += (
+            f"\n\n<b>📊 Статистика по сотруднику:</b>\n"
+            f"  Взял заказов: всего <b>{stats['claimed_total']}</b> | "
+            f"сегодня <b>{stats['claimed_today']}</b> | "
+            f"неделя <b>{stats['claimed_week']}</b>\n"
+            f"  Выполнил: всего <b>{stats['completed_total']}</b> | "
+            f"сегодня <b>{stats['completed_today']}</b> | "
+            f"неделя <b>{stats['completed_week']}</b>"
+        )
+    header += "\n"
+    if not entries:
+        return header + "\n<i>Записей нет.</i>"
+    lines = [header]
+    for e in entries:
+        staff_name = e.get("first_name") or (
+            f"@{e['username']}" if e.get("username") else f"id{e['staff_id']}"
+        )
+        role_label = STAFF_ROLE_LABELS.get(e["role"], e["role"])
+        action_label = _action_label(e["action"])
+        entity = ""
+        if e.get("entity_type") and e.get("entity_id"):
+            etype = _ENTITY_LABELS.get(e["entity_type"], e["entity_type"])
+            entity = f" → {etype} #{e['entity_id']}"
+        ts = _fmt_msk(e["created_at"])
+        lines.append(
+            f"\n<b>{escape(staff_name)}</b> [{role_label}]\n"
+            f"  {action_label}{entity}\n"
+            f"  <i>{ts}</i>"
+        )
+    return "\n".join(lines)
+
+
+async def _show_journal(
+    call: CallbackQuery,
+    page: int,
+    staff_filter: int | None,
+) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    entries, total = await db_get_staff_journal(page=page, staff_filter=staff_filter)
+    staff_list = await db_list_staff()
+    stats = await db_staff_order_stats(staff_filter) if staff_filter is not None else None
+    text = _build_journal_text(entries, total, page, staff_filter, stats=stats)
+    kb = _journal_nav_kb(page, total, staff_filter, staff_list, call.from_user.id)
+    await send_or_edit(call, text, kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:staff:journal")
+async def cb_adm_staff_journal(call: CallbackQuery) -> None:
+    await _show_journal(call, page=0, staff_filter=None)
+
+
+@dp.callback_query(F.data.startswith("adm:staff:journal:p:"))
+async def cb_adm_staff_journal_page(call: CallbackQuery) -> None:
+    try:
+        page = int(call.data.split(":")[-1])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    await _show_journal(call, page=page, staff_filter=None)
+
+
+@dp.callback_query(F.data.startswith("adm:staff:journal:s:"))
+async def cb_adm_staff_journal_staff(call: CallbackQuery) -> None:
+    # format: adm:staff:journal:s:{staff_id}:p:{page}
+    try:
+        parts = call.data.split(":")
+        staff_id = int(parts[4])
+        page = int(parts[6])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    await _show_journal(call, page=page, staff_filter=staff_id)
 
 
 # =====================================================================
