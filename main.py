@@ -70,6 +70,26 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # Если оставить 0 — пересылка будет отключена.
 MODERATOR_CHAT_ID = 1727614596
 
+# Иерархия сотрудников. MODERATOR_CHAT_ID сохраняется как обратная
+# совместимость с прежней конфигурацией, но теперь он является Founder.
+ROLE_FOUNDER = "founder"
+ROLE_ADMINISTRATOR = "administrator"
+ROLE_MODERATOR = "moderator"
+ROLE_HELPER = "helper"
+STAFF_ROLES = (
+    ROLE_FOUNDER,
+    ROLE_ADMINISTRATOR,
+    ROLE_MODERATOR,
+    ROLE_HELPER,
+)
+STAFF_ROLE_LABELS = {
+    ROLE_FOUNDER: "Founder",
+    ROLE_ADMINISTRATOR: "Administrator",
+    ROLE_MODERATOR: "Moderator",
+    ROLE_HELPER: "Helper",
+}
+_STAFF_ROLES: dict[int, str] = {}
+
 # Юзернеймы (везде, где упоминается @username)
 SUPPORT_USERNAME = "@cheeze0729"  # Поддержка
 OTHER_APPS_USERNAME = "@cheeze0729"  # Донат в других приложениях
@@ -354,6 +374,29 @@ class BlacklistMiddleware(BaseMiddleware):
 dp.message.middleware(BlacklistMiddleware())
 dp.callback_query.middleware(BlacklistMiddleware())
 
+
+class StaffAuditMiddleware(BaseMiddleware):
+    """Записывает действия сотрудников без сохранения текста сообщений."""
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None and _STAFF_ROLES.get(user.id) in STAFF_ROLES:
+            action = getattr(event, "data", None)
+            if action:
+                action = f"callback:{str(action).split(':', 1)[0]}"
+            else:
+                text = getattr(event, "text", None) or ""
+                action = f"message:{text.split()[0][:40]}" if text else "message"
+            try:
+                await db_audit_staff_action(user.id, action)
+            except Exception as exc:
+                logging.warning(f"Не удалось записать действие сотрудника: {exc}")
+        return await handler(event, data)
+
+
+dp.message.middleware(StaffAuditMiddleware())
+dp.callback_query.middleware(StaffAuditMiddleware())
+
 # =====================================================================
 # База данных (PostgreSQL через asyncpg + Neon)
 # =====================================================================
@@ -401,7 +444,51 @@ async def db_init() -> None:
                 contact    TEXT,
                 login_data TEXT,
                 login_code TEXT,
+                gamepass_price INTEGER,
+                assigned_to BIGINT,
+                assigned_at TEXT,
                 created_at TEXT NOT NULL
+            )
+        """)
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS gamepass_price INTEGER"
+        )
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS assigned_to BIGINT"
+        )
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS assigned_at TEXT"
+        )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS staff_members (
+                tg_id       BIGINT PRIMARY KEY,
+                role        TEXT NOT NULL,
+                username    TEXT,
+                first_name  TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS staff_order_messages (
+                order_id    INTEGER NOT NULL,
+                staff_id    BIGINT NOT NULL,
+                chat_id     BIGINT NOT NULL,
+                message_id  BIGINT NOT NULL,
+                message_text TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (order_id, staff_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS staff_audit_log (
+                id          SERIAL PRIMARY KEY,
+                staff_id    BIGINT NOT NULL,
+                role        TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                entity_type TEXT,
+                entity_id   TEXT,
+                created_at  TEXT NOT NULL
             )
         """)
         await conn.execute("""
@@ -472,6 +559,24 @@ async def db_init() -> None:
             "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS "
             "max_uses INTEGER DEFAULT NULL"
         )
+        if MODERATOR_CHAT_ID:
+            now = datetime.now(timezone.utc).isoformat()
+            await conn.execute(
+                "INSERT INTO staff_members "
+                "(tg_id, role, username, first_name, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $5) "
+                "ON CONFLICT (tg_id) DO UPDATE SET role = $2, updated_at = $5",
+                MODERATOR_CHAT_ID, ROLE_FOUNDER, None, "Founder", now,
+            )
+        staff_rows = await conn.fetch(
+            "SELECT tg_id, role FROM staff_members"
+        )
+        _STAFF_ROLES.clear()
+        _STAFF_ROLES.update({
+            int(row["tg_id"]): row["role"]
+            for row in staff_rows
+            if row["role"] in STAFF_ROLES
+        })
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS referral_purchases (
                 id          SERIAL PRIMARY KEY,
@@ -588,6 +693,28 @@ async def db_init() -> None:
                 END IF;
             END $$;
         """)
+        # Тикеты поддержки
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id            SERIAL PRIMARY KEY,
+                user_tg_id    BIGINT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'open',
+                assigned_to   BIGINT DEFAULT NULL,
+                description   TEXT,
+                photo_file_id TEXT,
+                created_at    TEXT NOT NULL,
+                closed_at     TEXT DEFAULT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_ticket_notify (
+                ticket_id  INTEGER NOT NULL,
+                staff_id   BIGINT NOT NULL,
+                chat_id    BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                PRIMARY KEY (ticket_id, staff_id)
+            )
+        """)
 
 
 async def db_get_or_create_user(user) -> tuple[dict, bool]:
@@ -681,16 +808,19 @@ async def db_create_order(
     price: float,
     status: str = "Оплачен",
     category: str | None = None,
+    gamepass_price: int | None = None,
 ) -> int:
     pool = await get_pool()
     order_id = await pool.fetchval(
-        "INSERT INTO orders (tg_id, title, price, status, category, created_at)"
-        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO orders "
+        "(tg_id, title, price, status, category, gamepass_price, created_at)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
         tg_id,
         title,
         price,
         status,
         category,
+        gamepass_price,
         datetime.utcnow().isoformat(timespec="seconds"),
     )
     return order_id
@@ -915,6 +1045,246 @@ async def db_get_order(order_id: int) -> dict | None:
 async def db_update_order_status(order_id: int, status: str) -> None:
     pool = await get_pool()
     await pool.execute("UPDATE orders SET status = $1 WHERE id = $2", status, order_id)
+
+
+async def db_get_staff_role(tg_id: int) -> str | None:
+    """Возвращает роль сотрудника и поддерживает быстрый runtime-кэш."""
+    if tg_id == MODERATOR_CHAT_ID:
+        _STAFF_ROLES[tg_id] = ROLE_FOUNDER
+        return ROLE_FOUNDER
+    pool = await get_pool()
+    role = await pool.fetchval(
+        "SELECT role FROM staff_members WHERE tg_id = $1", tg_id
+    )
+    if role in STAFF_ROLES:
+        _STAFF_ROLES[tg_id] = role
+        return role
+    _STAFF_ROLES.pop(tg_id, None)
+    return None
+
+
+async def db_list_staff() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, role, username, first_name, created_at, updated_at "
+        "FROM staff_members ORDER BY CASE role "
+        "WHEN 'founder' THEN 1 WHEN 'administrator' THEN 2 "
+        "WHEN 'moderator' THEN 3 ELSE 4 END, tg_id"
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_upsert_staff(
+    tg_id: int,
+    role: str,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> None:
+    if role not in STAFF_ROLES:
+        raise ValueError("Неизвестная роль сотрудника")
+    now = datetime.now(timezone.utc).isoformat()
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO staff_members "
+        "(tg_id, role, username, first_name, created_at, updated_at) "
+        "VALUES ($1, $2, $3, $4, $5, $5) "
+        "ON CONFLICT (tg_id) DO UPDATE SET role = $2, "
+        "username = COALESCE($3, staff_members.username), "
+        "first_name = COALESCE($4, staff_members.first_name), updated_at = $5",
+        tg_id, role, username, first_name, now,
+    )
+    _STAFF_ROLES[tg_id] = role
+
+
+async def db_remove_staff(tg_id: int) -> bool:
+    if tg_id == MODERATOR_CHAT_ID:
+        return False
+    pool = await get_pool()
+    deleted = await pool.fetchval(
+        "DELETE FROM staff_members WHERE tg_id = $1 RETURNING tg_id", tg_id
+    )
+    _STAFF_ROLES.pop(tg_id, None)
+    return deleted is not None
+
+
+async def db_get_order_staff_recipients() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, role, username, first_name FROM staff_members "
+        "WHERE role IN ($1, $2) ORDER BY CASE role WHEN $1 THEN 1 ELSE 2 END, tg_id",
+        ROLE_FOUNDER, ROLE_ADMINISTRATOR,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_get_can_moderate_recipients() -> list[dict]:
+    """Возвращает Founder + Administrator + Moderator для рассылки отзывов."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, role, username, first_name FROM staff_members "
+        "WHERE role IN ($1, $2, $3) ORDER BY CASE role "
+        "WHEN $1 THEN 1 WHEN $2 THEN 2 ELSE 3 END, tg_id",
+        ROLE_FOUNDER, ROLE_ADMINISTRATOR, ROLE_MODERATOR,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_claim_order(order_id: int, staff_id: int) -> dict | None:
+    """Атомарно назначает свободный заказ одному сотруднику."""
+    pool = await get_pool()
+    now = datetime.now(timezone.utc).isoformat()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE orders SET assigned_to = $2, assigned_at = $3 "
+            "WHERE id = $1 AND assigned_to IS NULL "
+            "AND status NOT IN ('Выполнен', 'Возврат') RETURNING *",
+            order_id, staff_id, now,
+        )
+    return dict(row) if row else None
+
+
+async def db_store_staff_order_message(
+    order_id: int,
+    staff_id: int,
+    chat_id: int,
+    message_id: int,
+    message_text: str,
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO staff_order_messages "
+        "(order_id, staff_id, chat_id, message_id, message_text, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "ON CONFLICT (order_id, staff_id) DO UPDATE SET "
+        "chat_id = $3, message_id = $4, message_text = $5",
+        order_id, staff_id, chat_id, message_id, message_text,
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+
+async def db_get_staff_order_messages(order_id: int) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT order_id, staff_id, chat_id, message_id "
+        "FROM staff_order_messages WHERE order_id = $1",
+        order_id,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_audit_staff_action(
+    staff_id: int,
+    action: str,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+) -> None:
+    role = await db_get_staff_role(staff_id) or "unknown"
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO staff_audit_log "
+        "(staff_id, role, action, entity_type, entity_id, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6)",
+        staff_id, role, action, entity_type, entity_id,
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+
+# ---- Тикеты поддержки ----
+
+async def db_create_ticket(
+    user_tg_id: int, description: str, photo_file_id: str | None = None
+) -> dict:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "INSERT INTO support_tickets (user_tg_id, description, photo_file_id, created_at) "
+        "VALUES ($1, $2, $3, $4) RETURNING *",
+        user_tg_id, description, photo_file_id,
+        datetime.now(timezone.utc).isoformat(),
+    )
+    return dict(row)
+
+
+async def db_get_ticket(ticket_id: int) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM support_tickets WHERE id = $1", ticket_id
+    )
+    return dict(row) if row else None
+
+
+async def db_get_active_ticket(user_tg_id: int) -> dict | None:
+    """Возвращает открытый или взятый тикет пользователя."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM support_tickets "
+        "WHERE user_tg_id = $1 AND status IN ('open', 'claimed') "
+        "ORDER BY id DESC LIMIT 1",
+        user_tg_id,
+    )
+    return dict(row) if row else None
+
+
+async def db_claim_ticket(ticket_id: int, staff_id: int) -> bool:
+    """Назначает тикет сотруднику. Возвращает True если успешно."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "UPDATE support_tickets SET status='claimed', assigned_to=$1 "
+        "WHERE id=$2 AND status='open'",
+        staff_id, ticket_id,
+    )
+    return result.endswith("1")
+
+
+async def db_close_ticket(ticket_id: int) -> bool:
+    """Закрывает тикет."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "UPDATE support_tickets SET status='closed', closed_at=$1 "
+        "WHERE id=$2 AND status IN ('open','claimed')",
+        datetime.now(timezone.utc).isoformat(), ticket_id,
+    )
+    return result.endswith("1")
+
+
+async def db_store_ticket_notify(
+    ticket_id: int, staff_id: int, chat_id: int, message_id: int
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO support_ticket_notify (ticket_id, staff_id, chat_id, message_id) "
+        "VALUES ($1, $2, $3, $4) ON CONFLICT (ticket_id, staff_id) DO UPDATE "
+        "SET chat_id=$3, message_id=$4",
+        ticket_id, staff_id, chat_id, message_id,
+    )
+
+
+async def db_get_ticket_notify(ticket_id: int) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT staff_id, chat_id, message_id FROM support_ticket_notify WHERE ticket_id=$1",
+        ticket_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_get_direct_support_contact() -> str | None:
+    """Возвращает @username первого хелпера с username, или founder, или None."""
+    pool = await get_pool()
+    # Сначала ищем хелпера с username
+    row = await pool.fetchrow(
+        "SELECT username FROM staff_members WHERE role=$1 AND username IS NOT NULL LIMIT 1",
+        ROLE_HELPER,
+    )
+    if row:
+        return f"@{row['username']}"
+    # Затем фаундера с username
+    row = await pool.fetchrow(
+        "SELECT username FROM staff_members WHERE role=$1 AND username IS NOT NULL LIMIT 1",
+        ROLE_FOUNDER,
+    )
+    if row:
+        return f"@{row['username']}"
+    return SUPPORT_USERNAME
 
 
 async def db_set_order_contact(order_id: int, contact: str) -> None:
@@ -1510,6 +1880,9 @@ class ShopStates(StatesGroup):
     waiting_reject_screenshot = State()
     waiting_email_code = State()
     waiting_pre_purchase_login = State()  # ввод данных для входа ДО оплаты
+    waiting_buyer_msg = State()           # покупатель пишет администратору
+    waiting_ticket_desc = State()         # покупатель описывает проблему в тикете
+    waiting_ticket_chat = State()         # покупатель в активном чате тикета
 
 
 class AdminStates(StatesGroup):
@@ -1521,6 +1894,7 @@ class AdminStates(StatesGroup):
     waiting_unblock_reason = State()
     waiting_gp_price = State()
     waiting_mod_reply = State()        # ответ покупателю из чата модератора
+    waiting_ord_buyer_reply = State() # ответ покупателю из управления заказом
     waiting_refund_reason = State()    # причина возврата (модератор вводит текст)
     waiting_broadcast = State()        # рассылка всем пользователям
     waiting_edit_product_price = State()   # изменение цены товара
@@ -1540,6 +1914,9 @@ class AdminStates(StatesGroup):
     waiting_rename_cat_emoji = State()     # новый эмодзи категории
     waiting_cat_delete_confirm = State()   # подтверждение удаления категории (текст)
     waiting_image_photo = State()          # ожидание фото для картинки категории/товара
+    waiting_staff_add_id = State()         # добавление сотрудника — ввод TG ID
+    waiting_staff_fire_confirm = State()   # увольнение — подтверждение
+    waiting_ticket_reply = State()         # сотрудник отвечает на тикет
 
 
 class PromoStates(StatesGroup):
@@ -1665,8 +2042,14 @@ def kb_after_purchase(
         [
             [
                 InlineKeyboardButton(
-                    text="💬 Связаться с модератором через бота",
-                    callback_data=f"contact_mod:{order_id}",
+                    text="✍️ Написать администратору",
+                    callback_data=f"buyer_write_admin:{order_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🆘 Поддержка",
+                    callback_data="support",
                 )
             ],
             [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
@@ -2005,34 +2388,253 @@ async def show_section(
     return await send_or_edit(call, text, kb)
 
 
+def _is_staff(user_id: int) -> bool:
+    return _STAFF_ROLES.get(user_id) in STAFF_ROLES
+
+
+def _is_founder(user_id: int) -> bool:
+    return _STAFF_ROLES.get(user_id) == ROLE_FOUNDER
+
+
+def _is_moderator(user_id: int) -> bool:
+    """Совместимое имя для старых обработчиков: Founder + Administrator."""
+    return _STAFF_ROLES.get(user_id) in (ROLE_FOUNDER, ROLE_ADMINISTRATOR)
+
+
+def _senior_staff(user_id: int) -> bool:
+    return _STAFF_ROLES.get(user_id) in (ROLE_FOUNDER, ROLE_ADMINISTRATOR)
+
+
+def _is_moderator_role(user_id: int) -> bool:
+    """Точно роль Moderator (не Founder/Administrator)."""
+    return _STAFF_ROLES.get(user_id) == ROLE_MODERATOR
+
+
+def _is_helper_role(user_id: int) -> bool:
+    """Точно роль Helper."""
+    return _STAFF_ROLES.get(user_id) == ROLE_HELPER
+
+
+def _can_moderate(user_id: int) -> bool:
+    """Founder + Administrator + Moderator: модерирование отзывов, просмотр карточек."""
+    return _STAFF_ROLES.get(user_id) in (ROLE_FOUNDER, ROLE_ADMINISTRATOR, ROLE_MODERATOR)
+
+
 async def notify_moderator(
     text: str, reply_markup: InlineKeyboardMarkup | None = None
 ) -> "Message | None":
-    """Отправляет уведомление модератору, если задан MODERATOR_CHAT_ID."""
-    if not MODERATOR_CHAT_ID:
-        return None
-    try:
-        return await bot.send_message(
-            MODERATOR_CHAT_ID, text, parse_mode="HTML", reply_markup=reply_markup
+    """Рассылает внутреннее уведомление Founder и Administrator."""
+    recipients = await db_get_order_staff_recipients()
+    first_message: Message | None = None
+    for staff in recipients:
+        try:
+            sent = await bot.send_message(
+                staff["tg_id"], text, parse_mode="HTML", reply_markup=reply_markup
+            )
+            first_message = first_message or sent
+        except Exception as exc:
+            logging.warning(
+                f"Не удалось уведомить сотрудника {staff['tg_id']}: {exc}"
+            )
+    return first_message
+
+
+def _safe_order_notification_text(text: str) -> str:
+    """Убирает секретные данные из общего сообщения о новом заказе."""
+    marker = "\n\n🔐 <b>Данные для входа:</b>"
+    return text.split(marker, 1)[0]
+
+
+def _staff_order_keyboard(order: dict) -> InlineKeyboardMarkup:
+    order_id = int(order["id"])
+    target_id = int(order["tg_id"])
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text="✅ Завершить заказ",
+            callback_data=f"ordone:{order_id}:{target_id}",
+        )],
+        [InlineKeyboardButton(
+            text="✍️ Написать покупателю",
+            callback_data=f"ord_write_buyer:{order_id}:{target_id}",
+        )],
+        [InlineKeyboardButton(
+            text="📧 Запросить код из почты",
+            callback_data=f"mod:req_email:{order_id}:{target_id}",
+        )],
+        [InlineKeyboardButton(
+            text="💸 Возврат", callback_data=f"mod:refund:{order_id}"
+        )],
+    ]
+    if order.get("category") == "roblox_gamepass" and order.get("gamepass_price"):
+        rows.insert(0, [InlineKeyboardButton(
+            text="🎮 Попросить изменить цену геймпасса",
+            callback_data=(
+                f"gpfix:{order_id}:{target_id}:{int(order['gamepass_price'])}"
+            ),
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _full_order_notification_text(base_text: str, order: dict) -> str:
+    text = _safe_order_notification_text(base_text)
+    if order.get("login_data"):
+        text += (
+            f"\n\n🔐 <b>Данные для входа:</b>\n"
+            f"<pre>{escape(str(order['login_data']))}</pre>"
         )
-    except Exception as e:
-        logging.warning(f"Не удалось уведомить модератора: {e}")
-        return None
+    if order.get("login_code"):
+        text += (
+            f"\n\n📨 <b>Код для входа:</b>\n"
+            f"<pre>{escape(str(order['login_code']))}</pre>"
+        )
+    return text
+
+
+async def _refresh_order_staff_messages(
+    order_id: int,
+    base_text: str,
+    order: dict,
+    assigned_staff_id: int | None = None,
+    assigned_label: str | None = None,
+) -> None:
+    """Обновляет все копии заказа: секреты видит только исполнитель."""
+    assigned = int(order["assigned_to"]) if order.get("assigned_to") else None
+    if assigned_staff_id is not None:
+        assigned = assigned_staff_id
+    rows = await db_get_staff_order_messages(order_id)
+    for row in rows:
+        staff_id = int(row["staff_id"])
+        if staff_id == assigned:
+            message_text = _full_order_notification_text(base_text, order)
+            if assigned_label:
+                message_text += f"\n\n🙋 Взял: {assigned_label}"
+            markup = _staff_order_keyboard(order)
+        else:
+            message_text = (
+                f"{_safe_order_notification_text(base_text)}\n\n"
+                f"🔒 Заказ уже взял сотрудник: <b>{escape(assigned_label or str(assigned))}</b>"
+            )
+            markup = None
+        try:
+            await bot.edit_message_text(
+                chat_id=row["chat_id"],
+                message_id=row["message_id"],
+                text=message_text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as exc:
+            logging.warning(
+                f"Не удалось обновить сообщение заказа #{order_id}: {exc}"
+            )
 
 
 async def notify_moderator_order(
-    text: str, reply_markup: InlineKeyboardMarkup | None = None
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    order_id: int | None = None,
 ) -> None:
-    """Отправляет уведомление модератору о заказе и закрепляет сообщение."""
-    msg = await notify_moderator(text, reply_markup=reply_markup)
-    if msg is None:
+    """Рассылает заказ Founder/Administrator с единой кнопкой назначения."""
+    if order_id is None:
+        await notify_moderator(text, reply_markup=reply_markup)
+        return
+    recipients = await db_get_order_staff_recipients()
+    safe_text = _safe_order_notification_text(text)
+    claim_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🙋 Взять заказ", callback_data=f"ordclaim:{order_id}"
+        )
+    ]])
+    for staff in recipients:
+        try:
+            msg = await bot.send_message(
+                staff["tg_id"], safe_text, parse_mode="HTML",
+                reply_markup=claim_kb,
+            )
+            await db_store_staff_order_message(
+                order_id, int(staff["tg_id"]), msg.chat.id, msg.message_id, safe_text
+            )
+            try:
+                await bot.pin_chat_message(
+                    msg.chat.id, msg.message_id, disable_notification=True
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            logging.warning(
+                f"Не удалось отправить заказ сотруднику {staff['tg_id']}: {exc}"
+            )
+
+
+@dp.callback_query(F.data.startswith("ordclaim:"))
+async def cb_order_claim(call: CallbackQuery) -> None:
+    if not _senior_staff(call.from_user.id):
+        await call.answer("Заказы доступны только Founder и Administrator.", show_alert=True)
         return
     try:
-        await bot.pin_chat_message(
-            msg.chat.id, msg.message_id, disable_notification=True
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректный заказ.", show_alert=True)
+        return
+    order = await db_claim_order(order_id, call.from_user.id)
+    if not order:
+        current = await db_get_order(order_id)
+        if current and current.get("assigned_to"):
+            await call.answer(
+                f"Заказ уже взял сотрудник: {current['assigned_to']}.",
+                show_alert=True,
+            )
+        else:
+            await call.answer("Заказ уже закрыт.", show_alert=True)
+        return
+    await db_audit_staff_action(
+        call.from_user.id, "claim_order", "order", str(order_id)
+    )
+    staff_name = call.from_user.first_name or "сотрудник"
+    staff_username = (
+        f"@{call.from_user.username}" if call.from_user.username else "username не указан"
+    )
+    assigned_label = f"{escape(staff_name)} ({escape(staff_username)})"
+    base_text = call.message.text or call.message.caption or ""
+    order["assigned_to"] = call.from_user.id
+    await _refresh_order_staff_messages(
+        order_id,
+        base_text,
+        order,
+        assigned_staff_id=call.from_user.id,
+        assigned_label=assigned_label,
+    )
+    await call.answer("Заказ закреплён за вами")
+
+
+async def notify_assigned_staff(
+    order_id: int,
+    text: str,
+    *,
+    include_markup: bool = False,
+) -> bool:
+    """Отправляет данные заказа только назначенному сотруднику."""
+    order = await db_get_order(order_id)
+    if not order or not order.get("assigned_to"):
+        logging.warning(
+            f"Заказ #{order_id} не назначен: секретное уведомление не отправлено."
         )
-    except Exception as e:
-        logging.warning(f"Не удалось закрепить сообщение модератора: {e}")
+        return False
+    staff_id = int(order["assigned_to"])
+    try:
+        await bot.send_message(
+            staff_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=_staff_order_keyboard(order) if include_markup else None,
+        )
+        return True
+    except Exception as exc:
+        logging.warning(
+            f"Не удалось отправить данные назначенному сотруднику "
+            f"{staff_id} по заказу #{order_id}: {exc}"
+        )
+        return False
 
 
 def parse_positive_int(text: str) -> int | None:
@@ -2136,10 +2738,43 @@ async def cb_guarantee(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
+def kb_support_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Оставить заявку", callback_data="support:ticket")],
+        [InlineKeyboardButton(text="💬 Написать напрямую", callback_data="support:direct")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+
+
 @dp.callback_query(F.data == "support")
 async def cb_support(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await show_section(call, "support", SUPPORT_TEXT, kb_support())
+    active = await db_get_active_ticket(call.from_user.id)
+    if active:
+        # У пользователя уже есть открытый тикет — показываем его
+        tid = active["id"]
+        status_map = {"open": "🟡 Ожидает сотрудника", "claimed": "🟢 В работе"}
+        status = status_map.get(active["status"], active["status"])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Продолжить переписку", callback_data=f"tkt:resume:{tid}")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await send_or_edit(
+            call,
+            f"<b>🎫 У вас уже есть открытый тикет #{tid}</b>\n\n"
+            f"Статус: {status}\n\n"
+            "Вы можете продолжить переписку или дождаться ответа сотрудника.",
+            kb,
+        )
+    else:
+        text = (
+            "<b>🆘 Поддержка</b>\n\n"
+            "Выберите способ связи:\n\n"
+            "📝 <b>Оставить заявку</b> — опишите проблему прямо в боте, "
+            "сотрудник возьмёт тикет и ответит вам здесь.\n\n"
+            "💬 <b>Написать напрямую</b> — откроет чат с сотрудником в Telegram."
+        )
+        await show_section(call, "support", text, kb_support_menu())
     await call.answer()
 
 
@@ -2148,6 +2783,503 @@ async def cb_info(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await show_section(call, "info", INFO_TEXT, kb_info())
     await call.answer()
+
+
+# =====================================================================
+# Система поддержки — тикеты
+# =====================================================================
+
+
+@dp.callback_query(F.data == "support:direct")
+async def cb_support_direct(call: CallbackQuery, state: FSMContext) -> None:
+    """Показывает @username хелпера (или фаундера) для прямого контакта."""
+    await state.clear()
+    contact = await db_get_direct_support_contact()
+    handle = (contact or SUPPORT_USERNAME).lstrip("@")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать в поддержку", url=f"https://t.me/{handle}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="support")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"💬 <b>Прямой контакт</b>\n\n"
+        f"Напишите нам напрямую: <b>{contact or SUPPORT_USERNAME}</b>\n\n"
+        "Нажмите кнопку ниже, чтобы открыть чат.",
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "support:ticket")
+async def cb_support_ticket(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало создания тикета — просим описать проблему."""
+    await state.clear()
+    active = await db_get_active_ticket(call.from_user.id)
+    if active:
+        await call.answer("У вас уже есть открытый тикет.", show_alert=True)
+        return
+    await state.set_state(ShopStates.waiting_ticket_desc)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="support")],
+    ])
+    sent = await send_or_edit(
+        call,
+        "📝 <b>Создание заявки в поддержку</b>\n\n"
+        "Опишите вашу проблему подробно одним сообщением.\n"
+        "При желании прикрепите фото — отправьте фото с подписью.\n\n"
+        "<i>Сотрудник получит вашу заявку и ответит прямо в боте.</i>",
+        kb,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_ticket_desc)
+async def msg_ticket_desc(message: Message, state: FSMContext) -> None:
+    """Покупатель прислал описание проблемы — создаём тикет."""
+    await _try_delete(message)
+    text = (message.text or message.caption or "").strip()
+    photo_file_id = message.photo[-1].file_id if message.photo else None
+    if not text and not photo_file_id:
+        await _edit_prompt(
+            state,
+            "⚠️ Пожалуйста, опишите проблему текстом (или пришлите фото с подписью).",
+            InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отмена", callback_data="support")
+            ]]),
+        )
+        return
+    await state.clear()
+    ticket = await db_create_ticket(message.from_user.id, text or "—", photo_file_id)
+    tid = ticket["id"]
+    # Ставим покупателя в режим чата
+    await state.set_state(ShopStates.waiting_ticket_chat)
+    await state.update_data(ticket_id=tid)
+    kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:exit:{tid}")],
+    ])
+    await message.answer(
+        f"✅ <b>Заявка #{tid} создана!</b>\n\n"
+        "Сотрудник получил уведомление и скоро возьмёт тикет в работу.\n\n"
+        "Пока тикет открыт — любое ваше сообщение здесь будет передано сотруднику.\n"
+        "Чтобы выйти из режима чата, нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=kb_buyer,
+    )
+    # Рассылаем уведомление всем сотрудникам
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    notify_text = (
+        f"🎫 <b>Новый тикет поддержки #{tid}</b>\n\n"
+        f"Пользователь: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>\n\n"
+        f"<b>Проблема:</b>\n{escape(text or '—')}"
+    )
+    claim_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎫 Взять тикет", callback_data=f"tkt:claim:{tid}")
+    ]])
+    recipients = await db_get_can_moderate_recipients()
+    for staff in recipients:
+        sid = int(staff["tg_id"])
+        try:
+            if photo_file_id:
+                msg = await bot.send_photo(
+                    chat_id=sid, photo=photo_file_id,
+                    caption=notify_text, parse_mode="HTML", reply_markup=claim_kb,
+                )
+            else:
+                msg = await bot.send_message(
+                    sid, notify_text, parse_mode="HTML", reply_markup=claim_kb,
+                )
+            await db_store_ticket_notify(tid, sid, msg.chat.id, msg.message_id)
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить сотрудника {sid} о тикете #{tid}: {e}")
+
+
+@dp.callback_query(F.data.startswith("tkt:claim:"))
+async def cb_tkt_claim(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник берёт тикет в работу."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ok = await db_claim_ticket(tid, call.from_user.id)
+    if not ok:
+        ticket = await db_get_ticket(tid)
+        if ticket and ticket["status"] != "open":
+            await call.answer("Тикет уже взят другим сотрудником.", show_alert=True)
+        else:
+            await call.answer("Тикет не найден.", show_alert=True)
+        return
+    ticket = await db_get_ticket(tid)
+    buyer_id = int(ticket["user_tg_id"])
+    staff = call.from_user
+    staff_name = staff.first_name or str(staff.id)
+    staff_handle = f"@{staff.username}" if staff.username else f"id{staff.id}"
+    label = f"{escape(staff_name)} ({escape(staff_handle)})"
+    # Обновляем уведомления у других сотрудников
+    notify_rows = await db_get_ticket_notify(tid)
+    for row in notify_rows:
+        sid = int(row["staff_id"])
+        if sid == staff.id:
+            continue
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=row["chat_id"],
+                message_id=row["message_id"],
+                reply_markup=None,
+            )
+            await bot.send_message(
+                sid,
+                f"🔒 Тикет <b>#{tid}</b> взял сотрудник: {label}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось обновить уведомление о тикете #{tid} для {sid}: {e}")
+    # Ставим сотрудника в режим чата
+    await state.set_state(AdminStates.waiting_ticket_reply)
+    await state.update_data(ticket_id=tid, ticket_buyer_id=buyer_id)
+    kb_staff = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await call.message.answer(
+        f"✅ Вы взяли тикет <b>#{tid}</b>\n\n"
+        f"Пользователь: <code>{buyer_id}</code>\n\n"
+        "Отправляйте сообщения прямо здесь — покупатель получит их в боте.\n"
+        "Для закрытия тикета нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=kb_staff,
+    )
+    await call.answer()
+    # Уведомляем покупателя
+    try:
+        await bot.send_message(
+            buyer_id,
+            f"🟢 <b>Сотрудник взял ваш тикет #{tid} в работу!</b>\n\n"
+            "Он напишет вам в ближайшее время. Можете также написать первыми — "
+            "любое ваше сообщение в боте дойдёт до него.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить покупателя {buyer_id}: {e}")
+
+
+@dp.callback_query(F.data.startswith("tkt:close:"))
+async def cb_tkt_close(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник закрывает тикет."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket:
+        await call.answer("Тикет не найден.", show_alert=True)
+        return
+    ok = await db_close_ticket(tid)
+    if not ok:
+        await call.answer("Тикет уже закрыт.", show_alert=True)
+        return
+    buyer_id = int(ticket["user_tg_id"])
+    await state.clear()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(f"✅ Тикет <b>#{tid}</b> закрыт.", parse_mode="HTML")
+    await call.answer()
+    # Уведомляем покупателя и сбрасываем его FSM
+    try:
+        buyer_fsm = FSMContext(
+            storage=dp.storage,
+            key=StorageKey(bot_id=bot.id, chat_id=buyer_id, user_id=buyer_id),
+        )
+        await buyer_fsm.clear()
+        kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Открыть новый тикет", callback_data="support:ticket")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await bot.send_message(
+            buyer_id,
+            f"✅ <b>Ваш тикет #{tid} закрыт сотрудником.</b>\n\n"
+            "Проблема решена? Если что-то ещё осталось — откройте новый тикет.",
+            parse_mode="HTML",
+            reply_markup=kb_buyer,
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить покупателя {buyer_id} о закрытии тикета: {e}")
+
+
+@dp.callback_query(F.data.startswith("tkt:exit:"))
+async def cb_tkt_exit(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель выходит из режима чата (тикет остаётся открытым)."""
+    await state.clear()
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        tid = 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Вернуться в чат", callback_data=f"tkt:resume:{tid}")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>Вы вышли из чата тикета #{tid}.</b>\n\n"
+        "Тикет остаётся открытым — сотрудник может ответить в любой момент, "
+        "вы получите уведомление. Чтобы вернуться в чат — нажмите кнопку ниже.",
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:staff_exit:"))
+async def cb_tkt_staff_exit(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник выходит из режима чата (тикет остаётся открытым)."""
+    if not _is_staff(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        tid = 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Вернуться к тикету", callback_data=f"tkt:staff_resume:{tid}")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>Вы вышли из чата тикета #{tid}.</b>\n\n"
+        "Тикет остаётся открытым. Покупатель может написать вам "
+        "— вы получите сообщение с кнопкой «Ответить».",
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:resume:"))
+async def cb_tkt_resume(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель возвращается в чат активного тикета."""
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket or ticket["status"] == "closed":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Новый тикет", callback_data="support:ticket")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await send_or_edit(call, f"Тикет #{tid} уже закрыт.", kb)
+        await call.answer()
+        return
+    if int(ticket["user_tg_id"]) != call.from_user.id:
+        await call.answer("Это не ваш тикет.", show_alert=True)
+        return
+    await state.set_state(ShopStates.waiting_ticket_chat)
+    await state.update_data(ticket_id=tid)
+    kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:exit:{tid}")],
+    ])
+    await send_or_edit(
+        call,
+        f"↩️ <b>Вы вернулись в чат тикета #{tid}.</b>\n\n"
+        "Пишите сообщения — они дойдут до сотрудника.",
+        kb_buyer,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:staff_resume:"))
+async def cb_tkt_staff_resume(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник возвращается в чат тикета."""
+    if not _is_staff(call.from_user.id):
+        await call.answer()
+        return
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket or ticket["status"] == "closed":
+        await call.answer("Тикет уже закрыт.", show_alert=True)
+        return
+    buyer_id = int(ticket["user_tg_id"])
+    await state.set_state(AdminStates.waiting_ticket_reply)
+    await state.update_data(ticket_id=tid, ticket_buyer_id=buyer_id)
+    kb_staff = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Выйти из чата", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await send_or_edit(
+        call,
+        f"↩️ <b>Вы вернулись в чат тикета #{tid}.</b>\n\n"
+        "Отправляйте сообщения — они дойдут до покупателя.",
+        kb_staff,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:reply:"))
+async def cb_tkt_reply(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник нажимает «Ответить» на сообщение покупателя вне FSM-чата."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":")
+        tid = int(parts[2])
+        buyer_id = int(parts[3])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket or ticket["status"] == "closed":
+        await call.answer("Тикет уже закрыт.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_ticket_reply)
+    await state.update_data(ticket_id=tid, ticket_buyer_id=buyer_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await call.message.answer(
+        f"✍️ <b>Ответ на тикет #{tid}</b>\n\nОтправьте сообщение (текст или фото):",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+# ---- Входящие сообщения в режиме чата ----
+
+@dp.message(ShopStates.waiting_ticket_chat)
+async def msg_ticket_chat(message: Message, state: FSMContext) -> None:
+    """Покупатель пишет в активный тикет."""
+    await _try_delete(message)
+    data = await state.get_data()
+    tid = int(data.get("ticket_id", 0))
+    ticket = await db_get_ticket(tid) if tid else None
+    if not ticket or ticket["status"] == "closed":
+        await state.clear()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Открыть новый тикет", callback_data="support:ticket")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await message.answer("Ваш тикет уже закрыт.", reply_markup=kb)
+        return
+    buyer_id = message.from_user.id
+    staff_id = ticket.get("assigned_to")
+    text = (message.text or message.caption or "").strip()
+    photo_id = message.photo[-1].file_id if message.photo else None
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    msg_header = (
+        f"💬 <b>Покупатель (тикет #{tid})</b>\n"
+        f"{escape(user.first_name or '')} ({escape(username)})\n"
+        f"<code>{buyer_id}</code>"
+    )
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"tkt:reply:{tid}:{buyer_id}")],
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+    ])
+    sent = False
+    if staff_id:
+        try:
+            if photo_id:
+                await bot.send_photo(
+                    chat_id=staff_id, photo=photo_id,
+                    caption=f"{msg_header}\n\n{escape(text)}" if text else msg_header,
+                    parse_mode="HTML", reply_markup=reply_kb,
+                )
+            else:
+                await bot.send_message(
+                    staff_id,
+                    f"{msg_header}\n\n{escape(text)}",
+                    parse_mode="HTML", reply_markup=reply_kb,
+                )
+            sent = True
+        except Exception as e:
+            logging.warning(f"Не удалось доставить сообщение сотруднику {staff_id}: {e}")
+    if not sent:
+        # Тикет ещё не взят — рассылаем всей команде
+        recipients = await db_get_can_moderate_recipients()
+        for staff in recipients:
+            sid = int(staff["tg_id"])
+            try:
+                if photo_id:
+                    await bot.send_photo(
+                        chat_id=sid, photo=photo_id,
+                        caption=f"{msg_header}\n\n{escape(text)}" if text else msg_header,
+                        parse_mode="HTML", reply_markup=reply_kb,
+                    )
+                else:
+                    await bot.send_message(
+                        sid,
+                        f"{msg_header}\n\n{escape(text)}",
+                        parse_mode="HTML", reply_markup=reply_kb,
+                    )
+            except Exception as e:
+                logging.warning(f"Не удалось доставить сообщение покупателя сотруднику {sid}: {e}")
+    kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:exit:{tid}")],
+    ])
+    await message.answer("📨 Отправлено.", reply_markup=kb_buyer)
+
+
+@dp.message(AdminStates.waiting_ticket_reply)
+async def msg_ticket_reply(message: Message, state: FSMContext) -> None:
+    """Сотрудник отвечает в тикет."""
+    if not _is_staff(message.from_user.id):
+        return
+    data = await state.get_data()
+    tid = int(data.get("ticket_id", 0))
+    buyer_id = int(data.get("ticket_buyer_id", 0))
+    ticket = await db_get_ticket(tid) if tid else None
+    if not ticket or ticket["status"] == "closed":
+        await state.clear()
+        await message.answer("Тикет уже закрыт.")
+        return
+    text = (message.text or message.caption or "").strip()
+    photo_id = message.photo[-1].file_id if message.photo else None
+    staff = message.from_user
+    staff_name = staff.first_name or str(staff.id)
+    reply_header = f"📩 <b>Ответ администратора (тикет #{tid})</b>"
+    resume_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"tkt:resume:{tid}")],
+    ])
+    try:
+        if photo_id:
+            await bot.send_photo(
+                chat_id=buyer_id, photo=photo_id,
+                caption=f"{reply_header}\n\n{escape(text)}" if text else reply_header,
+                parse_mode="HTML", reply_markup=resume_kb,
+            )
+        else:
+            await bot.send_message(
+                buyer_id,
+                f"{reply_header}\n\n{escape(text)}",
+                parse_mode="HTML", reply_markup=resume_kb,
+            )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить покупателю: {e}")
+        return
+    # Сотрудник остаётся в FSM-чате для продолжения диалога
+    kb_staff = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Выйти из чата", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await message.answer(
+        f"✅ Ответ отправлен покупателю.",
+        reply_markup=kb_staff,
+    )
 
 
 # =====================================================================
@@ -2794,8 +3926,19 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
             await send_or_edit(call, text, kb)
             return
 
-        order_id = await db_create_order(user.id, title, final_price,
-                                         status="Оплачен", category=category)
+        gamepass_price = None
+        if category == "roblox_gamepass" and extra:
+            raw_gamepass_price = extra.get("gamepass_price")
+            if raw_gamepass_price:
+                gamepass_price = int(raw_gamepass_price)
+        order_id = await db_create_order(
+            user.id,
+            title,
+            final_price,
+            status="Оплачен",
+            category=category,
+            gamepass_price=gamepass_price,
+        )
         await db_add_transaction(user.id, -final_price, kind="purchase",
                                  reason=f"Заказ #{order_id}: {title}")
 
@@ -2918,6 +4061,8 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     admin_rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="✅ Завершить заказ",
                               callback_data=f"ordone:{order_id}:{user.id}")],
+        [InlineKeyboardButton(text="✍️ Написать покупателю",
+                              callback_data=f"ord_write_buyer:{order_id}:{user.id}")],
         [InlineKeyboardButton(text="📧 Запросить код из почты",
                               callback_data=f"mod:req_email:{order_id}:{user.id}")],
         [InlineKeyboardButton(text="💸 Возврат",
@@ -2948,7 +4093,9 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     # Данные для входа, введённые ДО оплаты — включаем прямо в уведомление о заказе
     if pre_login:
         admin_text += f"\n\n🔐 <b>Данные для входа:</b>\n<pre>{escape(pre_login)}</pre>"
-    await notify_moderator_order(admin_text, reply_markup=admin_kb)
+    await notify_moderator_order(
+        admin_text, reply_markup=admin_kb, order_id=order_id
+    )
 
 @dp.callback_query(F.data.startswith("promo_reminder:apply:"))
 async def cb_promo_reminder_apply(call: CallbackQuery, state: FSMContext) -> None:
@@ -3154,11 +4301,16 @@ async def msg_login_data(message: Message, state: FSMContext) -> None:
 
     user = message.from_user
     username = f"@{user.username}" if user.username else "—"
-    await notify_moderator(
+    order = await db_get_order(order_id) if order_id else None
+    if not order or order.get("tg_id") != user.id:
+        await message.answer("⚠️ Заказ не найден или недоступен.")
+        return
+    await notify_assigned_staff(
+        order_id,
         f"🔐 Данные для входа по заказу <b>#{order_id}</b>\n\n"
         f"<pre>{escape(payload)}</pre>\n"
         f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
-        f"Telegram ID: <code>{user.id}</code>"
+        f"Telegram ID: <code>{user.id}</code>",
     )
 
     text = (
@@ -3210,11 +4362,16 @@ async def msg_login_code(message: Message, state: FSMContext) -> None:
 
     user = message.from_user
     username = f"@{user.username}" if user.username else "—"
-    await notify_moderator(
+    order = await db_get_order(order_id) if order_id else None
+    if not order or order.get("tg_id") != user.id:
+        await message.answer("⚠️ Заказ не найден или недоступен.")
+        return
+    await notify_assigned_staff(
+        order_id,
         f"📨 Код для входа по заказу <b>#{order_id}</b>\n\n"
         f"<pre>{escape(code)}</pre>\n"
         f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
-        f"Telegram ID: <code>{user.id}</code>"
+        f"Telegram ID: <code>{user.id}</code>",
     )
 
     await _state_edit(
@@ -3667,10 +4824,6 @@ async def cb_paid(call: CallbackQuery) -> None:
     )
 
 
-def _is_moderator(user_id: int) -> bool:
-    return bool(MODERATOR_CHAT_ID) and user_id == MODERATOR_CHAT_ID
-
-
 @dp.callback_query(F.data.startswith("tpconf:"))
 async def cb_topup_admin_confirm(call: CallbackQuery) -> None:
     if not _is_moderator(call.from_user.id):
@@ -3853,6 +5006,15 @@ async def cb_order_done(call: CallbackQuery) -> None:
         return
     if order.get("status") == "Выполнен":
         await call.answer("Этот заказ уже отмечен как выполненный.", show_alert=True)
+        return
+
+    # Только взявший заказ может его завершить
+    assigned = order.get("assigned_to")
+    if assigned and int(assigned) != call.from_user.id:
+        await call.answer(
+            "Этот заказ взял другой сотрудник — только он может его завершить.",
+            show_alert=True,
+        )
         return
 
     await db_set_order_status(order_id, "Выполнен")
@@ -4299,55 +5461,62 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
     # ID пересланных сообщений сохраняем в callback_data для последующего
     # форварда в канал при нажатии «Опубликовать».
     # ----------------------------------------------------------------
-    try:
-        header = (
-            f"⭐ <b>Новый отзыв</b>\n"
-            f"🎁 Товар: <b>{escape(str(title))}</b>"
-        )
-        # Заголовок тоже сохраняем — он пересылается в канал вместе с отзывом
-        header_msg = await bot.send_message(MODERATOR_CHAT_ID, header, parse_mode="HTML")
-        buyer_id = message.from_user.id
-
-        if photo_id and photo_msg_id and photo_chat_id:
-            # Сначала форвардим — потом удаляем оригиналы
-            photo_fwd = await bot.forward_message(
-                chat_id=MODERATOR_CHAT_ID,
-                from_chat_id=photo_chat_id,
-                message_id=photo_msg_id,
-            )
-            text_fwd = await bot.forward_message(
-                chat_id=MODERATOR_CHAT_ID,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-            )
-            await bot.delete_message(photo_chat_id, photo_msg_id)
-            await _try_delete(message)
-            await bot.send_message(
-                MODERATOR_CHAT_ID,
-                "⬆️ Управление отзывом:",
-                reply_markup=kb_review_mod(
-                    order_id, buyer_id,
-                    header_msg.message_id, photo_fwd.message_id, text_fwd.message_id,
-                ),
-            )
-        else:
-            # Текстовый отзыв: форвардим сначала, удаляем после
-            text_fwd = await bot.forward_message(
-                chat_id=MODERATOR_CHAT_ID,
-                from_chat_id=message.chat.id,
-                message_id=message.message_id,
-            )
-            await _try_delete(message)
-            await bot.send_message(
-                MODERATOR_CHAT_ID,
-                "⬆️ Управление отзывом:",
-                reply_markup=kb_review_mod(
-                    order_id, buyer_id,
-                    header_msg.message_id, text_fwd.message_id,
-                ),
-            )
-    except Exception as e:
-        logging.warning(f"Не удалось переслать отзыв модератору: {e}")
+    # Рассылаем отзыв всем Founder + Administrator + Moderator
+    review_recipients = await db_get_can_moderate_recipients()
+    buyer_id = message.from_user.id
+    header = (
+        f"⭐ <b>Новый отзыв</b>\n"
+        f"🎁 Товар: <b>{escape(str(title))}</b>"
+    )
+    orig_chat = message.chat.id
+    orig_msg_id = message.message_id
+    orig_photo_chat = photo_chat_id
+    orig_photo_msg = photo_msg_id
+    deleted_orig = False
+    for staff in review_recipients:
+        rid = int(staff["tg_id"])
+        try:
+            hdr_msg = await bot.send_message(rid, header, parse_mode="HTML")
+            if photo_id and orig_photo_chat and orig_photo_msg:
+                pfwd = await bot.forward_message(
+                    chat_id=rid, from_chat_id=orig_photo_chat,
+                    message_id=orig_photo_msg,
+                )
+                tfwd = await bot.forward_message(
+                    chat_id=rid, from_chat_id=orig_chat,
+                    message_id=orig_msg_id,
+                )
+                if not deleted_orig:
+                    try:
+                        await bot.delete_message(orig_photo_chat, orig_photo_msg)
+                    except Exception:
+                        pass
+                    await _try_delete(message)
+                    deleted_orig = True
+                await bot.send_message(
+                    rid, "⬆️ Управление отзывом:",
+                    reply_markup=kb_review_mod(
+                        order_id, buyer_id,
+                        hdr_msg.message_id, pfwd.message_id, tfwd.message_id,
+                    ),
+                )
+            else:
+                tfwd = await bot.forward_message(
+                    chat_id=rid, from_chat_id=orig_chat,
+                    message_id=orig_msg_id,
+                )
+                if not deleted_orig:
+                    await _try_delete(message)
+                    deleted_orig = True
+                await bot.send_message(
+                    rid, "⬆️ Управление отзывом:",
+                    reply_markup=kb_review_mod(
+                        order_id, buyer_id,
+                        hdr_msg.message_id, tfwd.message_id,
+                    ),
+                )
+        except Exception as e:
+            logging.warning(f"Не удалось переслать отзыв сотруднику {rid}: {e}")
 
     thanks_kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -4367,7 +5536,7 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("pub_review:"))
 async def cb_publish_review(call: CallbackQuery) -> None:
     """Модератор публикует отзыв в канал — пересылает через forward_message."""
-    if not _is_moderator(call.from_user.id):
+    if not _can_moderate(call.from_user.id):
         await call.answer("Нет доступа.", show_alert=True)
         return
     # callback_data: pub_review:{order_id}:{msg_id1}[:{msg_id2}]
@@ -4399,7 +5568,7 @@ async def cb_publish_review(call: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("rej_review:"))
 async def cb_reject_review(call: CallbackQuery) -> None:
     """Модератор отклоняет отзыв."""
-    if not _is_moderator(call.from_user.id):
+    if not _can_moderate(call.from_user.id):
         await call.answer("Нет доступа.", show_alert=True)
         return
     rejected_kb = InlineKeyboardMarkup(
@@ -4552,21 +5721,18 @@ async def msg_gp_price_input(message: Message, state: FSMContext) -> None:
 USERS_PAGE_SIZE = 8
 
 
-def kb_admin_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="adm:find")],
-            [
-                InlineKeyboardButton(
-                    text="👥 Список пользователей", callback_data="adm:users:0"
-                )
-            ],
-            [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="adm:promos")],
-            [InlineKeyboardButton(text="🛒 Каталог и курсы", callback_data="adm:catalog")],
-            [InlineKeyboardButton(text="🖼️ Картинки", callback_data="adm:images")],
-            [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
-        ]
-    )
+def kb_admin_main(user_id: int = 0) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="adm:find")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="adm:users:0")],
+        [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="adm:promos")],
+        [InlineKeyboardButton(text="🛒 Каталог и курсы", callback_data="adm:catalog")],
+        [InlineKeyboardButton(text="🖼️ Картинки", callback_data="adm:images")],
+    ]
+    if _is_founder(user_id):
+        rows.append([InlineKeyboardButton(text="👥 Персонал", callback_data="adm:staff")])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---- вспомогательные словари для каталога ----
@@ -4782,7 +5948,7 @@ async def _send_admin_user_card(
         await send_or_edit(
             call,
             f"❌ Пользователь с ID <code>{target_id}</code> не найден.",
-            kb_admin_main(),
+            kb_admin_main(call.from_user.id),
         )
         return
     blocked = bool(user_row.get("is_blacklisted"))
@@ -4810,14 +5976,29 @@ async def _send_admin_user_card(
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext) -> None:
-    if not _is_moderator(message.from_user.id):
+    uid = message.from_user.id
+    if not _is_staff(uid):
         return
     await state.clear()
-    await message.answer(
-        "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
-        reply_markup=kb_admin_main(),
-        parse_mode="HTML",
-    )
+    role = _STAFF_ROLES.get(uid)
+    if role in (ROLE_FOUNDER, ROLE_ADMINISTRATOR):
+        await message.answer(
+            "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
+            reply_markup=kb_admin_main(uid),
+            parse_mode="HTML",
+        )
+    elif role == ROLE_MODERATOR:
+        await message.answer(
+            "<b>🛡️ Панель модератора</b>\n\nВыберите действие:",
+            reply_markup=kb_moderator_panel(),
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            "<b>🤝 Панель помощника</b>\n\nВыберите действие:",
+            reply_markup=kb_helper_panel(),
+            parse_mode="HTML",
+        )
 
 
 @dp.callback_query(F.data == "adm:close")
@@ -4848,7 +6029,7 @@ async def cb_adm_main(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         return
     await state.clear()
-    await send_or_edit(call, "<b>🛠️ Админ-панель</b>\n\nВыберите действие:", kb_admin_main())
+    await send_or_edit(call, "<b>🛠️ Админ-панель</b>\n\nВыберите действие:", kb_admin_main(call.from_user.id))
     await call.answer()
 
 
@@ -4965,7 +6146,7 @@ async def msg_adm_edit_product_price(message: Message, state: FSMContext) -> Non
     await _state_edit(
         message, state,
         f"✅ Цена <b>{escape(name)}</b> обновлена: <b>{price}₽</b>",
-        kb_admin_main(),
+        kb_admin_main(message.from_user.id),
     )
 
 
@@ -5081,13 +6262,13 @@ async def msg_adm_new_product_delivery(message: Message, state: FSMContext) -> N
             message, state,
             f"✅ Товар <b>{escape(name)}</b> добавлен!\n"
             f"Ключ: <code>{key}</code>  Цена: <b>{int(price)}₽</b>",
-            kb_admin_main(),
+            kb_admin_main(message.from_user.id),
         )
     else:
         await _state_edit(
             message, state,
             f"❌ Товар с ключом <code>{key}</code> уже существует. Выберите другой ключ.",
-            kb_admin_main(),
+            kb_admin_main(message.from_user.id),
         )
 
 
@@ -5788,7 +6969,7 @@ async def msg_adm_edit_setting(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ <b>{escape(label)}</b> обновлено: <b>{save_val}</b>",
         parse_mode="HTML",
-        reply_markup=kb_admin_main(),
+        reply_markup=kb_admin_main(message.from_user.id),
     )
 
 
@@ -5812,7 +6993,7 @@ async def cb_adm_users(call: CallbackQuery, state: FSMContext) -> None:
         await send_or_edit(
             call,
             "<b>👥 Пользователей пока нет.</b>",
-            kb_admin_main(),
+            kb_admin_main(call.from_user.id),
         )
         await call.answer()
         return
@@ -5862,7 +7043,10 @@ async def cb_adm_find(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(AdminStates.waiting_user_id)
 async def msg_adm_user_id(message: Message, state: FSMContext) -> None:
-    if not _is_moderator(message.from_user.id):
+    uid = message.from_user.id
+    # Доступно всем сотрудникам: Founder, Admin (через adm:find),
+    # Moderator (через mod:find_user), Helper (через hlp:find_user)
+    if not _is_staff(uid):
         return
     await _try_delete(message)
     target_id = parse_positive_int(message.text)
@@ -5872,31 +7056,73 @@ async def msg_adm_user_id(message: Message, state: FSMContext) -> None:
                                InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")
                            ]]))
         return
+    data = await state.get_data()
+    panel_return = data.get("mod_panel_return", "")
+    hlp_mode = data.get("hlp_mode", False)
     await state.clear()
     user_row = await db_find_user(target_id)
     if not user_row:
+        not_found_kb = (
+            kb_helper_panel() if hlp_mode
+            else kb_moderator_panel() if panel_return == "mod:panel"
+            else kb_admin_main(uid)
+        )
         await _state_edit(
             message, state,
             f"❌ Пользователь с ID <code>{target_id}</code> не найден.",
-            kb_admin_main(),
+            not_found_kb,
         )
         return
     blocked = bool(user_row.get("is_blacklisted"))
     orders_cnt = await db_orders_count(target_id)
-    text = (
-        "<b>👤 Карточка пользователя</b>\n\n"
-        f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
-        f"Username: @{escape(user_row.get('username') or '—')}\n"
-        f"Имя: {escape(user_row.get('first_name') or '—')}\n"
-        f"Баланс: <b>{user_row['balance']}₽</b>\n"
-        f"Заказов: <b>{orders_cnt}</b>\n"
-        f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
-    )
-    await _state_edit(
-        message, state,
-        text,
-        kb_admin_user(target_id, blocked, from_list_page=None),
-    )
+
+    if hlp_mode:
+        # Helper: базовая карточка без баланса и действий
+        text = (
+            "<b>👤 Карточка пользователя</b>\n\n"
+            f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
+            f"Username: @{escape(user_row.get('username') or '—')}\n"
+            f"Имя: {escape(user_row.get('first_name') or '—')}\n"
+            f"Заказов: <b>{orders_cnt}</b>\n"
+            f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
+        )
+        kb_back = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Другой пользователь", callback_data="hlp:find_user")],
+            [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+        ])
+        await _state_edit(message, state, text, kb_back)
+    elif panel_return == "mod:panel":
+        # Moderator: полная карточка, без финансовых действий
+        text = (
+            "<b>👤 Карточка пользователя</b>\n\n"
+            f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
+            f"Username: @{escape(user_row.get('username') or '—')}\n"
+            f"Имя: {escape(user_row.get('first_name') or '—')}\n"
+            f"Баланс: <b>{user_row['balance']}₽</b>\n"
+            f"Заказов: <b>{orders_cnt}</b>\n"
+            f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
+        )
+        kb_back = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Другой пользователь", callback_data="mod:find_user")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="mod:panel")],
+        ])
+        await _state_edit(message, state, text, kb_back)
+    else:
+        # Founder / Administrator: полная карточка с действиями
+        text = (
+            "<b>👤 Карточка пользователя</b>\n\n"
+            f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
+            f"Username: @{escape(user_row.get('username') or '—')}\n"
+            f"Имя: {escape(user_row.get('first_name') or '—')}\n"
+            f"Баланс: <b>{user_row['balance']}₽</b>\n"
+            f"Заказов: <b>{orders_cnt}</b>\n"
+            f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
+        )
+        await _state_edit(
+            message, state,
+            text,
+            kb_admin_user(target_id, blocked, from_list_page=None),
+        )
 
 
 @dp.callback_query(F.data.startswith("adm:credit:"))
@@ -5943,7 +7169,7 @@ async def msg_adm_credit(message: Message, state: FSMContext) -> None:
     if saved_source is not None:
         await state.update_data(admin_user_from_list_page=saved_source)
     if not target_id:
-        await message.answer("Не указан пользователь.", reply_markup=kb_admin_main())
+        await message.answer("Не указан пользователь.", reply_markup=kb_admin_main(message.from_user.id))
         return
     new_balance = await db_credit_balance(
         target_id, amount, kind="admin_add", reason="Начисление администратором"
@@ -6455,7 +7681,7 @@ async def cb_adm_panel(call: CallbackQuery, state: FSMContext) -> None:
     await send_or_edit(
         call,
         "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
-        kb_admin_main(),
+        kb_admin_main(call.from_user.id),
     )
 
 
@@ -7352,7 +8578,9 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         [InlineKeyboardButton(text="📧 Запросить код из почты", callback_data=f"mod:req_email:{order_id}:{user.id}")],
         [InlineKeyboardButton(text="💸 Возврат", callback_data=f"mod:refund:{order_id}")],
     ])
-    await notify_moderator_order(admin_text, reply_markup=admin_kb)
+    await notify_moderator_order(
+        admin_text, reply_markup=admin_kb, order_id=order_id
+    )
 
 
 @dp.callback_query(F.data.startswith("mod:done:"))
@@ -7642,8 +8870,8 @@ def _acquire_single_instance_lock() -> None:
 
 @dp.callback_query(F.data.startswith("reply_buyer:"))
 async def cb_reply_buyer(call: CallbackQuery, state: FSMContext) -> None:
-    """Модератор нажимает «Ответить покупателю» — бот просит написать текст."""
-    if not _is_moderator(call.from_user.id):
+    """Сотрудник нажимает «Ответить покупателю» — бот просит написать текст."""
+    if not _is_staff(call.from_user.id):
         await call.answer("Нет доступа.", show_alert=True)
         return
     buyer_id = int(call.data.split(":")[1])
@@ -7661,7 +8889,7 @@ async def cb_reply_buyer(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "mod_reply_cancel")
 async def cb_mod_reply_cancel(call: CallbackQuery, state: FSMContext) -> None:
-    if not _is_moderator(call.from_user.id):
+    if not _is_staff(call.from_user.id):
         return
     await state.clear()
     await call.message.edit_text("❌ Ответ покупателю отменён.")
@@ -7670,7 +8898,7 @@ async def cb_mod_reply_cancel(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(AdminStates.waiting_mod_reply)
 async def msg_mod_reply(message: Message, state: FSMContext) -> None:
-    if not _is_moderator(message.from_user.id):
+    if not _is_staff(message.from_user.id):
         return
     data = await state.get_data()
     buyer_id = int(data.get("mod_reply_buyer_id", 0))
@@ -7684,6 +8912,262 @@ async def msg_mod_reply(message: Message, state: FSMContext) -> None:
         await message.answer("✅ Сообщение отправлено покупателю.")
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить: {e}")
+
+
+# =====================================================================
+# Написать покупателю из управления заказом (ord_write_buyer)
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("ord_write_buyer:"))
+async def cb_ord_write_buyer(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник нажимает «Написать покупателю» в управлении заказом."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":")
+        order_id = int(parts[1])
+        buyer_id = int(parts[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    await state.set_state(AdminStates.waiting_ord_buyer_reply)
+    await state.update_data(ord_reply_order_id=order_id, ord_reply_buyer_id=buyer_id)
+    await call.message.answer(
+        f"✍️ <b>Написать покупателю (заказ #{order_id})</b>\n\n"
+        "Отправьте текст или фото — покупатель получит его с пометкой «Сообщение от администратора».\n\n"
+        "Для отмены нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="ord_write_buyer_cancel"),
+        ]]),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "ord_write_buyer_cancel")
+async def cb_ord_write_buyer_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_staff(call.from_user.id):
+        return
+    await state.clear()
+    await call.message.edit_text("❌ Отправка сообщения покупателю отменена.")
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_ord_buyer_reply)
+async def msg_ord_buyer_reply(message: Message, state: FSMContext) -> None:
+    if not _is_staff(message.from_user.id):
+        return
+    data = await state.get_data()
+    order_id = int(data.get("ord_reply_order_id", 0))
+    buyer_id = int(data.get("ord_reply_buyer_id", 0))
+    await state.clear()
+
+    # Кнопка «Ответить администратору» — появится у покупателя под сообщением
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✍️ Ответить администратору",
+            callback_data=f"buyer_write_admin:{order_id}",
+        )
+    ]])
+
+    try:
+        # Пересылаем контент и добавляем пометку
+        caption_prefix = f"📩 <b>Сообщение от администратора по заказу #{order_id}</b>"
+        if message.photo:
+            await bot.send_photo(
+                chat_id=buyer_id,
+                photo=message.photo[-1].file_id,
+                caption=(
+                    f"{caption_prefix}\n\n{escape(message.caption or '')}"
+                    if message.caption
+                    else caption_prefix
+                ),
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+        elif message.text:
+            await bot.send_message(
+                chat_id=buyer_id,
+                text=f"{caption_prefix}\n\n{escape(message.text)}",
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+        else:
+            # Любой другой тип (голос, документ и т.д.) — форвард + отдельное сообщение
+            await bot.forward_message(
+                chat_id=buyer_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            await bot.send_message(
+                chat_id=buyer_id,
+                text=caption_prefix,
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+        await message.answer(f"✅ Сообщение по заказу #{order_id} отправлено покупателю.")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить покупателю: {e}")
+
+
+# =====================================================================
+# Покупатель пишет администратору (buyer_write_admin)
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("buyer_write_admin:"))
+async def cb_buyer_write_admin(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель нажимает «Написать администратору» после оплаты заказа."""
+    try:
+        order_id = int(call.data.split(":")[1])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    # Проверяем, что этот пользователь — владелец заказа
+    order = await db_get_order(order_id)
+    if not order or int(order.get("tg_id", 0)) != call.from_user.id:
+        await call.answer("Заказ не найден или недоступен.", show_alert=True)
+        return
+    await state.set_state(ShopStates.waiting_buyer_msg)
+    await state.update_data(buyer_msg_order_id=order_id)
+    sent = await send_or_edit(
+        call,
+        f"✍️ <b>Написать администратору (заказ #{order_id})</b>\n\n"
+        "Отправьте ваш вопрос или сообщение — текст или фото.\n\n"
+        "Для отмены нажмите кнопку ниже.",
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"buyer_msg_cancel:{order_id}"),
+        ]]),
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("buyer_msg_cancel:"))
+async def cb_buyer_msg_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        order_id = int(call.data.split(":")[1])
+    except (IndexError, ValueError):
+        order_id = 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(call, f"❌ Отправка сообщения отменена.", kb)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_buyer_msg)
+async def msg_buyer_write_admin(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    data = await state.get_data()
+    order_id = int(data.get("buyer_msg_order_id", 0))
+    await state.clear()
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    caption_prefix = (
+        f"💬 <b>Сообщение от покупателя по заказу #{order_id}</b>\n\n"
+        f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>"
+    )
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✍️ Написать покупателю",
+            callback_data=f"ord_write_buyer:{order_id}:{user.id}",
+        )
+    ]])
+
+    # Отправляем назначенному сотруднику, или всем Founder/Admin если никто не взял
+    order = await db_get_order(order_id) if order_id else None
+    sent_to_staff = False
+    if order and order.get("assigned_to"):
+        staff_id = int(order["assigned_to"])
+        try:
+            if message.photo:
+                await bot.send_photo(
+                    chat_id=staff_id,
+                    photo=message.photo[-1].file_id,
+                    caption=(
+                        f"{caption_prefix}\n\n{escape(message.caption or '')}"
+                        if message.caption
+                        else caption_prefix
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=reply_kb,
+                )
+            elif message.text:
+                await bot.send_message(
+                    chat_id=staff_id,
+                    text=f"{caption_prefix}\n\n{escape(message.text)}",
+                    parse_mode="HTML",
+                    reply_markup=reply_kb,
+                )
+            else:
+                await bot.send_message(staff_id, caption_prefix, parse_mode="HTML")
+                await bot.forward_message(
+                    chat_id=staff_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
+                await bot.send_message(staff_id, "⬆️ Сообщение покупателя", reply_markup=reply_kb)
+            sent_to_staff = True
+        except Exception as e:
+            logging.warning(f"Не удалось отправить сообщение покупателя сотруднику {staff_id}: {e}")
+
+    if not sent_to_staff:
+        # Заказ не назначен — рассылаем всем Founder + Admin
+        recipients = await db_get_order_staff_recipients()
+        for staff in recipients:
+            sid = int(staff["tg_id"])
+            try:
+                if message.photo:
+                    await bot.send_photo(
+                        chat_id=sid,
+                        photo=message.photo[-1].file_id,
+                        caption=(
+                            f"{caption_prefix}\n\n{escape(message.caption or '')}"
+                            if message.caption
+                            else caption_prefix
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=reply_kb,
+                    )
+                elif message.text:
+                    await bot.send_message(
+                        chat_id=sid,
+                        text=f"{caption_prefix}\n\n{escape(message.text)}",
+                        parse_mode="HTML",
+                        reply_markup=reply_kb,
+                    )
+                else:
+                    await bot.send_message(sid, caption_prefix, parse_mode="HTML")
+                    await bot.forward_message(
+                        chat_id=sid,
+                        from_chat_id=message.chat.id,
+                        message_id=message.message_id,
+                    )
+                    await bot.send_message(sid, "⬆️ Сообщение покупателя", reply_markup=reply_kb)
+            except Exception as e:
+                logging.warning(f"Не удалось отправить сообщение покупателя сотруднику {sid}: {e}")
+
+    kb_after = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✍️ Написать ещё",
+            callback_data=f"buyer_write_admin:{order_id}",
+        )],
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await message.answer(
+        f"✅ Ваше сообщение по заказу <b>#{order_id}</b> передано администратору.\n\n"
+        "Когда он ответит — вы получите уведомление прямо в боте.",
+        parse_mode="HTML",
+        reply_markup=kb_after,
+    )
 
 
 # =====================================================================
@@ -8607,6 +10091,392 @@ async def msg_adm_image_photo(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text="🛠️ Админ-панель", callback_data="adm:admin")],
         ]),
     )
+
+# =====================================================================
+# Управление персоналом (только Founder)
+# =====================================================================
+
+def kb_staff_list(staff: list[dict], viewer_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in staff:
+        if int(s["tg_id"]) == viewer_id:
+            continue  # себя не показываем
+        label_role = STAFF_ROLE_LABELS.get(s["role"], s["role"])
+        name = s.get("first_name") or s.get("username") or str(s["tg_id"])
+        handle = f"@{s['username']}" if s.get("username") else f"id{s['tg_id']}"
+        rows.append([InlineKeyboardButton(
+            text=f"[{label_role}] {name} ({handle})",
+            callback_data=f"adm:staff:member:{s['tg_id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="adm:staff:add")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_staff_member(tg_id: int, role: str) -> InlineKeyboardMarkup:
+    assignable = [r for r in STAFF_ROLES if r != ROLE_FOUNDER]
+    rows: list[list[InlineKeyboardButton]] = []
+    for r in assignable:
+        label = STAFF_ROLE_LABELS[r]
+        mark = "✅ " if r == role else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{mark}{label}",
+            callback_data=f"adm:staff:setrole:{tg_id}:{r}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔥 Уволить", callback_data=f"adm:staff:fire:{tg_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К персоналу", callback_data="adm:staff")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm:staff")
+async def cb_adm_staff(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    await state.clear()
+    staff = await db_list_staff()
+    text = f"<b>👥 Персонал</b>\n\nВсего сотрудников: <b>{len(staff)}</b>"
+    await send_or_edit(call, text, kb_staff_list(staff, call.from_user.id))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:staff:member:"))
+async def cb_adm_staff_member(call: CallbackQuery) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        tg_id = int(call.data.split(":", 3)[3])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    role = await db_get_staff_role(tg_id) or ROLE_HELPER
+    staff_list = await db_list_staff()
+    member = next((s for s in staff_list if int(s["tg_id"]) == tg_id), None)
+    if not member:
+        await call.answer("Сотрудник не найден.", show_alert=True)
+        return
+    name = member.get("first_name") or member.get("username") or str(tg_id)
+    handle = f"@{member['username']}" if member.get("username") else f"id{tg_id}"
+    label_role = STAFF_ROLE_LABELS.get(role, role)
+    text = (
+        f"<b>Сотрудник: {escape(name)} ({escape(handle)})</b>\n\n"
+        f"Telegram ID: <code>{tg_id}</code>\n"
+        f"Роль: <b>{label_role}</b>\n\n"
+        "Выберите действие:"
+    )
+    await send_or_edit(call, text, kb_staff_member(tg_id, role))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:staff:setrole:"))
+async def cb_adm_staff_setrole(call: CallbackQuery) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":", 4)
+        tg_id = int(parts[3])
+        new_role = parts[4]
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    if new_role not in STAFF_ROLES or new_role == ROLE_FOUNDER:
+        await call.answer("Недопустимая роль.", show_alert=True)
+        return
+    await db_upsert_staff(tg_id, new_role)
+    await db_audit_staff_action(call.from_user.id, "change_role", "staff", str(tg_id))
+    label = STAFF_ROLE_LABELS[new_role]
+    try:
+        await bot.send_message(
+            tg_id,
+            f"🔔 <b>Ваша роль в магазине изменена.</b>\n\nНовая роль: <b>{label}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.answer(f"✅ Роль изменена на {label}", show_alert=True)
+    staff_list = await db_list_staff()
+    member = next((s for s in staff_list if int(s["tg_id"]) == tg_id), None)
+    name = (member.get("first_name") or member.get("username") or str(tg_id)) if member else str(tg_id)
+    handle = (f"@{member['username']}" if member and member.get("username") else f"id{tg_id}")
+    text = (
+        f"<b>Сотрудник: {escape(name)} ({escape(handle)})</b>\n\n"
+        f"Telegram ID: <code>{tg_id}</code>\n"
+        f"Роль: <b>{label}</b>\n\n"
+        "Выберите действие:"
+    )
+    await send_or_edit(call, text, kb_staff_member(tg_id, new_role))
+
+
+@dp.callback_query(F.data.startswith("adm:staff:fire:"))
+async def cb_adm_staff_fire(call: CallbackQuery) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        tg_id = int(call.data.split(":", 3)[3])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    removed = await db_remove_staff(tg_id)
+    if not removed:
+        await call.answer("Нельзя уволить Founder.", show_alert=True)
+        return
+    await db_audit_staff_action(call.from_user.id, "fire_staff", "staff", str(tg_id))
+    try:
+        await bot.send_message(
+            tg_id,
+            "🔔 <b>Вы больше не являетесь сотрудником магазина.</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.answer("✅ Сотрудник уволен", show_alert=True)
+    staff = await db_list_staff()
+    text = f"<b>👥 Персонал</b>\n\nВсего сотрудников: <b>{len(staff)}</b>"
+    await send_or_edit(call, text, kb_staff_list(staff, call.from_user.id))
+
+
+@dp.callback_query(F.data == "adm:staff:add")
+async def cb_adm_staff_add(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_staff_add_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:staff")]
+    ])
+    sent = await send_or_edit(
+        call,
+        "➕ <b>Добавление сотрудника</b>\n\n"
+        "Отправьте <b>Telegram ID</b> нового сотрудника одним числом.",
+        kb,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_staff_add_id)
+async def msg_staff_add_id(message: Message, state: FSMContext) -> None:
+    if not _is_founder(message.from_user.id):
+        return
+    await _try_delete(message)
+    tg_id = parse_positive_int(message.text)
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:staff")]
+    ])
+    if tg_id is None:
+        await _edit_prompt(state, "⚠️ Введите числовой Telegram ID.", kb_cancel)
+        return
+    if tg_id == message.from_user.id:
+        await _edit_prompt(state, "⚠️ Нельзя добавить себя.", kb_cancel)
+        return
+    await state.update_data(staff_new_tg_id=tg_id)
+    assignable = [r for r in STAFF_ROLES if r != ROLE_FOUNDER]
+    role_rows = [
+        [InlineKeyboardButton(
+            text=STAFF_ROLE_LABELS[r],
+            callback_data=f"adm:staff:addconfirm:{tg_id}:{r}",
+        )]
+        for r in assignable
+    ]
+    role_rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:staff")])
+    await _edit_prompt(
+        state,
+        f"👤 <b>Пользователь: <code>{tg_id}</code></b>\n\nВыберите роль:",
+        InlineKeyboardMarkup(inline_keyboard=role_rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:staff:addconfirm:"))
+async def cb_adm_staff_addconfirm(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":", 4)
+        tg_id = int(parts[3])
+        role = parts[4]
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    if role not in STAFF_ROLES or role == ROLE_FOUNDER:
+        await call.answer("Недопустимая роль.", show_alert=True)
+        return
+    await state.clear()
+    await db_upsert_staff(tg_id, role)
+    await db_audit_staff_action(call.from_user.id, "add_staff", "staff", str(tg_id))
+    label = STAFF_ROLE_LABELS[role]
+    try:
+        await bot.send_message(
+            tg_id,
+            f"🎉 <b>Вы назначены сотрудником магазина!</b>\n\nВаша роль: <b>{label}</b>\n\n"
+            "Используйте /admin для доступа к панели.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.answer(f"✅ Сотрудник добавлен с ролью {label}", show_alert=True)
+    staff = await db_list_staff()
+    text = f"<b>👥 Персонал</b>\n\nВсего сотрудников: <b>{len(staff)}</b>"
+    await send_or_edit(call, text, kb_staff_list(staff, call.from_user.id))
+
+
+# =====================================================================
+# Панель модератора (Moderator role)
+# =====================================================================
+
+def kb_moderator_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="mod:find_user")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="mod:users:0")],
+        [InlineKeyboardButton(text="🎟️ Промокоды (просмотр)", callback_data="mod:promos")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+    ])
+
+
+@dp.callback_query(F.data == "mod:panel")
+async def cb_mod_panel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_staff(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    if _is_moderator(call.from_user.id):
+        await send_or_edit(
+            call,
+            "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
+            kb_admin_main(call.from_user.id),
+        )
+    else:
+        await send_or_edit(
+            call,
+            "<b>🛡️ Панель модератора</b>\n\nВыберите действие:",
+            kb_moderator_panel(),
+        )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mod:find_user")
+async def cb_mod_find_user(call: CallbackQuery, state: FSMContext) -> None:
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.waiting_user_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
+        call, "🔍 Отправьте Telegram ID пользователя одним сообщением.", kb
+    )
+    await state.update_data(
+        _prompt_chat_id=sent.chat.id,
+        _prompt_msg_id=sent.message_id,
+        mod_panel_return="mod:panel",
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("mod:users:"))
+async def cb_mod_users(call: CallbackQuery, state: FSMContext) -> None:
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    try:
+        page = max(0, int(call.data.split(":", 2)[2]))
+    except (ValueError, IndexError):
+        page = 0
+    total = await db_users_count()
+    users = await db_list_users(USERS_PAGE_SIZE, page * USERS_PAGE_SIZE)
+    if not users and page > 0:
+        page = 0
+        users = await db_list_users(USERS_PAGE_SIZE, 0)
+    await state.update_data(admin_users_last_page=page, mod_panel_return="mod:panel")
+    if total == 0:
+        await send_or_edit(call, "<b>👥 Пользователей пока нет.</b>", kb_moderator_panel())
+        await call.answer()
+        return
+    text = (
+        f"<b>👥 Пользователи бота</b>\n"
+        f"Всего: <b>{total}</b>\n\n"
+        "Нажмите на пользователя, чтобы открыть карточку."
+    )
+    await send_or_edit(call, text, kb_admin_users(users, page, total))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mod:promos")
+async def cb_mod_promos(call: CallbackQuery, state: FSMContext) -> None:
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    promos = await db_list_regular_promos()
+    text = "<b>🎟️ Промокоды (просмотр)</b>\n\n"
+    if promos:
+        for p in promos:
+            disc = f"{p['discount_pct']}%" if p.get("discount_pct") else f"{p.get('fixed_discount', 0)}₽"
+            use_count = p.get("use_count", 0)
+            max_uses = p.get("max_uses")
+            uses_str = f"{use_count}/{max_uses}" if max_uses else f"{use_count}/∞"
+            text += f"• <code>{escape(p['code'])}</code> — скидка {disc}, использований: {uses_str}\n"
+    else:
+        text += "Промокодов нет."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="mod:panel")]
+    ])
+    await send_or_edit(call, text, kb)
+    await call.answer()
+
+
+# =====================================================================
+# Панель помощника (Helper role)
+# =====================================================================
+
+def kb_helper_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="hlp:find_user")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+    ])
+
+
+@dp.callback_query(F.data == "hlp:panel")
+async def cb_hlp_panel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_helper_role(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    await send_or_edit(
+        call,
+        "<b>🤝 Панель помощника</b>\n\nВыберите действие:",
+        kb_helper_panel(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "hlp:find_user")
+async def cb_hlp_find_user(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.waiting_user_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
+        call, "🔍 Отправьте Telegram ID пользователя одним сообщением.", kb
+    )
+    await state.update_data(
+        _prompt_chat_id=sent.chat.id,
+        _prompt_msg_id=sent.message_id,
+        mod_panel_return="hlp:panel",
+        hlp_mode=True,
+    )
+    await call.answer()
+
 
 async def _preload_local_section_images() -> None:
     """При старте загружает картинки в Telegram и кеширует file_id в БД.
