@@ -3942,7 +3942,8 @@ async def perform_purchase(
 
     # Скидка по активному реф./pct промокоду (для приглашённых пользователей)
     # Проверяем тип заранее, чтобы не применять level_disc вместе с pct_discount
-    _active_promo_id_check = user_row.get("active_ref_promo") if category != "tgstars" else None
+    _no_discount_cat = category in ("tgstars", "roblox_gamepass")
+    _active_promo_id_check = user_row.get("active_ref_promo") if not _no_discount_cat else None
     _active_promo_for_check = (
         await db_get_promo_by_id(_active_promo_id_check)
         if _active_promo_id_check else None
@@ -3953,13 +3954,13 @@ async def perform_purchase(
         and _active_promo_for_check.get("discount_pct", 0) > 0
     )
 
-    # Автоматическая скидка по реферальному уровню (не для TG Stars, не если активен pct_discount)
-    level = (user_row.get("referral_level") or 0) if (category != "tgstars" and not _has_active_pct) else 0
+    # Автоматическая скидка по реферальному уровню (не для TG Stars / геймпасса, не если активен pct_discount)
+    level = (user_row.get("referral_level") or 0) if (not _no_discount_cat and not _has_active_pct) else 0
     level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
 
     promo_disc = 0
     applied_ref_promo_id = None
-    if category != "tgstars":
+    if not _no_discount_cat:
         active_promo_id = _active_promo_id_check
         if active_promo_id:
             ref_promo = await db_get_promo_by_id(active_promo_id)
@@ -4366,19 +4367,20 @@ async def msg_pre_purchase_login(message: Message, state: FSMContext) -> None:
     user_row, _ = await db_get_or_create_user(message.from_user)
     original_price = price
 
-    _active_promo_id = user_row.get("active_ref_promo") if category != "tgstars" else None
+    _no_disc = category in ("tgstars", "roblox_gamepass")
+    _active_promo_id = user_row.get("active_ref_promo") if not _no_disc else None
     _active_promo = await db_get_promo_by_id(_active_promo_id) if _active_promo_id else None
     _has_active_pct = (
         _active_promo is not None
         and _active_promo.get("game") == "pct_discount"
         and _active_promo.get("discount_pct", 0) > 0
     )
-    level = (user_row.get("referral_level") or 0) if (category != "tgstars" and not _has_active_pct) else 0
+    level = (user_row.get("referral_level") or 0) if (not _no_disc and not _has_active_pct) else 0
     level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
 
     promo_disc = 0
     applied_ref_promo_id = None
-    if category != "tgstars" and _active_promo_id:
+    if not _no_disc and _active_promo_id:
         if _active_promo and _active_promo.get("discount_pct", 0) > 0:
             user_promo_list = await db_get_user_promos(message.from_user.id)
             up = next(
