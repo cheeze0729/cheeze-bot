@@ -308,7 +308,7 @@ GUARANTEE_TEXT = (
 
 # login_hint для категорий со специальными хендлерами (не управляются через DB)
 LOGIN_HINTS = {
-    "roblox_gamepass": "Отправьте ссылку на созданный геймпасс в Roblox.",
+    "roblox_gamepass": "После оплаты создайте геймпасс в Roblox и отправьте сюда ссылку на него одним сообщением.",
     "tgstars": "Отправьте @username аккаунта Telegram для зачисления звёзд.",
 }
 # Стандартные категории из DB теперь хранят login_hint и needs_code в таблице categories
@@ -2383,9 +2383,14 @@ async def order_needs_login(category: str | None) -> bool:
 
 async def _needs_pre_purchase_login(category: str | None) -> bool:
     """Нужно ли запрашивать данные для входа ДО оплаты.
-    Для roblox_gamepass — ссылка создаётся после, поэтому False."""
-    if not category or category == "roblox_gamepass":
+
+    Для Roblox-геймпаса данные нужны до оплаты, потому что ссылка
+    на созданный геймпасс будет отправлена после создания.
+    """
+    if not category:
         return False
+    if category == "roblox_gamepass":
+        return True
     return await order_needs_login(category)
 
 
@@ -3540,11 +3545,13 @@ async def cb_roblox_gamepass(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(ShopStates.waiting_robux_amount)
 async def msg_robux_amount(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
     qty = parse_positive_int(message.text)
     if qty is None:
-        await message.answer(
-            "Введите положительное число робуксов (например: 1500).",
-            reply_markup=kb_back_main("shop"),
+        await _edit_prompt(
+            state,
+            "⚠️ Введите положительное число робуксов (например: 1500).",
+            kb_back_main("shop"),
         )
         return
 
@@ -3568,10 +3575,10 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
         "Срок: до 5 дней\n"
         "Способ оплаты: Оплата с внутреннего баланса бота"
     )
-    await message.answer(
+    await _edit_prompt(
+        state,
         text,
-        reply_markup=kb_calc_actions("buy:robux_gp", "cat:roblox_gamepass"),
-        parse_mode="HTML",
+        kb_calc_actions("buy:robux_gp", "cat:roblox_gamepass"),
     )
 
 
@@ -3992,7 +3999,7 @@ async def perform_purchase(
     # Напоминание о неиспользованном промокоде на скидку.
     # Показываем только если прomo-скидка ВЫГОДНЕЕ текущей реф.-уровневой.
     # Скидки не суммируются: промо заменяет реф. уровень.
-    if state is not None and promo_disc == 0:
+    if state is not None and promo_disc == 0 and category not in ("tgstars", "roblox_gamepass"):
         reminder = await _find_reminder_promo(user.id, applied_ref_promo_id)
         if reminder:
             disc = reminder["discount_pct"]
