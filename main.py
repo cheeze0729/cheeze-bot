@@ -2124,17 +2124,6 @@ async def kb_shop_dynamic() -> InlineKeyboardMarkup:
             text=f"{icon}{cat['emoji']} {cat['name']}",
             callback_data=f"cat:{cat['key']}",
         )])
-    # Специальные категории — проверяем disabled в DB
-    gp_cat = await db_get_category("roblox_gamepass")
-    gp_icon = "⚠️ " if gp_cat and gp_cat["disabled"] else ""
-    rows.append([InlineKeyboardButton(
-        text=f"{gp_icon}🎮 Roblox, геймпассом (5 дней)", callback_data="cat:roblox_gamepass"
-    )])
-    stars_cat = await db_get_category("tgstars")
-    stars_icon = "⚠️ " if stars_cat and stars_cat["disabled"] else ""
-    rows.append([InlineKeyboardButton(
-        text=f"{stars_icon}✨ Telegram Stars", callback_data="cat:tgstars"
-    )])
     rows.append([InlineKeyboardButton(text="📱 Другие приложения", callback_data="cat:other")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
