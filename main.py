@@ -656,6 +656,22 @@ async def db_init() -> None:
                  'Отправьте почту, привязанную к вашему аккаунту и ожидайте код.', TRUE)
             ON CONFLICT (key) DO NOTHING
         """)
+        # Добавляем встроенные специальные категории (геймпасс и звёзды), если их ещё нет
+        await conn.execute("""
+            INSERT INTO categories (key, name, emoji, sort_order, disabled, login_hint, needs_code) VALUES
+                ('roblox_gamepass', 'Roblox — геймпассом', '🎮', 2, FALSE,
+                 'Отправьте ссылку на созданный геймпасс в Roblox.', FALSE),
+                ('tgstars', 'Telegram Stars', '✨', 3, FALSE, NULL, FALSE)
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Миграция: добавляем встроенные специальные категории если таблица уже была
+        await conn.execute("""
+            INSERT INTO categories (key, name, emoji, sort_order, disabled, login_hint, needs_code) VALUES
+                ('roblox_gamepass', 'Roblox — геймпассом', '🎮', 2, FALSE,
+                 'Отправьте ссылку на созданный геймпасс в Roblox.', FALSE),
+                ('tgstars', 'Telegram Stars', '✨', 3, FALSE, NULL, FALSE)
+            ON CONFLICT (key) DO NOTHING
+        """)
         # Миграция: добавляем новые колонки категорий если таблица уже была
         for col_sql in [
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS disabled_reason TEXT DEFAULT NULL",
@@ -2108,9 +2124,17 @@ async def kb_shop_dynamic() -> InlineKeyboardMarkup:
             text=f"{icon}{cat['emoji']} {cat['name']}",
             callback_data=f"cat:{cat['key']}",
         )])
-    # Специальные категории с собственными хендлерами (не управляются через DB)
-    rows.append([InlineKeyboardButton(text="🎮 Roblox, геймпассом (5 дней)", callback_data="cat:roblox_gamepass")])
-    rows.append([InlineKeyboardButton(text="✨ Telegram Stars", callback_data="cat:tgstars")])
+    # Специальные категории — проверяем disabled в DB
+    gp_cat = await db_get_category("roblox_gamepass")
+    gp_icon = "⚠️ " if gp_cat and gp_cat["disabled"] else ""
+    rows.append([InlineKeyboardButton(
+        text=f"{gp_icon}🎮 Roblox, геймпассом (5 дней)", callback_data="cat:roblox_gamepass"
+    )])
+    stars_cat = await db_get_category("tgstars")
+    stars_icon = "⚠️ " if stars_cat and stars_cat["disabled"] else ""
+    rows.append([InlineKeyboardButton(
+        text=f"{stars_icon}✨ Telegram Stars", callback_data="cat:tgstars"
+    )])
     rows.append([InlineKeyboardButton(text="📱 Другие приложения", callback_data="cat:other")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3501,15 +3525,27 @@ async def cb_roblox_instant_card(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "cat:roblox_gamepass")
 async def cb_roblox_gamepass(call: CallbackQuery, state: FSMContext) -> None:
-    text = (
-        "<b>Roblox — геймпассом (до 5 дней)</b>\n\n"
-        "⚠️ <b>Данный способ покупки временно недоступен.</b>\n\n"
-        "На данный момент покупка робуксов через геймпасс невозможна "
-        "в связи с ограничениями на платформе Roblox.\n\n"
-        "Воспользуйтесь покупкой <b>моментально</b> — она работает в штатном режиме."
-    )
+    cat = await db_get_category("roblox_gamepass")
     cat_photo = await db_get_image("cat:roblox_gamepass")
-    await show_section(call, "roblox_gamepass", text, kb_back_main("shop"), photo=cat_photo)
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        text = (
+            "<b>🎮 Roblox — геймпассом (до 5 дней)</b>\n\n"
+            f"⚠️ <b>Данный способ покупки временно недоступен.</b>\n\n"
+            f"{escape(reason)}"
+        )
+        await show_section(call, "roblox_gamepass", text, kb_back_main("shop"), photo=cat_photo)
+        await call.answer()
+        return
+    gp_rate = float(await db_get_setting("robux_gamepass_rate", "0.65"))
+    text = (
+        "<b>🎮 Roblox — геймпассом (до 5 дней)</b>\n\n"
+        f"Курс: 1 робукс = {gp_rate}₽\n\n"
+        "Введите количество робуксов:"
+    )
+    sent = await show_section(call, "roblox_gamepass", text, kb_back_main("shop"), photo=cat_photo)
+    await state.set_state(ShopStates.waiting_robux_amount)
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
     await call.answer()
 
 
@@ -3622,13 +3658,24 @@ async def cb_brawl_card(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "cat:tgstars")
 async def cb_tgstars(call: CallbackQuery, state: FSMContext) -> None:
+    cat = await db_get_category("tgstars")
+    cat_photo = await db_get_image("cat:tgstars")
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        text = (
+            f"<b>{e('tg_stars')} Telegram Stars</b>\n\n"
+            f"⚠️ <b>Данный способ покупки временно недоступен.</b>\n\n"
+            f"{escape(reason)}"
+        )
+        await show_section(call, "tgstars", text, kb_back_main("shop"), photo=cat_photo)
+        await call.answer()
+        return
     stars_rate = float(await db_get_setting("tg_stars_rate", "1.3"))
     text = (
         f"<b>{e('tg_stars')} Telegram Stars</b>\n\n"
         f"Курс: 1 звезда = {stars_rate}₽\n\n"
         "Введите количество звёзд одним сообщением (например: 100):"
     )
-    cat_photo = await db_get_image("cat:tgstars")
     sent = await show_section(call, "tgstars", text, kb_back_main("shop"), photo=cat_photo)
     await state.set_state(ShopStates.waiting_stars_amount)
     await state.update_data(_prompt_chat_id=sent.chat.id,
@@ -5954,10 +6001,17 @@ async def kb_catalog_categories() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for cat in cats:
         status = "⚠️ " if cat["disabled"] else ""
-        rows.append([InlineKeyboardButton(
-            text=f"{status}{cat['emoji']} {cat['name']}",
-            callback_data=f"adm:catalog:cat:{cat['key']}",
-        )])
+        if cat["key"] in _SPECIAL_CAT_KEYS:
+            # Нет товаров — ведём сразу в настройки
+            rows.append([InlineKeyboardButton(
+                text=f"{status}{cat['emoji']} {cat['name']} ⚙️",
+                callback_data=f"adm:catcfg:{cat['key']}",
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text=f"{status}{cat['emoji']} {cat['name']}",
+                callback_data=f"adm:catalog:cat:{cat['key']}",
+            )])
     rows.append([InlineKeyboardButton(text="➕ Создать категорию", callback_data="adm:catalog:new_cat")])
     rows.append([InlineKeyboardButton(text="⚙️ Курсы и лимиты", callback_data="adm:settings")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
@@ -5993,6 +6047,10 @@ def kb_product_manage(prod_key: str, cat_key: str) -> InlineKeyboardMarkup:
     ])
 
 
+# Встроенные категории без списка товаров — только открытие/закрытие и текст после оплаты
+_SPECIAL_CAT_KEYS: frozenset[str] = frozenset({"roblox_gamepass", "tgstars"})
+
+
 def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
     """Клавиатура настроек категории."""
     key = cat["key"]
@@ -6013,6 +6071,28 @@ def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"adm:catdel:ask:{key}")])
     rows.append([InlineKeyboardButton(text="⬅️ К товарам", callback_data=f"adm:catalog:cat:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_cat_config_builtin(cat: dict) -> InlineKeyboardMarkup:
+    """Упрощённая клавиатура настроек для встроенных категорий без товаров
+    (roblox_gamepass, tgstars): только открыть/закрыть и текст после оплаты."""
+    key = cat["key"]
+    disabled = cat.get("disabled", False)
+    rows: list[list[InlineKeyboardButton]] = []
+    if disabled:
+        rows.append([InlineKeyboardButton(text="✅ Включить категорию", callback_data=f"adm:catdis:enable:{key}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔴 Отключить категорию", callback_data=f"adm:catdis:start:{key}")])
+    rows.append([InlineKeyboardButton(text="📝 Изменить текст после оплаты", callback_data=f"adm:catlogin:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К каталогу", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _cat_config_kb(cat: dict) -> InlineKeyboardMarkup:
+    """Выбирает нужную клавиатуру настроек в зависимости от типа категории."""
+    if cat["key"] in _SPECIAL_CAT_KEYS:
+        return kb_cat_config_builtin(cat)
+    return kb_cat_config(cat)
 
 
 def kb_settings_list(settings: list[dict]) -> InlineKeyboardMarkup:
@@ -6718,16 +6798,24 @@ async def cb_adm_catcfg(call: CallbackQuery, state: FSMContext) -> None:
     hint_preview = (cat.get("login_hint") or "—")[:60]
     if len(cat.get("login_hint") or "") > 60:
         hint_preview += "…"
-    nc_icon = "🔔✅" if cat["needs_code"] else "🔔❌"
-    text = (
-        f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
-        f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
-        f"Текст после оплаты: <i>{escape(hint_preview)}</i>\n"
-        f"Кнопка кода: {nc_icon} {'включена' if cat['needs_code'] else 'выключена'}"
-    )
+    is_special = key in _SPECIAL_CAT_KEYS
+    if is_special:
+        text = (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
+            f"Текст после оплаты: <i>{escape(hint_preview)}</i>"
+        )
+    else:
+        nc_icon = "🔔✅" if cat["needs_code"] else "🔔❌"
+        text = (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
+            f"Текст после оплаты: <i>{escape(hint_preview)}</i>\n"
+            f"Кнопка кода: {nc_icon} {'включена' if cat['needs_code'] else 'выключена'}"
+        )
     if cat["disabled"] and cat.get("disabled_reason"):
         text += f"\nПричина отключения: <i>{escape(cat['disabled_reason'])}</i>"
-    await send_or_edit(call, text, kb_cat_config(cat))
+    await send_or_edit(call, text, _cat_config_kb(cat))
 
 
 @dp.callback_query(F.data.startswith("adm:catdis:enable:"))
@@ -6744,7 +6832,7 @@ async def cb_adm_catdis_enable(call: CallbackQuery) -> None:
         await send_or_edit(call, (
             f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
             f"Статус: ✅ активна"
-        ), kb_cat_config(cat))
+        ), _cat_config_kb(cat))
 
 
 @dp.callback_query(F.data.startswith("adm:catdis:start:"))
@@ -6782,7 +6870,7 @@ async def cb_adm_catdis_noreason(call: CallbackQuery, state: FSMContext) -> None
         await send_or_edit(call, (
             f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
             f"Статус: ⚠️ отключена"
-        ), kb_cat_config(cat))
+        ), _cat_config_kb(cat))
 
 
 @dp.message(AdminStates.waiting_cat_disabled_reason)
@@ -6832,7 +6920,7 @@ async def cb_adm_cat_needscode(call: CallbackQuery) -> None:
         await send_or_edit(call, (
             f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
             f"Кнопка «Отправить код»: {'✅ включена' if new_val else '❌ выключена'}"
-        ), kb_cat_config(cat))
+        ), _cat_config_kb(cat))
 
 
 @dp.callback_query(F.data.startswith("adm:catlogin:"))
@@ -6877,7 +6965,7 @@ async def cb_adm_catlogin_clear(call: CallbackQuery, state: FSMContext) -> None:
         await send_or_edit(call, (
             f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
             "Текст после оплаты: —"
-        ), kb_cat_config(cat))
+        ), _cat_config_kb(cat))
 
 
 @dp.message(AdminStates.waiting_cat_login_hint)
