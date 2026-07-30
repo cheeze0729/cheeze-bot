@@ -74,7 +74,6 @@ PRICE_CHECK_ENABLED = True
 PRICE_CHECK_SCHEDULE_HOUR = 10
 PRICE_CHECK_SCHEDULE_MINUTE = 0
 PRICE_CHECK_TIMEZONE = "Europe/Moscow"
-PRICE_CHECK_TARGET_CHAT_ID = int(os.environ.get("PRICE_CHECK_CHAT_ID", MODERATOR_CHAT_ID))
 PRICE_CHECK_MARKUP_PCT = 12.0
 PRICE_CHECK_URL = "https://starvell.com/roblox/packages"
 PRICE_CHECK_OFFER_URL = "https://starvell.com/offers/ffb5571f-4031-4df8-8a0c-c52da41c0c19"
@@ -96,6 +95,7 @@ PRICE_CHECK_GAMEPASS_LABEL = "Роблокс геймпассом (за 1 шт)"
 # Сюда будут приходить уведомления о новых заказах и сообщения от клиентов.
 # Если оставить 0 — пересылка будет отключена.
 MODERATOR_CHAT_ID = 1727614596
+PRICE_CHECK_TARGET_CHAT_ID = int(os.environ.get("PRICE_CHECK_CHAT_ID", MODERATOR_CHAT_ID))
 
 # Иерархия сотрудников. MODERATOR_CHAT_ID сохраняется как обратная
 # совместимость с прежней конфигурацией, но теперь он является Founder.
