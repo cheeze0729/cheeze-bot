@@ -2394,6 +2394,11117 @@ async def _needs_pre_purchase_login(category: str | None) -> bool:
     return await order_needs_login(category)
 
 
+async def _get_login_hint(category: str | None) -> str | None:
+    """Возвращает текст после оплаты для категории.
+
+    Сначала берёт значение из админки (DB), если оно задано, иначе —
+    встроенный дефолт для специальных категорий.
+    """
+    if not category:
+        return None
+    cat_obj = await db_get_category(category)
+    if cat_obj and cat_obj.get("login_hint"):
+        return cat_obj.get("login_hint")
+    return LOGIN_HINTS.get(category)
+
+
+async def order_needs_code(category: str | None) -> bool:
+    """Нужно ли показывать кнопку «Отправить код для входа»."""
+    if not category:
+        return False
+    cat = await db_get_category(category)
+    if cat is not None:
+        return bool(cat.get("needs_code"))
+    return False
+
+
+async def _try_delete(msg: Message) -> None:
+    """Тихо удаляет сообщение, игнорируя ошибки."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _edit_prompt(state: FSMContext, text: str,
+                       kb: InlineKeyboardMarkup) -> None:
+    """Редактирует сохранённое в FSM сообщение-подсказку бота.
+
+    Если редактирование невозможно (фото, устарело и т.д.) — отправляет новое.
+    Перед этим обновляет сохранённый msg_id на новый.
+    """
+    data = await state.get_data()
+    chat_id: int | None = data.get("_prompt_chat_id")
+    msg_id: int | None = data.get("_prompt_msg_id")
+    if chat_id and msg_id:
+        try:
+            edited = await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await state.update_data(_prompt_msg_id=edited.message_id)
+            return
+        except Exception:
+            pass
+    # Если не получилось отредактировать — шлём новым сообщением
+    sent = await bot.send_message(
+        chat_id or 0,
+        text,
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
+
+
+async def _state_edit(message: Message, state: FSMContext, text: str,
+                      kb: InlineKeyboardMarkup) -> None:
+    """Удаляет сообщение пользователя и редактирует/отправляет ответ бота.
+    Сохраняет ID нового сообщения бота для следующего шага."""
+    await _try_delete(message)
+    data = await state.get_data()
+    chat_id = data.get("_prompt_chat_id") or message.chat.id
+    msg_id = data.get("_prompt_msg_id")
+    if msg_id and chat_id:
+        try:
+            edited = await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            await state.update_data(_prompt_chat_id=chat_id,
+                                    _prompt_msg_id=edited.message_id)
+            return
+        except Exception:
+            pass
+    sent = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
+
+
+async def send_or_edit(target, text: str,
+                       kb: InlineKeyboardMarkup) -> Message:
+    """Для CallbackQuery удаляет старое сообщение и отправляет новое.
+    Возвращает отправленное/отредактированное сообщение."""
+    try:
+        if isinstance(target, CallbackQuery):
+            chat_id = target.message.chat.id
+            try:
+                await target.message.delete()
+            except Exception:
+                pass
+            return await bot.send_message(
+                chat_id,
+                text,
+                reply_markup=kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        else:
+            return await target.answer(
+                text,
+                reply_markup=kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+    except Exception:
+        chat_id = (
+            target.message.chat.id
+            if isinstance(target, CallbackQuery)
+            else target.chat.id
+        )
+        return await bot.send_message(
+            chat_id,
+            text,
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+
+async def show_section(
+    call: CallbackQuery, key: str, text: str, kb: InlineKeyboardMarkup,
+    photo: str | None = None,
+) -> Message:
+    """Всегда удаляет старое сообщение и открывает новое. Возвращает Message."""
+    image = photo or SECTION_IMAGES.get(key)
+
+    if image and len(text) <= 1024:
+        chat_id = call.message.chat.id
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        try:
+            sent = await bot.send_photo(
+                chat_id,
+                photo=image,
+                caption=text,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return sent
+        except Exception as e:
+            logging.warning(f"Не удалось отправить картинку '{key}': {e}")
+
+    return await send_or_edit(call, text, kb)
+
+
+def _is_staff(user_id: int) -> bool:
+    return _STAFF_ROLES.get(user_id) in STAFF_ROLES
+
+
+def _is_founder(user_id: int) -> bool:
+    return _STAFF_ROLES.get(user_id) == ROLE_FOUNDER
+
+
+def _is_moderator(user_id: int) -> bool:
+    """Совместимое имя для старых обработчиков: Founder + Administrator."""
+    return _STAFF_ROLES.get(user_id) in (ROLE_FOUNDER, ROLE_ADMINISTRATOR)
+
+
+def _senior_staff(user_id: int) -> bool:
+    return _STAFF_ROLES.get(user_id) in (ROLE_FOUNDER, ROLE_ADMINISTRATOR)
+
+
+def _is_moderator_role(user_id: int) -> bool:
+    """Точно роль Moderator (не Founder/Administrator)."""
+    return _STAFF_ROLES.get(user_id) == ROLE_MODERATOR
+
+
+def _is_helper_role(user_id: int) -> bool:
+    """Точно роль Helper."""
+    return _STAFF_ROLES.get(user_id) == ROLE_HELPER
+
+
+def _can_moderate(user_id: int) -> bool:
+    """Founder + Administrator + Moderator: модерирование отзывов, просмотр карточек."""
+    return _STAFF_ROLES.get(user_id) in (ROLE_FOUNDER, ROLE_ADMINISTRATOR, ROLE_MODERATOR)
+
+
+async def notify_moderator(
+    text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> "Message | None":
+    """Рассылает внутреннее уведомление Founder и Administrator."""
+    recipients = await db_get_order_staff_recipients()
+    first_message: Message | None = None
+    for staff in recipients:
+        try:
+            sent = await bot.send_message(
+                staff["tg_id"], text, parse_mode="HTML", reply_markup=reply_markup
+            )
+            first_message = first_message or sent
+        except Exception as exc:
+            logging.warning(
+                f"Не удалось уведомить сотрудника {staff['tg_id']}: {exc}"
+            )
+    return first_message
+
+
+def _safe_order_notification_text(text: str) -> str:
+    """Убирает секретные данные из общего сообщения о новом заказе."""
+    marker = "\n\n🔐 <b>Данные для входа:</b>"
+    return text.split(marker, 1)[0]
+
+
+def _staff_order_keyboard(order: dict) -> InlineKeyboardMarkup:
+    order_id = int(order["id"])
+    target_id = int(order["tg_id"])
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text="✅ Завершить заказ",
+            callback_data=f"ordone:{order_id}:{target_id}",
+        )],
+        [InlineKeyboardButton(
+            text="✍️ Написать покупателю",
+            callback_data=f"ord_write_buyer:{order_id}:{target_id}",
+        )],
+        [InlineKeyboardButton(
+            text="📧 Запросить код из почты",
+            callback_data=f"mod:req_email:{order_id}:{target_id}",
+        )],
+        [InlineKeyboardButton(
+            text="💸 Возврат", callback_data=f"mod:refund:{order_id}"
+        )],
+        [InlineKeyboardButton(
+            text="📋 История заказа", callback_data=f"ord:history:{order_id}"
+        )],
+    ]
+    if order.get("category") == "roblox_gamepass" and order.get("gamepass_price"):
+        rows.insert(0, [InlineKeyboardButton(
+            text="🎮 Попросить изменить цену геймпасса",
+            callback_data=(
+                f"gpfix:{order_id}:{target_id}:{int(order['gamepass_price'])}"
+            ),
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _full_order_notification_text(base_text: str, order: dict) -> str:
+    text = _safe_order_notification_text(base_text)
+    if order.get("login_data"):
+        text += (
+            f"\n\n🔐 <b>Данные для входа:</b>\n"
+            f"<pre>{escape(str(order['login_data']))}</pre>"
+        )
+    if order.get("login_code"):
+        text += (
+            f"\n\n📨 <b>Код для входа:</b>\n"
+            f"<pre>{escape(str(order['login_code']))}</pre>"
+        )
+    return text
+
+
+async def _refresh_order_staff_messages(
+    order_id: int,
+    base_text: str,
+    order: dict,
+    assigned_staff_id: int | None = None,
+    assigned_label: str | None = None,
+) -> None:
+    """Обновляет все копии заказа: секреты видит только исполнитель."""
+    assigned = int(order["assigned_to"]) if order.get("assigned_to") else None
+    if assigned_staff_id is not None:
+        assigned = assigned_staff_id
+    rows = await db_get_staff_order_messages(order_id)
+    for row in rows:
+        staff_id = int(row["staff_id"])
+        if staff_id == assigned:
+            message_text = _full_order_notification_text(base_text, order)
+            if assigned_label:
+                message_text += f"\n\n🙋 Взял: {assigned_label}"
+            markup = _staff_order_keyboard(order)
+        else:
+            message_text = (
+                f"{_safe_order_notification_text(base_text)}\n\n"
+                f"🔒 Заказ уже взял сотрудник: <b>{escape(assigned_label or str(assigned))}</b>"
+            )
+            markup = None
+        try:
+            await bot.edit_message_text(
+                chat_id=row["chat_id"],
+                message_id=row["message_id"],
+                text=message_text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as exc:
+            logging.warning(
+                f"Не удалось обновить сообщение заказа #{order_id}: {exc}"
+            )
+
+
+async def notify_moderator_order(
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    order_id: int | None = None,
+) -> None:
+    """Рассылает заказ Founder/Administrator с единой кнопкой назначения."""
+    if order_id is None:
+        await notify_moderator(text, reply_markup=reply_markup)
+        return
+    recipients = await db_get_order_staff_recipients()
+    safe_text = _safe_order_notification_text(text)
+    claim_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🙋 Взять заказ", callback_data=f"ordclaim:{order_id}"
+        )
+    ]])
+    for staff in recipients:
+        try:
+            msg = await bot.send_message(
+                staff["tg_id"], safe_text, parse_mode="HTML",
+                reply_markup=claim_kb,
+            )
+            await db_store_staff_order_message(
+                order_id, int(staff["tg_id"]), msg.chat.id, msg.message_id, safe_text
+            )
+            try:
+                await bot.pin_chat_message(
+                    msg.chat.id, msg.message_id, disable_notification=True
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            logging.warning(
+                f"Не удалось отправить заказ сотруднику {staff['tg_id']}: {exc}"
+            )
+
+
+@dp.callback_query(F.data.startswith("ordclaim:"))
+async def cb_order_claim(call: CallbackQuery) -> None:
+    if not _senior_staff(call.from_user.id):
+        await call.answer("Заказы доступны только Founder и Administrator.", show_alert=True)
+        return
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректный заказ.", show_alert=True)
+        return
+    order = await db_claim_order(order_id, call.from_user.id)
+    if not order:
+        current = await db_get_order(order_id)
+        if current and current.get("assigned_to"):
+            await call.answer(
+                f"Заказ уже взял сотрудник: {current['assigned_to']}.",
+                show_alert=True,
+            )
+        else:
+            await call.answer("Заказ уже закрыт.", show_alert=True)
+        return
+    await db_audit_staff_action(
+        call.from_user.id, "claim_order", "order", str(order_id)
+    )
+    staff_name = call.from_user.first_name or "сотрудник"
+    staff_username = (
+        f"@{call.from_user.username}" if call.from_user.username else "username не указан"
+    )
+    assigned_label = f"{escape(staff_name)} ({escape(staff_username)})"
+    base_text = call.message.text or call.message.caption or ""
+    order["assigned_to"] = call.from_user.id
+    await _refresh_order_staff_messages(
+        order_id,
+        base_text,
+        order,
+        assigned_staff_id=call.from_user.id,
+        assigned_label=assigned_label,
+    )
+    await call.answer("Заказ закреплён за вами")
+
+
+async def notify_assigned_staff(
+    order_id: int,
+    text: str,
+    *,
+    include_markup: bool = False,
+) -> bool:
+    """Отправляет данные заказа только назначенному сотруднику."""
+    order = await db_get_order(order_id)
+    if not order or not order.get("assigned_to"):
+        logging.warning(
+            f"Заказ #{order_id} не назначен: секретное уведомление не отправлено."
+        )
+        return False
+    staff_id = int(order["assigned_to"])
+    try:
+        await bot.send_message(
+            staff_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=_staff_order_keyboard(order) if include_markup else None,
+        )
+        return True
+    except Exception as exc:
+        logging.warning(
+            f"Не удалось отправить данные назначенному сотруднику "
+            f"{staff_id} по заказу #{order_id}: {exc}"
+        )
+        return False
+
+
+def parse_positive_int(text: str) -> int | None:
+    """Парсит положительное целое число из текста."""
+    text = (text or "").strip().replace(" ", "")
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if value <= 0:
+        return None
+    return value
+
+
+
+# =====================================================================
+# /start и главное меню
+# =====================================================================
+
+
+@dp.message(CommandStart())
+async def handle_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user_row, is_new_user = await db_get_or_create_user(message.from_user)
+
+    # Обрабатываем реферальную ссылку
+    parts = message.text.split() if message.text else []
+    used_ref_link = False
+    if len(parts) > 1 and parts[1].startswith("ref_"):
+        ref_code = parts[1][4:]
+        referrer = await db_get_user_by_ref_code(ref_code)
+        if referrer and referrer["tg_id"] != message.from_user.id:
+            used_ref_link = True
+            already_referred = user_row.get("referred_by") is not None
+            await db_set_referred_by(message.from_user.id, referrer["tg_id"])
+            # Выдаём 3 INV-промокода только при первом входе по реф. ссылке
+            if not already_referred:
+                invite_codes = await db_create_invite_promo_codes(message.from_user.id, count=3)
+                if invite_codes:
+                    codes_text = "\n".join(f"<code>{c}</code>" for c in invite_codes)
+                    try:
+                        await message.answer(
+                            f"🎁 <b>Добро пожаловать! Вам начислены промокоды.</b>\n\n"
+                            f"Вы перешли по реферальной ссылке и получили "
+                            f"<b>3 промокода</b> на скидку <b>5%</b> на любой заказ:\n\n"
+                            f"{codes_text}\n\n"
+                            f"Активируйте промокод в разделе "
+                            f"<b>«Мои реф. промокоды»</b> перед покупкой.\n"
+                            f"<i>Не действует на Telegram Stars.</i>",
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            f"Не удалось уведомить нового реферала "
+                            f"{message.from_user.id}: {e}"
+                        )
+
+    # Обычным новым пользователям (без реф. ссылки) выдаём 1 промокод на 5%
+    if not used_ref_link and is_new_user:
+        welcome_codes = await db_create_invite_promo_codes(message.from_user.id, count=1)
+        if welcome_codes:
+            try:
+                await message.answer(
+                    f"🎁 <b>Добро пожаловать! Вам начислен промокод.</b>\n\n"
+                    f"Вы получили промокод на скидку <b>5%</b> на любой заказ:\n\n"
+                    f"<code>{welcome_codes[0]}</code>\n\n"
+                    f"Активируйте промокод в разделе "
+                    f"<b>«Мои реф. промокоды»</b> перед покупкой.\n"
+                    f"<i>Не действует на Telegram Stars.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(
+                    f"Не удалось уведомить нового пользователя "
+                    f"{message.from_user.id}: {e}"
+                )
+
+    try:
+        await message.answer_photo(
+            photo=WELCOME_IMAGE_URL,
+            caption=WELCOME_TEXT,
+            reply_markup=kb_main_menu(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await message.answer(
+            WELCOME_TEXT, reply_markup=kb_main_menu(), parse_mode="HTML"
+        )
+
+
+@dp.callback_query(F.data == "main")
+async def cb_main(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await show_section(call, "welcome", WELCOME_TEXT, kb_main_menu())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "guarantee")
+async def cb_guarantee(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await show_section(call, "guarantee", GUARANTEE_TEXT, kb_guarantee())
+    await call.answer()
+
+
+def kb_support_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Оставить заявку", callback_data="support:ticket")],
+        [InlineKeyboardButton(text="💬 Написать напрямую", callback_data="support:direct")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+
+
+@dp.callback_query(F.data == "support")
+async def cb_support(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    active = await db_get_active_ticket(call.from_user.id)
+    if active:
+        # У пользователя уже есть открытый тикет — показываем его
+        tid = active["id"]
+        status_map = {"open": "🟡 Ожидает сотрудника", "claimed": "🟢 В работе"}
+        status = status_map.get(active["status"], active["status"])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Продолжить переписку", callback_data=f"tkt:resume:{tid}")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await send_or_edit(
+            call,
+            f"<b>🎫 У вас уже есть открытый тикет #{tid}</b>\n\n"
+            f"Статус: {status}\n\n"
+            "Вы можете продолжить переписку или дождаться ответа сотрудника.",
+            kb,
+        )
+    else:
+        text = (
+            "<b>🆘 Поддержка</b>\n\n"
+            "Выберите способ связи:\n\n"
+            "📝 <b>Оставить заявку</b> — опишите проблему прямо в боте, "
+            "сотрудник возьмёт тикет и ответит вам здесь.\n\n"
+            "💬 <b>Написать напрямую</b> — откроет чат с сотрудником в Telegram."
+        )
+        await show_section(call, "support", text, kb_support_menu())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "info")
+async def cb_info(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await show_section(call, "info", INFO_TEXT, kb_info())
+    await call.answer()
+
+
+# =====================================================================
+# Система поддержки — тикеты
+# =====================================================================
+
+
+@dp.callback_query(F.data == "support:direct")
+async def cb_support_direct(call: CallbackQuery, state: FSMContext) -> None:
+    """Показывает @username хелпера (или фаундера) для прямого контакта."""
+    await state.clear()
+    contact = await db_get_direct_support_contact()
+    handle = (contact or SUPPORT_USERNAME).lstrip("@")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать в поддержку", url=f"https://t.me/{handle}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="support")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"💬 <b>Прямой контакт</b>\n\n"
+        f"Напишите нам напрямую: <b>{contact or SUPPORT_USERNAME}</b>\n\n"
+        "Нажмите кнопку ниже, чтобы открыть чат.",
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "support:ticket")
+async def cb_support_ticket(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало создания тикета — просим описать проблему."""
+    await state.clear()
+    active = await db_get_active_ticket(call.from_user.id)
+    if active:
+        await call.answer("У вас уже есть открытый тикет.", show_alert=True)
+        return
+    await state.set_state(ShopStates.waiting_ticket_desc)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="support")],
+    ])
+    sent = await send_or_edit(
+        call,
+        "📝 <b>Создание заявки в поддержку</b>\n\n"
+        "Опишите вашу проблему подробно одним сообщением.\n"
+        "При желании прикрепите фото — отправьте фото с подписью.\n\n"
+        "<i>Сотрудник получит вашу заявку и ответит прямо в боте.</i>",
+        kb,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_ticket_desc)
+async def msg_ticket_desc(message: Message, state: FSMContext) -> None:
+    """Покупатель прислал описание проблемы — создаём тикет."""
+    await _try_delete(message)
+    text = (message.text or message.caption or "").strip()
+    photo_file_id = message.photo[-1].file_id if message.photo else None
+    if not text and not photo_file_id:
+        await _edit_prompt(
+            state,
+            "⚠️ Пожалуйста, опишите проблему текстом (или пришлите фото с подписью).",
+            InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отмена", callback_data="support")
+            ]]),
+        )
+        return
+    await state.clear()
+    ticket = await db_create_ticket(message.from_user.id, text or "—", photo_file_id)
+    tid = ticket["id"]
+    # Ставим покупателя в режим чата
+    await state.set_state(ShopStates.waiting_ticket_chat)
+    await state.update_data(ticket_id=tid)
+    kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:exit:{tid}")],
+    ])
+    await message.answer(
+        f"✅ <b>Заявка #{tid} создана!</b>\n\n"
+        "Сотрудник получил уведомление и скоро возьмёт тикет в работу.\n\n"
+        "Пока тикет открыт — любое ваше сообщение здесь будет передано сотруднику.\n"
+        "Чтобы выйти из режима чата, нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=kb_buyer,
+    )
+    # Рассылаем уведомление всем сотрудникам
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    notify_text = (
+        f"🎫 <b>Новый тикет поддержки #{tid}</b>\n\n"
+        f"Пользователь: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>\n\n"
+        f"<b>Проблема:</b>\n{escape(text or '—')}"
+    )
+    claim_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎫 Взять тикет", callback_data=f"tkt:claim:{tid}")
+    ]])
+    recipients = await db_get_can_moderate_recipients()
+    for staff in recipients:
+        sid = int(staff["tg_id"])
+        try:
+            if photo_file_id:
+                msg = await bot.send_photo(
+                    chat_id=sid, photo=photo_file_id,
+                    caption=notify_text, parse_mode="HTML", reply_markup=claim_kb,
+                )
+            else:
+                msg = await bot.send_message(
+                    sid, notify_text, parse_mode="HTML", reply_markup=claim_kb,
+                )
+            await db_store_ticket_notify(tid, sid, msg.chat.id, msg.message_id)
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить сотрудника {sid} о тикете #{tid}: {e}")
+
+
+@dp.callback_query(F.data.startswith("tkt:claim:"))
+async def cb_tkt_claim(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник берёт тикет в работу."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ok = await db_claim_ticket(tid, call.from_user.id)
+    if not ok:
+        ticket = await db_get_ticket(tid)
+        if ticket and ticket["status"] != "open":
+            await call.answer("Тикет уже взят другим сотрудником.", show_alert=True)
+        else:
+            await call.answer("Тикет не найден.", show_alert=True)
+        return
+    ticket = await db_get_ticket(tid)
+    buyer_id = int(ticket["user_tg_id"])
+    staff = call.from_user
+    staff_name = staff.first_name or str(staff.id)
+    staff_handle = f"@{staff.username}" if staff.username else f"id{staff.id}"
+    label = f"{escape(staff_name)} ({escape(staff_handle)})"
+    # Обновляем уведомления у других сотрудников
+    notify_rows = await db_get_ticket_notify(tid)
+    for row in notify_rows:
+        sid = int(row["staff_id"])
+        if sid == staff.id:
+            continue
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=row["chat_id"],
+                message_id=row["message_id"],
+                reply_markup=None,
+            )
+            await bot.send_message(
+                sid,
+                f"🔒 Тикет <b>#{tid}</b> взял сотрудник: {label}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось обновить уведомление о тикете #{tid} для {sid}: {e}")
+    # Ставим сотрудника в режим чата
+    await state.set_state(AdminStates.waiting_ticket_reply)
+    await state.update_data(ticket_id=tid, ticket_buyer_id=buyer_id)
+    kb_staff = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await call.message.answer(
+        f"✅ Вы взяли тикет <b>#{tid}</b>\n\n"
+        f"Пользователь: <code>{buyer_id}</code>\n\n"
+        "Отправляйте сообщения прямо здесь — покупатель получит их в боте.\n"
+        "Для закрытия тикета нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=kb_staff,
+    )
+    await call.answer()
+    # Уведомляем покупателя
+    try:
+        await bot.send_message(
+            buyer_id,
+            f"🟢 <b>Сотрудник взял ваш тикет #{tid} в работу!</b>\n\n"
+            "Он напишет вам в ближайшее время. Можете также написать первыми — "
+            "любое ваше сообщение в боте дойдёт до него.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить покупателя {buyer_id}: {e}")
+
+
+@dp.callback_query(F.data.startswith("tkt:close:"))
+async def cb_tkt_close(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник закрывает тикет."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket:
+        await call.answer("Тикет не найден.", show_alert=True)
+        return
+    ok = await db_close_ticket(tid)
+    if not ok:
+        await call.answer("Тикет уже закрыт.", show_alert=True)
+        return
+    buyer_id = int(ticket["user_tg_id"])
+    await state.clear()
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(f"✅ Тикет <b>#{tid}</b> закрыт.", parse_mode="HTML")
+    await call.answer()
+    # Уведомляем покупателя и сбрасываем его FSM
+    try:
+        buyer_fsm = FSMContext(
+            storage=dp.storage,
+            key=StorageKey(bot_id=bot.id, chat_id=buyer_id, user_id=buyer_id),
+        )
+        await buyer_fsm.clear()
+        kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Открыть новый тикет", callback_data="support:ticket")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await bot.send_message(
+            buyer_id,
+            f"✅ <b>Ваш тикет #{tid} закрыт сотрудником.</b>\n\n"
+            "Проблема решена? Если что-то ещё осталось — откройте новый тикет.",
+            parse_mode="HTML",
+            reply_markup=kb_buyer,
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить покупателя {buyer_id} о закрытии тикета: {e}")
+
+
+@dp.callback_query(F.data.startswith("tkt:exit:"))
+async def cb_tkt_exit(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель выходит из режима чата (тикет остаётся открытым)."""
+    await state.clear()
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        tid = 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Вернуться в чат", callback_data=f"tkt:resume:{tid}")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>Вы вышли из чата тикета #{tid}.</b>\n\n"
+        "Тикет остаётся открытым — сотрудник может ответить в любой момент, "
+        "вы получите уведомление. Чтобы вернуться в чат — нажмите кнопку ниже.",
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:staff_exit:"))
+async def cb_tkt_staff_exit(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник выходит из режима чата (тикет остаётся открытым)."""
+    if not _is_staff(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        tid = 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Вернуться к тикету", callback_data=f"tkt:staff_resume:{tid}")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>Вы вышли из чата тикета #{tid}.</b>\n\n"
+        "Тикет остаётся открытым. Покупатель может написать вам "
+        "— вы получите сообщение с кнопкой «Ответить».",
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:resume:"))
+async def cb_tkt_resume(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель возвращается в чат активного тикета."""
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket or ticket["status"] == "closed":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Новый тикет", callback_data="support:ticket")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await send_or_edit(call, f"Тикет #{tid} уже закрыт.", kb)
+        await call.answer()
+        return
+    if int(ticket["user_tg_id"]) != call.from_user.id:
+        await call.answer("Это не ваш тикет.", show_alert=True)
+        return
+    await state.set_state(ShopStates.waiting_ticket_chat)
+    await state.update_data(ticket_id=tid)
+    kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:exit:{tid}")],
+    ])
+    await send_or_edit(
+        call,
+        f"↩️ <b>Вы вернулись в чат тикета #{tid}.</b>\n\n"
+        "Пишите сообщения — они дойдут до сотрудника.",
+        kb_buyer,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:staff_resume:"))
+async def cb_tkt_staff_resume(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник возвращается в чат тикета."""
+    if not _is_staff(call.from_user.id):
+        await call.answer()
+        return
+    try:
+        tid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket or ticket["status"] == "closed":
+        await call.answer("Тикет уже закрыт.", show_alert=True)
+        return
+    buyer_id = int(ticket["user_tg_id"])
+    await state.set_state(AdminStates.waiting_ticket_reply)
+    await state.update_data(ticket_id=tid, ticket_buyer_id=buyer_id)
+    kb_staff = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Выйти из чата", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await send_or_edit(
+        call,
+        f"↩️ <b>Вы вернулись в чат тикета #{tid}.</b>\n\n"
+        "Отправляйте сообщения — они дойдут до покупателя.",
+        kb_staff,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tkt:reply:"))
+async def cb_tkt_reply(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник нажимает «Ответить» на сообщение покупателя вне FSM-чата."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":")
+        tid = int(parts[2])
+        buyer_id = int(parts[3])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    ticket = await db_get_ticket(tid)
+    if not ticket or ticket["status"] == "closed":
+        await call.answer("Тикет уже закрыт.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_ticket_reply)
+    await state.update_data(ticket_id=tid, ticket_buyer_id=buyer_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await call.message.answer(
+        f"✍️ <b>Ответ на тикет #{tid}</b>\n\nОтправьте сообщение (текст или фото):",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+# ---- Входящие сообщения в режиме чата ----
+
+@dp.message(ShopStates.waiting_ticket_chat)
+async def msg_ticket_chat(message: Message, state: FSMContext) -> None:
+    """Покупатель пишет в активный тикет."""
+    await _try_delete(message)
+    data = await state.get_data()
+    tid = int(data.get("ticket_id", 0))
+    ticket = await db_get_ticket(tid) if tid else None
+    if not ticket or ticket["status"] == "closed":
+        await state.clear()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Открыть новый тикет", callback_data="support:ticket")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await message.answer("Ваш тикет уже закрыт.", reply_markup=kb)
+        return
+    buyer_id = message.from_user.id
+    staff_id = ticket.get("assigned_to")
+    text = (message.text or message.caption or "").strip()
+    photo_id = message.photo[-1].file_id if message.photo else None
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    msg_header = (
+        f"💬 <b>Покупатель (тикет #{tid})</b>\n"
+        f"{escape(user.first_name or '')} ({escape(username)})\n"
+        f"<code>{buyer_id}</code>"
+    )
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"tkt:reply:{tid}:{buyer_id}")],
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+    ])
+    sent = False
+    if staff_id:
+        try:
+            if photo_id:
+                await bot.send_photo(
+                    chat_id=staff_id, photo=photo_id,
+                    caption=f"{msg_header}\n\n{escape(text)}" if text else msg_header,
+                    parse_mode="HTML", reply_markup=reply_kb,
+                )
+            else:
+                await bot.send_message(
+                    staff_id,
+                    f"{msg_header}\n\n{escape(text)}",
+                    parse_mode="HTML", reply_markup=reply_kb,
+                )
+            sent = True
+        except Exception as e:
+            logging.warning(f"Не удалось доставить сообщение сотруднику {staff_id}: {e}")
+    if not sent:
+        # Тикет ещё не взят — рассылаем всей команде
+        recipients = await db_get_can_moderate_recipients()
+        for staff in recipients:
+            sid = int(staff["tg_id"])
+            try:
+                if photo_id:
+                    await bot.send_photo(
+                        chat_id=sid, photo=photo_id,
+                        caption=f"{msg_header}\n\n{escape(text)}" if text else msg_header,
+                        parse_mode="HTML", reply_markup=reply_kb,
+                    )
+                else:
+                    await bot.send_message(
+                        sid,
+                        f"{msg_header}\n\n{escape(text)}",
+                        parse_mode="HTML", reply_markup=reply_kb,
+                    )
+            except Exception as e:
+                logging.warning(f"Не удалось доставить сообщение покупателя сотруднику {sid}: {e}")
+    kb_buyer = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Выйти из чата (тикет остаётся)", callback_data=f"tkt:exit:{tid}")],
+    ])
+    await message.answer("📨 Отправлено.", reply_markup=kb_buyer)
+
+
+@dp.message(AdminStates.waiting_ticket_reply)
+async def msg_ticket_reply(message: Message, state: FSMContext) -> None:
+    """Сотрудник отвечает в тикет."""
+    if not _is_staff(message.from_user.id):
+        return
+    data = await state.get_data()
+    tid = int(data.get("ticket_id", 0))
+    buyer_id = int(data.get("ticket_buyer_id", 0))
+    ticket = await db_get_ticket(tid) if tid else None
+    if not ticket or ticket["status"] == "closed":
+        await state.clear()
+        await message.answer("Тикет уже закрыт.")
+        return
+    text = (message.text or message.caption or "").strip()
+    photo_id = message.photo[-1].file_id if message.photo else None
+    staff = message.from_user
+    staff_name = staff.first_name or str(staff.id)
+    reply_header = f"📩 <b>Ответ администратора (тикет #{tid})</b>"
+    resume_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Ответить", callback_data=f"tkt:resume:{tid}")],
+    ])
+    try:
+        if photo_id:
+            await bot.send_photo(
+                chat_id=buyer_id, photo=photo_id,
+                caption=f"{reply_header}\n\n{escape(text)}" if text else reply_header,
+                parse_mode="HTML", reply_markup=resume_kb,
+            )
+        else:
+            await bot.send_message(
+                buyer_id,
+                f"{reply_header}\n\n{escape(text)}",
+                parse_mode="HTML", reply_markup=resume_kb,
+            )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить покупателю: {e}")
+        return
+    # Сотрудник остаётся в FSM-чате для продолжения диалога
+    kb_staff = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"tkt:close:{tid}")],
+        [InlineKeyboardButton(text="❌ Выйти из чата", callback_data=f"tkt:staff_exit:{tid}")],
+    ])
+    await message.answer(
+        f"✅ Ответ отправлен покупателю.",
+        reply_markup=kb_staff,
+    )
+
+
+# =====================================================================
+# Раздел "Купить донат"
+# =====================================================================
+
+
+@dp.callback_query(F.data == "shop")
+async def cb_shop(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await show_section(
+        call, "shop", "<b>Купить донат</b>\n\nВыберите категорию:",
+        await kb_shop_dynamic(),
+    )
+    await call.answer()
+
+
+# --- Roblox моментально ---
+
+
+@dp.callback_query(F.data == "cat:roblox_instant")
+async def cb_roblox_instant(call: CallbackQuery) -> None:
+    cat = await db_get_category("roblox_instant")
+    cat_photo = await db_get_image("cat:roblox_instant")
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        await show_section(call, "roblox_instant",
+            f"⚠️ <b>Категория временно недоступна.</b>\n\n{escape(reason)}",
+            kb_back_main("shop"), photo=cat_photo)
+        await call.answer()
+        return
+    products = await db_get_products("roblox_instant")
+    label = f"{cat['emoji']} {cat['name']}" if cat else "Roblox — моментально"
+    await show_section(
+        call,
+        "roblox_instant",
+        f"<b>{label}</b>\n\nВыберите количество робуксов:",
+        kb_product_list(products, "rbi"),
+        photo=cat_photo,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("rbi:"))
+async def cb_roblox_instant_card(call: CallbackQuery) -> None:
+    key = call.data.split(":", 1)[1]
+    product = await db_get_product_by_key(key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, delivery = product
+    text = (
+        f"<b>{escape(name)}</b>\n\n"
+        f"Цена: <b>{price}₽</b>\n"
+        f"Способ выдачи: {escape(delivery)}\n"
+        "Способ оплаты: Оплата с внутреннего баланса бота\n\n"
+        "Для покупки на вашем внутреннем балансе должно быть достаточно средств."
+    )
+    prod_photo = await db_get_image(f"prod:{key}") or await db_get_image("cat:roblox_instant")
+    await show_section(
+        call,
+        "card_roblox_instant",
+        text,
+        kb_product_card(f"buy:rbi:{key}", "cat:roblox_instant", needs_login=True),
+        photo=prod_photo,
+    )
+    await call.answer()
+
+
+# --- Roblox геймпассом ---
+
+
+@dp.callback_query(F.data == "cat:roblox_gamepass")
+async def cb_roblox_gamepass(call: CallbackQuery, state: FSMContext) -> None:
+    cat = await db_get_category("roblox_gamepass")
+    cat_photo = await db_get_image("cat:roblox_gamepass")
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        text = (
+            "<b>🎮 Roblox — геймпассом (до 5 дней)</b>\n\n"
+            f"⚠️ <b>Данный способ покупки временно недоступен.</b>\n\n"
+            f"{escape(reason)}"
+        )
+        await show_section(call, "roblox_gamepass", text, kb_back_main("shop"), photo=cat_photo)
+        await call.answer()
+        return
+    gp_rate = float(await db_get_setting("robux_gamepass_rate", "0.65"))
+    text = (
+        "<b>🎮 Roblox — геймпассом (до 5 дней)</b>\n\n"
+        f"Курс: 1 робукс = {gp_rate}₽\n\n"
+        "Введите количество робуксов:"
+    )
+    sent = await show_section(call, "roblox_gamepass", text, kb_back_main("shop"), photo=cat_photo)
+    await state.set_state(ShopStates.waiting_robux_amount)
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_robux_amount)
+async def msg_robux_amount(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    qty = parse_positive_int(message.text)
+    if qty is None:
+        await _edit_prompt(
+            state,
+            "⚠️ Введите положительное число робуксов (например: 1500).",
+            kb_back_main("shop"),
+        )
+        return
+
+    gp_rate = float(await db_get_setting("robux_gamepass_rate", "0.65"))
+    gp_pass_rate = float(await db_get_setting("robux_gamepass_pass_price_rate", "0.7"))
+    price = max(1, round(qty * gp_rate))
+    gamepass_price = max(1, round(qty / gp_pass_rate))
+
+    await state.update_data(
+        robux_qty=qty,
+        robux_price=price,
+        robux_gamepass_price=gamepass_price,
+    )
+
+    text = (
+        f"<b>{e('roblox')} Roblox геймпассом</b>\n\n"
+        f"Количество: <b>{qty}</b> робуксов\n"
+        f"Курс оплаты: 1 робукс = {gp_rate}₽\n"
+        f"Итого к оплате: <b>{price}₽</b>\n"
+        f"Цена для создания геймпасса: <b>{gamepass_price} R$</b>\n"
+        "Срок: до 5 дней\n"
+        "Способ оплаты: Оплата с внутреннего баланса бота"
+    )
+    await _edit_prompt(
+        state,
+        text,
+        kb_calc_actions("buy:robux_gp", "cat:roblox_gamepass"),
+    )
+
+
+# --- Brawl Stars ---
+
+
+@dp.callback_query(F.data == "cat:brawl")
+async def cb_brawl(call: CallbackQuery) -> None:
+    cat = await db_get_category("brawl")
+    cat_photo = await db_get_image("cat:brawl")
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        await show_section(call, "brawl",
+            f"⚠️ <b>Категория временно недоступна.</b>\n\n{escape(reason)}",
+            kb_back_main("shop"), photo=cat_photo)
+        await call.answer()
+        return
+    brawl_products = await db_get_products("brawl")
+    label = f"{cat['emoji']} {cat['name']}" if cat else "Brawl Stars"
+    rows = [
+        [InlineKeyboardButton(text=f"{n} — {p}₽", callback_data=f"bs:{k}")]
+        for k, n, p, _ in brawl_products
+    ]
+    rows.append([InlineKeyboardButton(text="🎁 Другие акции", callback_data="bs:promo")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="shop")])
+    await show_section(
+        call, "brawl",
+        f"<b>{label}</b>\n\nВыберите товар:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+        photo=cat_photo,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "bs:promo")
+async def cb_brawl_promo(call: CallbackQuery) -> None:
+    text = (
+        "Чтобы узнать об актуальных акциях в категории Brawl Stars, "
+        f"напишите в Telegram: {BRAWL_PROMO_USERNAME}"
+    )
+    await show_section(
+        call, "brawl", text, kb_username_link(BRAWL_PROMO_USERNAME, "cat:brawl")
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("bs:"))
+async def cb_brawl_card(call: CallbackQuery) -> None:
+    key = call.data.split(":", 1)[1]
+    if key == "promo":
+        return
+    product = await db_get_product_by_key(key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, delivery = product
+    text = (
+        f"<b>{escape(name)}</b>\n\n"
+        f"Цена: <b>{price}₽</b>\n"
+        f"Способ выдачи: {escape(delivery)}\n"
+        "Способ оплаты: Оплата с внутреннего баланса бота"
+    )
+    prod_photo = await db_get_image(f"prod:{key}") or await db_get_image("cat:brawl")
+    await show_section(
+        call, "card_brawl", text, kb_product_card(f"buy:bs:{key}", "cat:brawl", needs_login=True),
+        photo=prod_photo,
+    )
+    await call.answer()
+
+
+# --- Telegram Stars ---
+
+
+@dp.callback_query(F.data == "cat:tgstars")
+async def cb_tgstars(call: CallbackQuery, state: FSMContext) -> None:
+    cat = await db_get_category("tgstars")
+    cat_photo = await db_get_image("cat:tgstars")
+    if cat and cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        text = (
+            f"<b>{e('tg_stars')} Telegram Stars</b>\n\n"
+            f"⚠️ <b>Данный способ покупки временно недоступен.</b>\n\n"
+            f"{escape(reason)}"
+        )
+        await show_section(call, "tgstars", text, kb_back_main("shop"), photo=cat_photo)
+        await call.answer()
+        return
+    stars_rate = float(await db_get_setting("tg_stars_rate", "1.3"))
+    text = (
+        f"<b>{e('tg_stars')} Telegram Stars</b>\n\n"
+        f"Курс: 1 звезда = {stars_rate}₽\n\n"
+        "Введите количество звёзд одним сообщением (например: 100):"
+    )
+    sent = await show_section(call, "tgstars", text, kb_back_main("shop"), photo=cat_photo)
+    await state.set_state(ShopStates.waiting_stars_amount)
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_stars_amount)
+async def msg_stars_amount(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    qty = parse_positive_int(message.text)
+    if qty is None:
+        await _edit_prompt(state,
+                           "⚠️ Введите положительное число звёзд (например: 100).",
+                           kb_back_main("shop"))
+        return
+    stars_rate = float(await db_get_setting("tg_stars_rate", "1.3"))
+    min_stars = int(await db_get_setting("min_tg_stars", "50"))
+    if qty < min_stars:
+        await _edit_prompt(state,
+                           f"⚠️ Минимальное количество — {min_stars} звёзд.\n"
+                           "Попробуйте ещё раз:",
+                           kb_back_main("shop"))
+        return
+    price = max(1, round(qty * stars_rate))
+    await state.update_data(stars_qty=qty, stars_price=price)
+    text = (
+        f"<b>Telegram Stars</b>\n\n"
+        f"Количество: <b>{qty}</b> ⭐\n"
+        f"Курс: 1 звезда = {stars_rate}₽\n"
+        f"Итого: <b>{price}₽</b>\n"
+        f"Минимум: <b>{min_stars} звёзд</b>\n"
+        "Способ выдачи: моментально\n"
+        "Способ оплаты: Оплата с внутреннего баланса бота"
+    )
+    await _edit_prompt(state, text, kb_calc_actions("buy:stars", "cat:tgstars"))
+
+
+# --- Другие приложения ---
+
+
+@dp.callback_query(F.data == "cat:other")
+async def cb_other(call: CallbackQuery) -> None:
+    text = (
+        "Для получения информации по донату в других приложениях "
+        f"напишите в Telegram: {OTHER_APPS_USERNAME}"
+    )
+    cat_photo = await db_get_image("cat:other")
+    await show_section(
+        call, "other", text, kb_username_link(OTHER_APPS_USERNAME, "shop"),
+        photo=cat_photo,
+    )
+    await call.answer()
+
+
+# --- Универсальный хендлер для DB-категорий (создаваемых через админку) ---
+
+
+# Набор ключей с собственными хендлерами — generic-хендлер их игнорирует
+_BUILTIN_CAT_KEYS = frozenset({"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"})
+
+
+@dp.callback_query(F.data.startswith("cat:"))
+async def cb_cat_generic(call: CallbackQuery) -> None:
+    key = call.data.split(":", 1)[1]
+    if key in _BUILTIN_CAT_KEYS:
+        return  # обрабатывается отдельными хендлерами выше
+    await call.answer()
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    name = f"{cat['emoji']} {cat['name']}"
+    if cat["disabled"]:
+        reason = cat.get("disabled_reason") or "Временно недоступно."
+        await show_section(call, key,
+            f"⚠️ <b>{escape(name)}</b>\n\n<b>Категория временно недоступна.</b>\n\n{escape(reason)}",
+            kb_back_main("shop"))
+        return
+    products = await db_get_products(key)
+    if not products:
+        await show_section(call, key,
+            f"<b>{escape(name)}</b>\n\nТоваров пока нет.", kb_back_main("shop"))
+        return
+    cat_image = await db_get_image(f"cat:{key}")
+    await show_section(call, key,
+        f"<b>{escape(name)}</b>\n\nВыберите товар:",
+        kb_product_list(products, f"cp:{key}", "shop"),
+        photo=cat_image)
+
+
+@dp.callback_query(F.data.startswith("cp:"))
+async def cb_cat_prod_card(call: CallbackQuery) -> None:
+    """Карточка товара из DB-категории."""
+    await call.answer()
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        return
+    cat_key, prod_key = parts[1], parts[2]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, delivery = product
+    cat = await db_get_category(cat_key)
+    cat_name = f"{cat['emoji']} {cat['name']}" if cat else cat_key
+    text = (
+        f"<b>{escape(name)}</b>\n\n"
+        f"Цена: <b>{price}₽</b>\n"
+        f"Способ выдачи: {escape(delivery)}\n"
+        "Способ оплаты: Оплата с внутреннего баланса бота\n\n"
+        "Для покупки на вашем внутреннем балансе должно быть достаточно средств."
+    )
+    prod_image = await db_get_image(f"prod:{prod_key}")
+    cat_image = await db_get_image(f"cat:{cat_key}")
+    cat_needs_login = await order_needs_login(cat_key)
+    await show_section(call, f"card_{cat_key}", text,
+        kb_product_card(f"buy_cp:{cat_key}:{prod_key}", f"cat:{cat_key}",
+                        needs_login=cat_needs_login),
+        photo=prod_image or cat_image)
+
+
+@dp.callback_query(F.data.startswith("buy_cp:"))
+async def cb_buy_cat_prod(call: CallbackQuery, state: FSMContext) -> None:
+    """Оплата товара из DB-категории."""
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        return
+    cat_key, prod_key = parts[1], parts[2]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    cat = await db_get_category(cat_key)
+    _, name, price, _ = product
+    cat_name = cat["name"] if cat else cat_key
+    title = f"{cat_name} — {name}"
+    await perform_purchase(call, title, float(price), category=cat_key, state=state)
+
+
+# =====================================================================
+# Покупка / списание с баланса
+# =====================================================================
+
+
+
+async def _find_reminder_promo(tg_id: int, already_applied_id) -> dict | None:
+    """Ищет первый подходящий неиспользованный промокод на скидку в профиле
+    пользователя (discount_pct > 0, promo_price == 0, не использован, активен).
+    Исключает already_applied_id — тот уже учтён при расчёте."""
+    user_promos = await db_get_user_promos(tg_id)
+    for p in user_promos:
+        if p.get("used_at") is not None:
+            continue
+        if not p.get("is_active"):
+            continue
+        if not (p.get("discount_pct") or 0) > 0:
+            continue
+        if (p.get("promo_price") or 0) > 0:          # фиксированная цена — пропускаем
+            continue
+        if p["promo_id"] == already_applied_id:       # уже применён автоматически
+            continue
+        if not _promo_is_valid_now(p):
+            continue
+        return p
+    return None
+
+
+async def _show_purchase_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    """Рендерит экран подтверждения оплаты по данным из FSM (_pnd_*)."""
+    data = await state.get_data()
+    title: str = data.get("_pnd_title") or ""
+    final_price: float = data.get("_pnd_final") or 0.0
+    original_price: float = data.get("_pnd_orig") or 0.0
+    level_disc: int = data.get("_pnd_ldsc") or 0
+    promo_disc: int = data.get("_pnd_pdsc") or 0
+
+    balance = await db_get_balance(call.from_user.id)
+
+    if level_disc or promo_disc:
+        disc_parts = []
+        if level_disc:
+            disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
+        if promo_disc:
+            disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
+        price_block = (
+            f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+            + "\n".join(disc_parts) + "\n"
+            + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+        )
+    else:
+        price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
+
+    enough = balance >= final_price
+    text = (
+        "🛒 <b>Подтверждение оплаты</b>\n\n"
+        f"📦 {escape(title)}\n\n"
+        f"{price_block}\n"
+        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+        + ("✅ Баланса достаточно для оплаты." if enough
+           else "❌ Недостаточно средств на балансе!")
+    )
+    if enough:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить оплату",
+                                  callback_data="confirm_purchase")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+    await send_or_edit(call, text, kb)
+
+
+async def perform_purchase(
+    call: CallbackQuery,
+    title: str,
+    price: float,
+    category: str | None = None,
+    extra: dict | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    """Показывает экран подтверждения с итоговой ценой (с учётом реф. скидки).
+    Если категория требует данные для входа — сначала запрашивает их.
+    Фактическое списание происходит в confirm_purchase."""
+    await call.answer()
+    user = call.from_user
+
+    # Если нужны данные для входа — запрашиваем ДО оплаты
+    if state is not None and await _needs_pre_purchase_login(category):
+        fsm_data = await state.get_data()
+        pre_login = fsm_data.get("_pnd_pre_login")
+        if not pre_login:
+            # Сохраняем намерение покупки в FSM
+            await state.update_data(
+                _pre_title=title,
+                _pre_price=price,
+                _pre_cat=category,
+                _pre_extra=extra,
+            )
+            await state.set_state(ShopStates.waiting_pre_purchase_login)
+            # Определяем подсказку для пользователя (редактируется в админ-панели)
+            login_hint = await _get_login_hint(category)
+            if login_hint:
+                prompt = (
+                    "🔐 <b>Данные для входа</b>\n\n"
+                    f"{escape(login_hint)}\n\n"
+                    "Отправьте данные одним сообщением прямо сюда.\n"
+                    "<i>Модератор получит их для выполнения заказа.</i>"
+                )
+            else:
+                prompt = (
+                    "🔐 <b>Данные для входа</b>\n\n"
+                    "Перед оплатой отправьте данные для входа одним сообщением.\n"
+                    "<i>Модератор получит их для выполнения заказа.</i>"
+                )
+            cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")]
+            ])
+            sent = await send_or_edit(call, prompt, cancel_kb)
+            await state.update_data(
+                _prompt_chat_id=sent.chat.id,
+                _prompt_msg_id=sent.message_id,
+            )
+            return
+
+    user_row, _ = await db_get_or_create_user(user)
+
+    original_price = float(price)
+
+    # Скидка по активному реф./pct промокоду (для приглашённых пользователей)
+    # Проверяем тип заранее, чтобы не применять level_disc вместе с pct_discount
+    _no_discount_cat = category in ("tgstars", "roblox_gamepass")
+    _active_promo_id_check = user_row.get("active_ref_promo") if not _no_discount_cat else None
+    _active_promo_for_check = (
+        await db_get_promo_by_id(_active_promo_id_check)
+        if _active_promo_id_check else None
+    )
+    _has_active_pct = (
+        _active_promo_for_check is not None
+        and _active_promo_for_check.get("game") == "pct_discount"
+        and _active_promo_for_check.get("discount_pct", 0) > 0
+    )
+
+    # Автоматическая скидка по реферальному уровню (не для TG Stars / геймпасса, не если активен pct_discount)
+    level = (user_row.get("referral_level") or 0) if (not _no_discount_cat and not _has_active_pct) else 0
+    level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
+
+    promo_disc = 0
+    applied_ref_promo_id = None
+    if not _no_discount_cat:
+        active_promo_id = _active_promo_id_check
+        if active_promo_id:
+            ref_promo = await db_get_promo_by_id(active_promo_id)
+            if ref_promo and ref_promo.get("discount_pct", 0) > 0:
+                user_promo_list = await db_get_user_promos(user.id)
+                up = next(
+                    (p for p in user_promo_list
+                     if p["promo_id"] == active_promo_id and p.get("used_at") is None),
+                    None,
+                )
+                if up:
+                    promo_disc = ref_promo["discount_pct"]
+                    applied_ref_promo_id = active_promo_id
+
+    final_price = original_price * (1 - level_disc / 100) * (1 - promo_disc / 100)
+
+    if state is not None:
+        await state.update_data(
+            _pnd_title=title,
+            _pnd_final=final_price,
+            _pnd_orig=original_price,
+            _pnd_cat=category,
+            _pnd_extra=extra,
+            _pnd_ldsc=level_disc,
+            _pnd_pdsc=promo_disc,
+            _pnd_pid=applied_ref_promo_id,
+        )
+
+    # Напоминание о неиспользованном промокоде на скидку.
+    # Показываем только если прomo-скидка ВЫГОДНЕЕ текущей реф.-уровневой.
+    # Скидки не суммируются: промо заменяет реф. уровень.
+    if state is not None and promo_disc == 0 and category not in ("tgstars", "roblox_gamepass"):
+        reminder = await _find_reminder_promo(user.id, applied_ref_promo_id)
+        if reminder:
+            disc = reminder["discount_pct"]
+            # Не показываем напоминание, если реф. уровень уже даёт бо́льшую скидку
+            if disc <= level_disc:
+                reminder = None
+        if reminder:
+            disc = reminder["discount_pct"]
+            code = reminder["code"]
+            pid  = reminder["promo_id"]
+            level_note = (
+                f"\n<i>Ваша скидка по реф. уровню ({level_disc}%) будет заменена.</i>"
+                if level_disc > 0 else ""
+            )
+            remind_text = (
+                "🎟️ <b>У вас есть неиспользованный промокод!</b>\n\n"
+                f"Код: <code>{escape(code)}</code>\n"
+                f"Скидка: <b>-{disc}%</b>{level_note}\n\n"
+                "Хотите применить его к этой покупке?\n"
+                "<i>Если откажетесь — промокод останется в вашем профиле.</i>"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"✅ Применить скидку -{disc}%",
+                    callback_data=f"promo_reminder:apply:{pid}",
+                )],
+                [InlineKeyboardButton(
+                    text="➡️ Купить без скидки",
+                    callback_data="promo_reminder:skip",
+                )],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+            ])
+            await send_or_edit(call, remind_text, kb)
+            return
+
+    await _show_purchase_confirm(call, state) if state is not None else None
+    if state is None:
+        # state не передан — рендерим напрямую (старый путь)
+        balance = await db_get_balance(user.id)
+        if level_disc or promo_disc:
+            disc_parts = []
+            if level_disc:
+                disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
+            if promo_disc:
+                disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
+            price_block = (
+                f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+                + "\n".join(disc_parts) + "\n"
+                + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+            )
+        else:
+            price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
+        enough = balance >= final_price
+        text = (
+            "🛒 <b>Подтверждение оплаты</b>\n\n"
+            f"📦 {escape(title)}\n\n"
+            f"{price_block}\n"
+            f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+            + ("✅ Баланса достаточно для оплаты." if enough
+               else "❌ Недостаточно средств на балансе!")
+        )
+        if enough:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Подтвердить оплату",
+                                      callback_data="confirm_purchase")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+            ])
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ])
+        await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data == "confirm_purchase")
+async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
+    """Выполняет покупку, данные которой сохранены в FSM perform_purchase."""
+    await call.answer()
+    data = await state.get_data()
+
+    title: str | None = data.get("_pnd_title")
+    final_price: float | None = data.get("_pnd_final")
+    original_price: float = data.get("_pnd_orig") or 0.0
+    category: str | None = data.get("_pnd_cat")
+    extra: dict | None = data.get("_pnd_extra")
+    level_disc: int = data.get("_pnd_ldsc") or 0
+    promo_disc: int = data.get("_pnd_pdsc") or 0
+    applied_ref_promo_id = data.get("_pnd_pid")
+
+    if not title or final_price is None:
+        await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+
+    user = call.from_user
+
+    if user.id in _processing_payments:
+        await call.answer("Платёж уже обрабатывается, подождите...", show_alert=True)
+        return
+    _processing_payments.add(user.id)
+    try:
+        ok = await db_try_charge(user.id, final_price)
+        if not ok:
+            balance = await db_get_balance(user.id)
+            text = (
+                "❌ <b>Недостаточно средств на балансе.</b>\n\n"
+                f"Сумма заказа: {_fmt_price(final_price)}₽\n"
+                f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
+                "Пополните баланс и повторите попытку."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ])
+            await send_or_edit(call, text, kb)
+            return
+
+        gamepass_price = None
+        if category == "roblox_gamepass" and extra:
+            raw_gamepass_price = extra.get("gamepass_price")
+            if raw_gamepass_price:
+                gamepass_price = int(raw_gamepass_price)
+        order_id = await db_create_order(
+            user.id,
+            title,
+            final_price,
+            status="Оплачен",
+            category=category,
+            gamepass_price=gamepass_price,
+        )
+        await db_add_transaction(user.id, -final_price, kind="purchase",
+                                 reason=f"Заказ #{order_id}: {title}")
+
+        if applied_ref_promo_id:
+            await db_use_promo(user.id, applied_ref_promo_id)
+            await db_set_active_ref_promo(user.id, None)
+
+        # Сохраняем данные для входа, введённые ДО оплаты
+        pre_login = data.get("_pnd_pre_login")
+        if pre_login:
+            await db_set_order_login(order_id, pre_login)
+
+        # Сбрасываем pending-данные и FSM-состояние (могло остаться waiting_pre_purchase_login)
+        await state.set_state(None)
+        await state.update_data(
+            _pnd_title=None, _pnd_final=None, _pnd_orig=None,
+            _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
+            _pnd_pdsc=None, _pnd_pid=None, _pnd_pre_login=None,
+            _pre_title=None, _pre_price=None, _pre_cat=None, _pre_extra=None,
+        )
+    finally:
+        _processing_payments.discard(user.id)
+
+    new_balance = await db_get_balance(user.id)
+    # Текст после оплаты: сначала берём текст из админки, затем встроенный дефолт
+    if category in LOGIN_HINTS:
+        login_hint = await _get_login_hint(category)
+        needs_code = False
+    elif category:
+        _cat_obj = await db_get_category(category)
+        login_hint = _cat_obj.get("login_hint") if _cat_obj else None
+        needs_code = bool(_cat_obj.get("needs_code")) if _cat_obj else False
+    else:
+        login_hint = None
+        needs_code = False
+    # Определяем метку кнопки данных для входа
+    if category == "roblox_gamepass":
+        login_label = "🔗 Отправить ссылку на геймпасс"
+    elif pre_login:
+        login_label = "✏️ Изменить данные для входа"
+    else:
+        login_label = "🔐 Отправить данные для входа"
+
+    disc_line = ""
+    if level_disc:
+        disc_line += f"🏆 Скидка реф. уровень: <b>-{level_disc}%</b>\n"
+    if promo_disc:
+        disc_line += f"🎟️ Промокод: <b>-{promo_disc}%</b>\n"
+    if disc_line and original_price != final_price:
+        disc_line += f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+
+    text = (
+        "✅ <b>Оплата прошла успешно. Заказ принят в обработку.</b>\n\n"
+        f"🧾 Номер заказа: <code>#{order_id}</code>\n"
+        f"🎁 Товар: {escape(title)}\n"
+        f"{disc_line}"
+        f"💰 Сумма: <b>{_fmt_price(final_price)}₽</b>\n"
+        f"💼 Остаток на балансе: <b>{_fmt_price(new_balance)}₽</b>\n\n"
+    )
+
+    if category == "roblox_gamepass":
+        if extra:
+            gp_price = extra.get("gamepass_price")
+            if gp_price:
+                text += f"🎮 <b>Цена для создания геймпасса:</b> <b>{gp_price} R$</b>\n\n"
+                text += (
+                    f"🔗 Создайте геймпасс в Roblox на сумму <b>{gp_price} R$</b> "
+                    "и нажмите «Отправить ссылку на геймпасс». "
+                    "Пришлите ссылку одним сообщением. "
+                    "Никакие данные от аккаунта и коды отправлять не нужно."
+                )
+            else:
+                text += (
+                    "🔗 Создайте геймпасс в Roblox на нужную сумму и нажмите "
+                    "«Отправить ссылку на геймпасс». Пришлите ссылку одним "
+                    "сообщением. Никакие данные от аккаунта и коды отправлять не нужно."
+                )
+        else:
+            text += (
+                "🔗 Создайте геймпасс в Roblox на нужную сумму и нажмите "
+                "«Отправить ссылку на геймпасс». Пришлите ссылку одним "
+                "сообщением. Никакие данные от аккаунта и коды отправлять не нужно."
+            )
+    elif pre_login and login_hint:
+        # Данные уже получены до оплаты
+        text += (
+            "✅ <b>Данные для входа получены.</b>\n"
+            "Модератор уже их видит. При необходимости измените их кнопкой ниже."
+        )
+        if needs_code:
+            text += (
+                "\n\n📨 Если на почту придёт код подтверждения, когда "
+                "модератор будет заходить — пришлите его кнопкой "
+                "«Отправить код для входа»."
+            )
+    elif login_hint:
+        text += (
+            "🔐 <b>Для выполнения заказа нужны данные для входа.</b>\n"
+            f"{escape(login_hint)}\n\n"
+            "Нажмите «Отправить данные для входа» и пришлите их одним "
+            "сообщением — модератор получит их вместе с заказом."
+        )
+        if needs_code:
+            if category and category.startswith("roblox"):
+                text += (
+                    "\n\n📨 <b>Если у вас подключён двухфакторный вход</b> "
+                    "(2FA) — на почту придёт код, когда модератор будет "
+                    "заходить на аккаунт. Пришлите код кнопкой «Отправить "
+                    "код для входа»."
+                )
+            else:
+                text += (
+                    "\n\n📨 Если на почту придёт код подтверждения, когда "
+                    "модератор будет заходить — пришлите его кнопкой "
+                    "«Отправить код для входа»."
+                )
+    else:
+        text += "Выберите удобный способ связи с модератором:"
+
+    await send_or_edit(
+        call,
+        text,
+        kb_after_purchase(
+            order_id,
+            needs_login=bool(login_hint),
+            needs_code=needs_code,
+            login_label=login_label,
+        ),
+    )
+    await call.answer("Заказ создан")
+
+    username = f"@{user.username}" if user.username else "—"
+    admin_rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="✅ Завершить заказ",
+                              callback_data=f"ordone:{order_id}:{user.id}")],
+        [InlineKeyboardButton(text="✍️ Написать покупателю",
+                              callback_data=f"ord_write_buyer:{order_id}:{user.id}")],
+        [InlineKeyboardButton(text="📧 Запросить код из почты",
+                              callback_data=f"mod:req_email:{order_id}:{user.id}")],
+        [InlineKeyboardButton(text="💸 Возврат",
+                              callback_data=f"mod:refund:{order_id}")],
+    ]
+    if category == "roblox_gamepass" and extra:
+        gp_price = int(extra.get("gamepass_price", 0))
+        if gp_price > 0:
+            admin_rows.insert(0, [InlineKeyboardButton(
+                text="🎮 Попросить изменить цену геймпасса",
+                callback_data=f"gpfix:{order_id}:{user.id}:{gp_price}",
+            )])
+
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=admin_rows)
+    disc_note = f" (скидка {level_disc + promo_disc}%)" if level_disc or promo_disc else ""
+    admin_text = (
+        f"🆕 <b>Новый заказ #{order_id}</b>\n\n"
+        f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>\n"
+        f"Товар: {escape(title)}\n"
+        f"Сумма: {_fmt_price(final_price)}₽{disc_note}\n"
+        f"Статус: Оплачен"
+    )
+    if category == "roblox_gamepass" and extra:
+        gp_price = extra.get("gamepass_price")
+        if gp_price:
+            admin_text += f"\nЦена геймпасса: <b>{gp_price} R$</b> (допуск ±5 R$)"
+    # Данные для входа, введённые ДО оплаты — включаем прямо в уведомление о заказе
+    if pre_login:
+        admin_text += f"\n\n🔐 <b>Данные для входа:</b>\n<pre>{escape(pre_login)}</pre>"
+    await notify_moderator_order(
+        admin_text, reply_markup=admin_kb, order_id=order_id
+    )
+
+@dp.callback_query(F.data.startswith("promo_reminder:apply:"))
+async def cb_promo_reminder_apply(call: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь выбрал применить найденный промокод на скидку."""
+    await call.answer()
+    parts = call.data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    promo_id = int(parts[2])
+    data = await state.get_data()
+
+    if not data.get("_pnd_title"):
+        await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+
+    # Проверяем промокод ещё раз (вдруг использовали в другой вкладке)
+    user_promos = await db_get_user_promos(call.from_user.id)
+    up = next(
+        (p for p in user_promos
+         if p["promo_id"] == promo_id and p.get("used_at") is None),
+        None,
+    )
+    if not up or not _promo_is_valid_now(up):
+        await call.answer(
+            "❌ Промокод уже использован или истёк.", show_alert=True
+        )
+        await _show_purchase_confirm(call, state)
+        return
+
+    disc = up["discount_pct"]
+    original_price: float = data.get("_pnd_orig") or 0.0
+    # Скидки не суммируются: промокод заменяет реф. уровень
+    final_price = original_price * (1 - disc / 100)
+
+    await state.update_data(
+        _pnd_final=final_price,
+        _pnd_pdsc=disc,
+        _pnd_pid=promo_id,
+        _pnd_ldsc=0,   # реф. уровень снят — применяется промокод
+    )
+    await _show_purchase_confirm(call, state)
+
+
+@dp.callback_query(F.data == "promo_reminder:skip")
+async def cb_promo_reminder_skip(call: CallbackQuery, state: FSMContext) -> None:
+    """Пользователь отказался применять промокод — промокод остаётся в профиле."""
+    await call.answer()
+    if not (await state.get_data()).get("_pnd_title"):
+        await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+    await _show_purchase_confirm(call, state)
+
+
+
+
+# --- Ввод данных для входа ДО оплаты ---
+
+@dp.message(ShopStates.waiting_pre_purchase_login)
+async def msg_pre_purchase_login(message: Message, state: FSMContext) -> None:
+    """Пользователь присылает данные для входа до оплаты."""
+    await _try_delete(message)
+    payload = (message.text or "").strip()
+    if not payload:
+        await _edit_prompt(
+            state,
+            "⚠️ Пустое сообщение. Пришлите данные для входа текстом.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="main")]
+            ]),
+        )
+        return
+
+    data = await state.get_data()
+    title = data.get("_pre_title", "")
+    price = float(data.get("_pre_price") or 0)
+    category = data.get("_pre_cat")
+    extra = data.get("_pre_extra")
+
+    # Сохраняем данные в FSM — perform_purchase подхватит их
+    await state.update_data(_pnd_pre_login=payload)
+
+    # Рассчитываем цену с учётом скидок (дублируем логику perform_purchase)
+    user_row, _ = await db_get_or_create_user(message.from_user)
+    original_price = price
+
+    _no_disc = category in ("tgstars", "roblox_gamepass")
+    _active_promo_id = user_row.get("active_ref_promo") if not _no_disc else None
+    _active_promo = await db_get_promo_by_id(_active_promo_id) if _active_promo_id else None
+    _has_active_pct = (
+        _active_promo is not None
+        and _active_promo.get("game") == "pct_discount"
+        and _active_promo.get("discount_pct", 0) > 0
+    )
+    level = (user_row.get("referral_level") or 0) if (not _no_disc and not _has_active_pct) else 0
+    level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
+
+    promo_disc = 0
+    applied_ref_promo_id = None
+    if not _no_disc and _active_promo_id:
+        if _active_promo and _active_promo.get("discount_pct", 0) > 0:
+            user_promo_list = await db_get_user_promos(message.from_user.id)
+            up = next(
+                (p for p in user_promo_list
+                 if p["promo_id"] == _active_promo_id and p.get("used_at") is None),
+                None,
+            )
+            if up:
+                promo_disc = _active_promo["discount_pct"]
+                applied_ref_promo_id = _active_promo_id
+
+    final_price = original_price * (1 - level_disc / 100) * (1 - promo_disc / 100)
+
+    await state.update_data(
+        _pnd_title=title,
+        _pnd_final=final_price,
+        _pnd_orig=original_price,
+        _pnd_cat=category,
+        _pnd_extra=extra,
+        _pnd_ldsc=level_disc,
+        _pnd_pdsc=promo_disc,
+        _pnd_pid=applied_ref_promo_id,
+    )
+
+    # Показываем экран подтверждения
+    balance = await db_get_balance(message.from_user.id)
+    if level_disc or promo_disc:
+        disc_parts = []
+        if level_disc:
+            disc_parts.append(f"🏆 Реф. уровень: <b>-{level_disc}%</b>")
+        if promo_disc:
+            disc_parts.append(f"🎟️ Промокод: <b>-{promo_disc}%</b>")
+        price_block = (
+            f"💵 Цена без скидки: <s>{_fmt_price(original_price)}₽</s>\n"
+            + "\n".join(disc_parts) + "\n"
+            + f"💰 Итого к оплате: <b>{_fmt_price(final_price)}₽</b>"
+        )
+    else:
+        price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
+
+    enough = balance >= final_price
+    confirm_text = (
+        "🛒 <b>Подтверждение оплаты</b>\n\n"
+        f"📦 {escape(title)}\n\n"
+        f"{price_block}\n"
+        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+        + ("✅ Баланса достаточно для оплаты." if enough
+           else "❌ Недостаточно средств на балансе!")
+    )
+    if enough:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить оплату",
+                                  callback_data="confirm_purchase")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+    await _edit_prompt(state, confirm_text, kb)
+    # Сбрасываем FSM-состояние: пользователь уже ввёл данные и видит кнопку "Подтвердить".
+    # Без этого любой следующий текст снова запустит хендлер и перезапишет данные.
+    await state.set_state(None)
+
+
+# --- Запрос / изменение данных для входа после покупки ---
+
+
+@dp.callback_query(F.data.startswith("send_login:"))
+async def cb_send_login(call: CallbackQuery, state: FSMContext) -> None:
+    parts = call.data.split(":")
+    order_id = int(parts[1])
+    needs_code = len(parts) > 2 and parts[2] == "1"
+    await state.set_state(ShopStates.waiting_login_data)
+    text = (
+        f"🔐 Отправьте данные для входа по заказу <b>#{order_id}</b> "
+        "одним сообщением.\n\n"
+        "Например: логин/пароль, ссылка на геймпасс, Supercell ID, "
+        "@username и т.д."
+    )
+    sent = await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    await state.update_data(login_order_id=order_id, login_needs_code=needs_code,
+                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_login_data)
+async def msg_login_data(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    payload = (message.text or "").strip()
+    data = await state.get_data()
+    order_id = int(data.get("login_order_id", 0))
+    needs_code = bool(data.get("login_needs_code", False))
+    if not payload:
+        await _edit_prompt(state, "⚠️ Пустое сообщение. Пришлите данные текстом.",
+                           kb_back_main(f"order_actions:{order_id}"))
+        return
+    await state.clear()
+
+    if order_id:
+        await db_set_order_login(order_id, payload)
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    order = await db_get_order(order_id) if order_id else None
+    if not order or order.get("tg_id") != user.id:
+        await message.answer("⚠️ Заказ не найден или недоступен.")
+        return
+    await notify_assigned_staff(
+        order_id,
+        f"🔐 Данные для входа по заказу <b>#{order_id}</b>\n\n"
+        f"<pre>{escape(payload)}</pre>\n"
+        f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>",
+    )
+
+    text = (
+        f"✅ Спасибо! Данные по заказу <b>#{order_id}</b> переданы модератору.\n"
+        "Скоро с вами свяжутся."
+    )
+    if needs_code:
+        text += (
+            "\n\n📨 Когда модератор будет заходить на аккаунт — вам "
+            "может прийти код подтверждения. Пришлите его кнопкой "
+            "<b>«Отправить код для входа»</b> ниже."
+        )
+    await _state_edit(
+        message, state, text,
+        kb_after_purchase(order_id, needs_login=False, needs_code=needs_code),
+    )
+
+
+@dp.callback_query(F.data.startswith("send_code:"))
+async def cb_send_code(call: CallbackQuery, state: FSMContext) -> None:
+    order_id = int(call.data.split(":", 1)[1])
+    await state.set_state(ShopStates.waiting_login_code)
+    text = (
+        f"📨 Пришлите код для входа по заказу <b>#{order_id}</b> "
+        "одним сообщением.\n\n"
+        "Это код, который пришёл вам на почту, когда модератор "
+        "заходил на аккаунт."
+    )
+    sent = await send_or_edit(call, text, kb_back_main(f"order_actions:{order_id}"))
+    await state.update_data(code_order_id=order_id,
+                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_login_code)
+async def msg_login_code(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    code = (message.text or "").strip()
+    data = await state.get_data()
+    order_id = int(data.get("code_order_id", 0))
+    if not code:
+        await _edit_prompt(state, "⚠️ Пустое сообщение. Пришлите код текстом.",
+                           kb_back_main(f"order_actions:{order_id}"))
+        return
+    await state.clear()
+
+    if order_id:
+        await db_set_order_login_code(order_id, code)
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    order = await db_get_order(order_id) if order_id else None
+    if not order or order.get("tg_id") != user.id:
+        await message.answer("⚠️ Заказ не найден или недоступен.")
+        return
+    await notify_assigned_staff(
+        order_id,
+        f"📨 Код для входа по заказу <b>#{order_id}</b>\n\n"
+        f"<pre>{escape(code)}</pre>\n"
+        f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>",
+    )
+
+    await _state_edit(
+        message, state,
+        f"✅ Спасибо! Код по заказу <b>#{order_id}</b> передан модератору.\n\n"
+        "Если придёт ещё один код — пришлите его той же кнопкой "
+        "<b>«Отправить код для входа»</b>.",
+        kb_after_purchase(order_id, needs_login=False, needs_code=True),
+    )
+
+
+@dp.callback_query(F.data.startswith("buy:rbi:"))
+async def cb_buy_rbi(call: CallbackQuery, state: FSMContext) -> None:
+    key = call.data.split(":", 2)[2]
+    product = await db_get_product_by_key(key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, _ = product
+    await perform_purchase(
+        call, f"Roblox — {name} (моментально)", price,
+        category="roblox_instant", state=state,
+    )
+
+
+@dp.callback_query(F.data.startswith("buy:bs:"))
+async def cb_buy_bs(call: CallbackQuery, state: FSMContext) -> None:
+    key = call.data.split(":", 2)[2]
+    product = await db_get_product_by_key(key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, _ = product
+    await perform_purchase(
+        call, f"Brawl Stars — {name}", price, category="brawl", state=state,
+    )
+
+
+@dp.callback_query(F.data == "buy:robux_gp")
+async def cb_buy_robux_gp(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    qty = data.get("robux_qty")
+    price = data.get("robux_price")
+    gamepass_price = data.get("robux_gamepass_price")
+
+    if not qty or not price or not gamepass_price:
+        await call.answer("Сначала введите количество.", show_alert=True)
+        return
+
+    await perform_purchase(
+        call,
+        f"Roblox геймпассом — {qty} робуксов (до 5 дней)",
+        int(price),
+        category="roblox_gamepass",
+        extra={"qty": int(qty), "gamepass_price": int(gamepass_price)},
+        state=state,
+    )
+
+
+@dp.callback_query(F.data == "buy:stars")
+async def cb_buy_stars(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    qty = data.get("stars_qty")
+    price = data.get("stars_price")
+    if not qty or not price:
+        await call.answer("Сначала введите количество.", show_alert=True)
+        return
+    await perform_purchase(
+        call,
+        f"Telegram Stars — {qty} звёзд",
+        int(price),
+        category="tgstars",
+        state=state,
+    )
+
+
+# =====================================================================
+# Связь с модератором после покупки
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("contact_mod:"))
+async def cb_contact_mod(call: CallbackQuery) -> None:
+    order_id = call.data.split(":", 1)[1]
+    user = call.from_user
+    username = f"@{user.username}" if user.username else "—"
+
+    await notify_moderator(
+        f"📨 Покупатель просит связь по заказу <b>#{order_id}</b>\n\n"
+        f"Имя: {escape(user.first_name or '')}\n"
+        f"Username: {escape(username)}\n"
+        f"Telegram ID: <code>{user.id}</code>\n"
+        "Свяжитесь с клиентом в Telegram."
+    )
+
+    handle = SUPPORT_USERNAME.lstrip("@")
+    text = (
+        f"✅ Модератор уведомлён о вашем заказе <b>#{order_id}</b> "
+        "и скоро свяжется с вами.\n\n"
+        f"Если хотите написать сами — нажмите кнопку ниже."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Написать модератору", url=f"https://t.me/{handle}"
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+    await send_or_edit(call, text, kb)
+    await call.answer()
+
+
+# =====================================================================
+# Профиль и история заказов
+# =====================================================================
+
+
+@dp.callback_query(F.data == "profile")
+async def cb_profile(call: CallbackQuery) -> None:
+    user_row, _ = await db_get_or_create_user(call.from_user)
+    orders_cnt = await db_orders_count(call.from_user.id)
+    user = call.from_user
+    username = f"@{user.username}" if user.username else "не указан"
+    created = user_row["created_at"].split("T")[0]
+    level = user_row.get("referral_level", 0)
+    level_name = _ref_level_name(level)
+    discount = _ref_discount_pct(level)
+    discount_line = f" · скидка <b>{discount}%</b>" if discount else ""
+
+    text = (
+        "<b>👤 Ваш профиль</b>\n\n"
+        f"Telegram ID: <code>{user.id}</code>\n"
+        f"Username: {escape(username)}\n"
+        f"Имя: {escape(user.first_name or '—')}\n"
+        f"Баланс: <b>{user_row['balance']}₽</b>\n"
+        f"Дата регистрации: {created}\n"
+        f"Заказов: <b>{orders_cnt}</b>\n"
+        f"Статус: <b>{level_name}</b>{discount_line}"
+    )
+    await show_section(call, "profile", text, kb_profile())
+    await call.answer()
+
+
+_ORDERS_PAGE_SIZE = 5
+_TX_PAGE_SIZE = 5
+
+
+async def _show_orders_page(call: CallbackQuery, tg_id: int, page: int) -> None:
+    total = await db_orders_count(tg_id)
+    total_pages = max(1, (total + _ORDERS_PAGE_SIZE - 1) // _ORDERS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    orders = await db_get_orders(tg_id, limit=_ORDERS_PAGE_SIZE, offset=page * _ORDERS_PAGE_SIZE)
+
+    rows = []
+    if not orders and total == 0:
+        text = "📦 <b>История заказов</b>\n\nУ вас пока нет заказов."
+    else:
+        lines = [f"📦 <b>История заказов</b>  {page + 1}/{total_pages}\n"]
+        for o in orders:
+            date = _fmt_msk(o["created_at"])
+            lines.append(
+                f"<b>#{o['id']}</b> • {escape(o['title'])}\n"
+                f"{o['price']}₽ • {escape(o['status'])}\n"
+                f"<i>{date}</i>"
+            )
+            if o["status"] != "Выполнен":
+                rows.append([InlineKeyboardButton(
+                    text=f"⚙️ Заказ #{o['id']}",
+                    callback_data=f"order_actions:{o['id']}",
+                )])
+        text = "\n\n".join(lines)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"orders:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"orders:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="profile"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+    ])
+    await show_section(call, "orders", text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "orders")
+async def cb_orders(call: CallbackQuery) -> None:
+    await _show_orders_page(call, call.from_user.id, 0)
+
+
+@dp.callback_query(F.data.startswith("orders:"))
+async def cb_orders_page(call: CallbackQuery) -> None:
+    try:
+        page = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        page = 0
+    await _show_orders_page(call, call.from_user.id, page)
+
+
+@dp.callback_query(F.data.startswith("order_actions:"))
+async def cb_order_actions(call: CallbackQuery) -> None:
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer("Некорректный заказ.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order or order["tg_id"] != call.from_user.id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    if order["status"] == "Выполнен":
+        has_review = await db_has_review(order_id)
+        review_line = (
+            "\n\n⭐ Вы уже оставили отзыв по этому заказу. Спасибо!"
+            if has_review
+            else "\n\n⭐ Если вам понравилось — оставьте, пожалуйста, отзыв."
+        )
+        text = (
+            f"📦 <b>Заказ #{order_id}</b>\n\n"
+            f"Товар: {escape(order['title'])}\n"
+            f"Сумма: {order['price']}₽\n"
+            f"Статус: <b>{escape(order['status'])}</b>\n\n"
+            "Этот заказ уже выполнен."
+            f"{review_line}"
+        )
+        rows = []
+        if not has_review:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="⭐ Оставить отзыв",
+                        callback_data=f"review:{order_id}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="orders"),
+                InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+            ]
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        await send_or_edit(call, text, kb)
+        await call.answer()
+        return
+
+    text = (
+        f"📦 <b>Заказ #{order_id}</b>\n\n"
+        f"Товар: {escape(order['title'])}\n"
+        f"Сумма: {order['price']}₽\n"
+        f"Статус: <b>{escape(order['status'])}</b>\n\n"
+        "Выберите действие по заказу:"
+    )
+    await send_or_edit(call, text, await kb_order_actions(order))
+    await call.answer()
+
+
+def _format_tx_kind(kind: str) -> str:
+    return {
+        "topup": "Пополнение",
+        "purchase": "Покупка",
+        "admin_add": "Начисление администратором",
+        "admin_reset": "Обнуление баланса администратором",
+    }.get(kind, kind)
+
+
+async def _show_tx_page(call: CallbackQuery, tg_id: int, page: int) -> None:
+    total = await db_transactions_count(tg_id)
+    total_pages = max(1, (total + _TX_PAGE_SIZE - 1) // _TX_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    txs = await db_get_transactions(tg_id, limit=_TX_PAGE_SIZE, offset=page * _TX_PAGE_SIZE)
+
+    if not txs and total == 0:
+        text = (
+            "📜 <b>История транзакций</b>\n\n"
+            "Здесь будут отображаться все начисления и списания по вашему балансу. Пока операций нет."
+        )
+    else:
+        lines = [f"📜 <b>История транзакций</b>  {page + 1}/{total_pages}\n"]
+        for t in txs:
+            date = _fmt_msk(t["created_at"])
+            sign = "➕" if t["amount"] > 0 else "➖"
+            lines.append(
+                f"{sign} <b>{abs(t['amount'])}₽</b> — {escape(_format_tx_kind(t['kind']))}"
+                + (f"\n<i>{escape(t['reason'])}</i>" if t["reason"] else "")
+                + f"\n<i>{date}</i>"
+            )
+        text = "\n\n".join(lines)
+
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"transactions:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"transactions:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="profile"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+    ])
+    await show_section(call, "tx_history", text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "transactions")
+async def cb_transactions(call: CallbackQuery) -> None:
+    await _show_tx_page(call, call.from_user.id, 0)
+
+
+@dp.callback_query(F.data.startswith("transactions:"))
+async def cb_transactions_page(call: CallbackQuery) -> None:
+    try:
+        page = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        page = 0
+    await _show_tx_page(call, call.from_user.id, page)
+
+
+# =====================================================================
+# Пополнение баланса
+# =====================================================================
+
+
+@dp.callback_query(F.data == "topup")
+async def cb_topup(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(ShopStates.waiting_topup_amount)
+    min_topup = int(await db_get_setting("min_topup", "10"))
+    text = (
+        "💳 <b>Пополнение баланса</b>\n\n"
+        f"Введите сумму пополнения в рублях (минимум {min_topup}₽).\n"
+        "Например: 500"
+    )
+    sent = await show_section(call, "topup", text, kb_back_main("profile"))
+    await state.update_data(_prompt_chat_id=sent.chat.id,
+                            _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_topup_amount)
+async def msg_topup_amount(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    amount = parse_positive_int(message.text)
+    if amount is None:
+        await _edit_prompt(state,
+                           "⚠️ Введите положительное число рублей, например: 500.",
+                           kb_back_main("profile"))
+        return
+    min_topup = int(await db_get_setting("min_topup", "10"))
+    if amount < min_topup:
+        await _edit_prompt(state,
+                           f"⚠️ Минимальная сумма пополнения — {min_topup}₽\n"
+                           "Попробуйте ещё раз:",
+                           kb_back_main("profile"))
+        return
+    await state.update_data(topup_amount=amount)
+    await state.set_state(ShopStates.waiting_topup_confirm)
+    await _edit_prompt(state,
+                       f"Вы хотите пополнить баланс на <b>{amount}₽</b>?",
+                       kb_topup_confirm())
+
+
+@dp.callback_query(F.data == "topup_go")
+async def cb_topup_go(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    amount = int(data.get("topup_amount", 0))
+    await state.clear()
+    if amount < int(await db_get_setting("min_topup", "10")):
+        await call.answer("Сумма не задана.", show_alert=True)
+        return
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    text = (
+        f"💳 <b>Оплатите {amount}₽</b> по реквизитам ниже:\n\n"
+        f"{CARD_DETAILS}\n\n"
+        f"💰 <b>Сумма к переводу: {amount}₽</b>\n\n"
+        f"🔢 <b>Код для комментария к переводу:</b>\n"
+        f"<code>{code}</code>\n\n"
+        "⚠️ Обязательно укажите этот код в <b>комментарии</b> к переводу — "
+        "без него платёж не будет засчитан.\n\n"
+        "⚠️ Переведите <b>точную сумму</b>, иначе платёж не будет засчитан.\n\n"
+        "После оплаты нажмите «Я оплатил» — заявка отправится модератору "
+        "на проверку, и баланс начислится после подтверждения."
+    )
+    await show_section(call, "topup", text, kb_topup_pay(amount, code))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("paid:"))
+async def cb_paid(call: CallbackQuery) -> None:
+    await call.answer("Заявка отправлена")
+    parts = call.data.split(":")
+    try:
+        amount = int(parts[1])
+    except (ValueError, IndexError):
+        return
+    code = parts[2] if len(parts) > 2 else ""
+
+    user = call.from_user
+    username = f"@{user.username}" if user.username else "—"
+
+    text = (
+        "🕒 <b>Заявка на пополнение отправлена</b>\n\n"
+        f"Сумма: <b>{amount}₽</b>\n"
+        + (f"Код в комментарии: <code>{code}</code>\n\n" if code else "\n")
+        + "Мы проверим поступление средств и начислим баланс. "
+        "Вы получите уведомление, как только заявка будет обработана."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+    await send_or_edit(call, text, kb)
+
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить",
+                    callback_data=f"tpconf:{user.id}:{amount}:{code}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"tprej:{user.id}:{amount}:{code}",
+                ),
+            ],
+        ]
+    )
+    await notify_moderator(
+        f"💰 <b>Новая заявка на пополнение</b>\n\n"
+        f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>\n"
+        f"Сумма: <b>{amount}₽</b>\n"
+        + (f"Код в комментарии: <code>{code}</code>\n\n" if code else "\n")
+        + "Проверьте поступление средств (сумма + код в комментарии) "
+        "и нажмите соответствующую кнопку.",
+        reply_markup=admin_kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("tpconf:"))
+async def cb_topup_admin_confirm(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Только для модератора.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":")
+        target_id = int(parts[1])
+        amount = int(parts[2])
+        code = parts[3] if len(parts) > 3 else ""
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    reason = f"Пополнение баланса (код: {code})" if code else "Пополнение баланса"
+    new_balance = await db_credit_balance(target_id, amount, kind="topup", reason=reason)
+
+    try:
+        old = call.message.text or call.message.caption or ""
+        await call.message.edit_text(
+            f"{old}\n\n✅ <b>Подтверждено.</b> Баланс пользователя: {_fmt_price(new_balance)}₽",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    try:
+        user_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🛒 Купить донат", callback_data="shop")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ]
+        )
+        await bot.send_message(
+            target_id,
+            f"✅ <b>Баланс пополнен на {_fmt_price(amount)}₽</b>\n\n"
+            f"Текущий баланс: <b>{_fmt_price(new_balance)}₽</b>",
+            parse_mode="HTML",
+            reply_markup=user_kb,
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
+
+    await call.answer("Баланс начислен")
+
+
+@dp.callback_query(F.data.startswith("tprej:"))
+async def cb_topup_admin_reject(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Только для модератора.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":")
+        target_id = int(parts[1])
+        amount = int(parts[2])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    try:
+        old = call.message.text or call.message.caption or ""
+        await call.message.edit_text(
+            f"{old}\n\n❌ <b>Отклонено.</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    try:
+        await bot.send_message(
+            target_id,
+            f"❌ <b>Заявка на пополнение на {amount}₽ отклонена.</b>\n\n"
+            "Если вы уверены, что оплата была произведена — свяжитесь с поддержкой.",
+            parse_mode="HTML",
+            reply_markup=kb_support(),
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
+
+    await call.answer("Отклонено")
+
+
+# =====================================================================
+# Авто-подтверждение заказа через 30 минут
+# =====================================================================
+
+RECEIPT_CONFIRM_TIMEOUT = 30 * 60  # секунд
+
+
+async def _auto_confirm_receipt(
+    order_id: int, tg_id: int, confirm_msg_id: int | None = None
+) -> None:
+    """Через 30 минут автоматически подтверждает заказ, если покупатель не ответил."""
+    await asyncio.sleep(RECEIPT_CONFIRM_TIMEOUT)
+    still_pending = await db_get_confirm_pending(order_id)
+    if not still_pending:
+        return  # пользователь уже нажал кнопку
+
+    await db_set_confirm_pending(order_id, False)
+
+    # Уведомляем модератора
+    try:
+        await notify_moderator(
+            f"⏱ <b>Заказ #{order_id} подтверждён автоматически</b>\n\n"
+            f"Покупатель (ID <code>{tg_id}</code>) не ответил в течение 30 минут — "
+            "заказ засчитан выполненным."
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить модератора об авто-подтверждении: {e}")
+
+    # Редактируем исходное сообщение с кнопками — убираем кнопки, ставим статус авто-подтверждения
+    has_review = await db_has_review(order_id)
+    review_btn = [] if has_review else [
+        [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review:{order_id}")]
+    ]
+    kb_after = InlineKeyboardMarkup(inline_keyboard=review_btn + [
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    auto_text = (
+        f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+        "⏱ <b>Получение подтверждено автоматически</b> — вы не ответили в течение 30 минут.\n\n"
+        + ("⭐ Если хотите — оставьте отзыв о заказе." if not has_review else "")
+    )
+    if confirm_msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=tg_id,
+                message_id=confirm_msg_id,
+                text=auto_text,
+                parse_mode="HTML",
+                reply_markup=kb_after,
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось отредактировать сообщение подтверждения: {e}")
+            # Fallback — шлём новое сообщение
+            try:
+                await bot.send_message(tg_id, auto_text, parse_mode="HTML", reply_markup=kb_after)
+            except Exception:
+                pass
+    else:
+        try:
+            await bot.send_message(tg_id, auto_text, parse_mode="HTML", reply_markup=kb_after)
+        except Exception as e:
+            logging.warning(f"Не удалось отправить авто-подтверждение пользователю {tg_id}: {e}")
+
+    # Отдельное короткое уведомление — чтобы покупатель точно заметил
+    try:
+        await bot.send_message(
+            tg_id,
+            f"ℹ️ Заказ <b>#{order_id}</b> закрыт автоматически после 30 минут ожидания.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+# =====================================================================
+# Действия модератора по заказу
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("ordone:"))
+async def cb_order_done(call: CallbackQuery) -> None:
+    """Модератор отмечает заказ как выполненный."""
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Только для модератора.", show_alert=True)
+        return
+    try:
+        _, oid_s, uid_s = call.data.split(":")
+        order_id = int(oid_s)
+        target_id = int(uid_s)
+    except ValueError:
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.get("status") == "Выполнен":
+        await call.answer("Этот заказ уже отмечен как выполненный.", show_alert=True)
+        return
+
+    # Только взявший заказ может его завершить
+    assigned = order.get("assigned_to")
+    if assigned and int(assigned) != call.from_user.id:
+        await call.answer(
+            "Этот заказ взял другой сотрудник — только он может его завершить.",
+            show_alert=True,
+        )
+        return
+
+    await db_set_order_status(order_id, "Выполнен")
+    await db_audit_staff_action(
+        call.from_user.id, "complete_order", "order", str(order_id)
+    )
+
+    # Обработка реферальной программы
+    referrer_id, level_up, new_level, _ = await db_process_referral(target_id)
+
+    if referrer_id:
+        ref_row = await db_find_user(referrer_id)
+        ref_count = ref_row["referral_count"] if ref_row else 0
+        next_level_refs = (new_level + 1) * REFERRAL_REFS_PER_LEVEL if new_level < 5 else None
+        refs_left = (next_level_refs - ref_count) if next_level_refs else None
+
+        if level_up:
+            level_name = _ref_level_name(new_level)
+            discount = _ref_discount_pct(new_level)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 <b>Поздравляем! Вы достигли нового уровня!</b>\n\n"
+                    f"🏆 Ваш новый статус: <b>{level_name}</b>\n"
+                    f"💰 Скидка на все заказы: <b>{discount}%</b>\n\n"
+                    f"Скидка применяется автоматически при каждой покупке.\n"
+                    f"<i>Не действует на Telegram Stars.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить о повышении уровня {referrer_id}: {e}")
+        else:
+            progress = f"\nДо следующего уровня: ещё <b>{refs_left}</b> реферал(ов)." if refs_left else ""
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"✅ <b>+1 реферал засчитан!</b>\n\n"
+                    f"Ваш приглашённый совершил первую покупку.\n"
+                    f"Всего рефералов: <b>{ref_count}</b>.{progress}",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
+
+    try:
+        old = call.message.text or call.message.caption or ""
+        await call.message.edit_text(
+            f"{old}\n\n✅ <b>Заказ #{order_id} отмечен как выполненный.</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    try:
+        user_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить получение",
+                        callback_data=f"confirm_receipt:{order_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отклонить",
+                        callback_data=f"reject_receipt:{order_id}",
+                    )
+                ],
+            ]
+        )
+        await bot.send_message(
+            target_id,
+            f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+            "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
+            "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
+            "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
+            "прислать скриншот из игры в качестве доказательства.\n\n"
+            "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
+            parse_mode="HTML",
+            reply_markup=user_kb,
+        )
+        await db_set_confirm_pending(order_id, True)
+        asyncio.create_task(_auto_confirm_receipt(order_id, target_id))
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
+
+    try:
+        await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+
+    await call.answer("Заказ выполнен")
+
+
+# =====================================================================
+# История конкретного заказа (для персонала)
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("ord:history:"))
+async def cb_order_history(call: CallbackQuery) -> None:
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        order_id = int(call.data.split(":", 2)[2])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    history = await db_get_order_history(order_id)
+    if not history:
+        await call.answer(f"История заказа #{order_id} пуста.", show_alert=True)
+        return
+
+    lines = [f"<b>📋 История заказа #{order_id}</b>\n"]
+    for entry in history:
+        staff_name = entry.get("first_name") or (
+            f"@{entry['username']}" if entry.get("username") else f"id{entry['staff_id']}"
+        )
+        role_label = STAFF_ROLE_LABELS.get(entry["role"], entry["role"])
+        action_label = _action_label(entry["action"])
+        ts = _fmt_msk(entry["created_at"])
+        lines.append(
+            f"<b>{escape(staff_name)}</b> [{role_label}]\n"
+            f"  {action_label}\n"
+            f"  <i>{ts}</i>\n"
+        )
+    text = "\n".join(lines)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+    ])
+    await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+
+# =====================================================================
+# Подтверждение / отклонение получения заказа
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("confirm_receipt:"))
+async def cb_confirm_receipt(call: CallbackQuery) -> None:
+    """Покупатель подтверждает получение товара → предлагаем оставить отзыв."""
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order or order["tg_id"] != call.from_user.id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    # Если таймер уже сработал — флаг сброшен, просто показываем успех
+    await db_set_confirm_pending(order_id, False)
+
+    user = call.from_user
+    username = f"@{user.username}" if user.username else "—"
+    # Уведомляем модератора
+    try:
+        await notify_moderator(
+            f"✅ <b>Покупатель подтвердил получение заказа #{order_id}</b>\n\n"
+            f"Имя: {escape(user.first_name or '—')}\n"
+            f"Username: {escape(username)}\n"
+            f"Telegram ID: <code>{user.id}</code>"
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить модератора о подтверждении: {e}")
+
+    has_review = await db_has_review(order_id)
+    review_btn = [] if has_review else [
+        [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review:{order_id}")]
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=review_btn + [
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"✅ <b>Спасибо! Получение заказа #{order_id} подтверждено.</b>\n\n"
+        "Рады, что всё прошло хорошо. Будем ждать вас снова!\n\n"
+        + ("⭐ Если вам понравилось — оставьте, пожалуйста, отзыв. "
+           "Это помогает другим покупателям и нам становиться лучше." if not has_review else ""),
+        kb,
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("reject_receipt:"))
+async def cb_reject_receipt(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель отклоняет получение → просим прислать скриншот из игры."""
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order or order["tg_id"] != call.from_user.id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+
+    await state.set_state(ShopStates.waiting_reject_screenshot)
+    await state.update_data(reject_order_id=order_id)
+
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+    ])
+    await send_or_edit(
+        call,
+        f"⚠️ <b>Отклонение заказа #{order_id}</b>\n\n"
+        "Пожалуйста, пришлите <b>скриншот из игры</b>, подтверждающий, "
+        "что товар не был зачислен (например, скриншот инвентаря или баланса).\n\n"
+        "Скриншот будет отправлен модератору для разбора ситуации.\n\n"
+        "⚠️ Напоминаем: ложное отклонение может привести к блокировке.",
+        kb_cancel,
+    )
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_reject_screenshot)
+async def msg_reject_screenshot(message: Message, state: FSMContext) -> None:
+    """Получаем скриншот от покупателя и пересылаем модератору."""
+    await _try_delete(message)
+    data = await state.get_data()
+    order_id = int(data.get("reject_order_id", 0))
+
+    file_id: str | None = None
+    is_document = False
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_id = message.document.file_id
+        is_document = True
+
+    if not file_id:
+        kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ])
+        await message.answer(
+            "⚠️ Пришлите изображение (фото или картинку файлом).",
+            reply_markup=kb_cancel,
+            parse_mode="HTML",
+        )
+        return
+
+    await state.clear()
+    await db_set_confirm_pending(order_id, False)
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+
+    # Уведомляем модератора
+    caption = (
+        f"🚫 <b>Покупатель отклонил получение заказа #{order_id}</b>\n\n"
+        f"Имя: {escape(user.first_name or '—')}\n"
+        f"Username: {escape(username)}\n"
+        f"Telegram ID: <code>{user.id}</code>\n\n"
+        "Скриншот от покупателя прикреплён ниже."
+    )
+    try:
+        if is_document:
+            await bot.send_document(
+                MODERATOR_CHAT_ID, file_id, caption=caption, parse_mode="HTML"
+            )
+        else:
+            await bot.send_photo(
+                MODERATOR_CHAT_ID, file_id, caption=caption, parse_mode="HTML"
+            )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить скриншот отклонения модератору: {e}")
+
+    await message.answer(
+        f"✅ <b>Скриншот отправлен модератору.</b>\n\n"
+        f"Мы рассмотрим ситуацию по заказу <b>#{order_id}</b> и свяжемся с вами.\n\n"
+        "Если хотите написать напрямую — нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=kb_support(),
+    )
+
+
+# =====================================================================
+# Отзывы покупателей
+# =====================================================================
+
+
+def kb_review_skip_photo(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➡️ Без фото",
+                    callback_data=f"review_skip_photo:{order_id}",
+                )
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="review_cancel")],
+        ]
+    )
+
+
+def kb_review_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="review_cancel")],
+        ]
+    )
+
+
+def kb_review_mod(order_id: int, buyer_id: int, *msg_ids: int) -> InlineKeyboardMarkup:
+    """Клавиатура модератора под управляющим сообщением отзыва.
+    buyer_id  — tg_id покупателя для кнопки «Ответить».
+    msg_ids   — id всех сообщений в чате модератора (заголовок + пересланные),
+                передаются в callback_data для форварда в канал.
+    """
+    ids_str = ":".join(str(m) for m in msg_ids)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Опубликовать в канал",
+                    callback_data=f"pub_review:{order_id}:{ids_str}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Ответить покупателю",
+                    callback_data=f"reply_buyer:{buyer_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"rej_review:{order_id}",
+                ),
+            ],
+        ]
+    )
+
+
+@dp.callback_query(F.data.startswith("review:"))
+async def cb_review_start(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order or order["tg_id"] != call.from_user.id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if order["status"] != "Выполнен":
+        await call.answer(
+            "Отзыв можно оставить только после выполнения заказа.",
+            show_alert=True,
+        )
+        return
+    if await db_has_review(order_id):
+        await call.answer("Вы уже оставили отзыв по этому заказу.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(ShopStates.waiting_review_photo)
+    text = (
+        f"⭐ <b>Отзыв по заказу #{order_id}</b>\n\n"
+        "📷 Пришлите <b>фото</b> выполненного заказа одним сообщением "
+        "(скриншот зачисления, скриншот игры и т.п.).\n\n"
+        "Если фото нет — нажмите «Без фото»."
+    )
+    sent = await send_or_edit(call, text, kb_review_skip_photo(order_id))
+    await state.update_data(review_order_id=order_id,
+                            _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("review_skip_photo:"))
+async def cb_review_skip_photo(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+    await state.set_state(ShopStates.waiting_review_text)
+    await state.update_data(review_order_id=order_id, review_photo_id=None)
+    text = (
+        f"⭐ <b>Отзыв по заказу #{order_id}</b>\n\n"
+        "✍️ Напишите ваш комментарий к отзыву одним сообщением."
+    )
+    await send_or_edit(call, text, kb_review_cancel())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "review_cancel")
+async def cb_review_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await send_or_edit(
+        call,
+        "❌ Отправка отзыва отменена.",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ]
+        ),
+    )
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_review_photo)
+async def msg_review_photo(message: Message, state: FSMContext) -> None:
+    # Фото НЕ удаляем здесь — оно нужно для copy_message модератору.
+    # Удалим его позже, в msg_review_text, после пересылки.
+    file_id: str | None = None
+    is_document = False
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_id = message.document.file_id
+        is_document = True
+
+    data = await state.get_data()
+    order_id = int(data.get("review_order_id", 0))
+
+    if not file_id:
+        await _try_delete(message)
+        await _edit_prompt(state,
+                           "⚠️ Пришлите изображение (фото или картинку файлом). "
+                           "Если фото нет — нажмите «Без фото».",
+                           kb_review_skip_photo(order_id))
+        return
+
+    await state.update_data(
+        review_photo_id=file_id,
+        review_photo_is_document=is_document,
+        # Сохраняем координаты фото для copy_message
+        review_photo_msg_id=message.message_id,
+        review_photo_chat_id=message.chat.id,
+    )
+    await state.set_state(ShopStates.waiting_review_text)
+    sent = await message.answer(
+        f"✅ Фото получено.\n\n"
+        f"✍️ Теперь напишите комментарий к отзыву по заказу <b>#{order_id}</b> "
+        "одним сообщением.",
+        parse_mode="HTML",
+        reply_markup=kb_review_cancel(),
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+
+
+@dp.message(ShopStates.waiting_review_text)
+async def msg_review_text(message: Message, state: FSMContext) -> None:
+    # НЕ удаляем сообщение здесь — оно нужно для forward_message модератору.
+    # Для ошибочных случаев удаляем вручную перед возвратом.
+    comment = (message.text or "").strip()
+    if not comment:
+        await _try_delete(message)
+        await _edit_prompt(state, "⚠️ Пустое сообщение. Напишите текст отзыва.",
+                           kb_review_cancel())
+        return
+    if len(comment) > 2000:
+        await _try_delete(message)
+        await _edit_prompt(state, "⚠️ Комментарий слишком длинный (макс. 2000 символов).\n"
+                           "Напишите покороче:",
+                           kb_review_cancel())
+        return
+
+    data = await state.get_data()
+    order_id = int(data.get("review_order_id", 0))
+    photo_id = data.get("review_photo_id")
+    photo_msg_id = data.get("review_photo_msg_id")
+    photo_chat_id = data.get("review_photo_chat_id")
+    await state.clear()
+
+    if not order_id:
+        await message.answer("Не удалось определить заказ. Попробуйте ещё раз.")
+        return
+
+    await db_add_review(order_id, message.from_user.id, photo_id, comment)
+
+    order = await db_get_order(order_id)
+    title = order["title"] if order else "—"
+
+    # ----------------------------------------------------------------
+    # Пересылаем отзыв модератору через forward_message ("Forwarded from").
+    # forward_message не поддерживает reply_markup, поэтому кнопки
+    # публикации отправляем отдельным управляющим сообщением после форварда.
+    # ID пересланных сообщений сохраняем в callback_data для последующего
+    # форварда в канал при нажатии «Опубликовать».
+    # ----------------------------------------------------------------
+    # Рассылаем отзыв всем Founder + Administrator + Moderator
+    review_recipients = await db_get_can_moderate_recipients()
+    buyer_id = message.from_user.id
+    header = (
+        f"⭐ <b>Новый отзыв</b>\n"
+        f"🎁 Товар: <b>{escape(str(title))}</b>"
+    )
+    orig_chat = message.chat.id
+    orig_msg_id = message.message_id
+    orig_photo_chat = photo_chat_id
+    orig_photo_msg = photo_msg_id
+    deleted_orig = False
+    for staff in review_recipients:
+        rid = int(staff["tg_id"])
+        try:
+            hdr_msg = await bot.send_message(rid, header, parse_mode="HTML")
+            if photo_id and orig_photo_chat and orig_photo_msg:
+                pfwd = await bot.forward_message(
+                    chat_id=rid, from_chat_id=orig_photo_chat,
+                    message_id=orig_photo_msg,
+                )
+                tfwd = await bot.forward_message(
+                    chat_id=rid, from_chat_id=orig_chat,
+                    message_id=orig_msg_id,
+                )
+                if not deleted_orig:
+                    try:
+                        await bot.delete_message(orig_photo_chat, orig_photo_msg)
+                    except Exception:
+                        pass
+                    await _try_delete(message)
+                    deleted_orig = True
+                await bot.send_message(
+                    rid, "⬆️ Управление отзывом:",
+                    reply_markup=kb_review_mod(
+                        order_id, buyer_id,
+                        hdr_msg.message_id, pfwd.message_id, tfwd.message_id,
+                    ),
+                )
+            else:
+                tfwd = await bot.forward_message(
+                    chat_id=rid, from_chat_id=orig_chat,
+                    message_id=orig_msg_id,
+                )
+                if not deleted_orig:
+                    await _try_delete(message)
+                    deleted_orig = True
+                await bot.send_message(
+                    rid, "⬆️ Управление отзывом:",
+                    reply_markup=kb_review_mod(
+                        order_id, buyer_id,
+                        hdr_msg.message_id, tfwd.message_id,
+                    ),
+                )
+        except Exception as e:
+            logging.warning(f"Не удалось переслать отзыв сотруднику {rid}: {e}")
+
+    thanks_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Все отзывы", url=REVIEWS_URL)],
+            [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+    await message.answer(
+        f"✅ <b>Спасибо за отзыв по заказу #{order_id}!</b>\n\n"
+        "Ваш отзыв передан модератору и скоро появится в нашем канале.",
+        parse_mode="HTML",
+        reply_markup=thanks_kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("pub_review:"))
+async def cb_publish_review(call: CallbackQuery) -> None:
+    """Модератор публикует отзыв в канал — пересылает через forward_message."""
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    # callback_data: pub_review:{order_id}:{msg_id1}[:{msg_id2}]
+    parts = call.data.split(":")
+    # parts[0]="pub_review", parts[1]=order_id, parts[2+]=msg_ids
+    mod_msg_ids = [int(p) for p in parts[2:] if p]
+    try:
+        for mid in mod_msg_ids:
+            await bot.forward_message(
+                chat_id=REVIEWS_CHANNEL,
+                from_chat_id=call.message.chat.id,
+                message_id=mid,
+            )
+        published_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="✅ Опубликовано в канале",
+                    url=REVIEWS_URL,
+                )]
+            ]
+        )
+        await call.message.edit_reply_markup(reply_markup=published_kb)
+        await call.answer("✅ Отзыв опубликован в канале!", show_alert=True)
+    except Exception as e:
+        logging.warning(f"Ошибка публикации отзыва: {e}")
+        await call.answer(f"Ошибка: {e}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("rej_review:"))
+async def cb_reject_review(call: CallbackQuery) -> None:
+    """Модератор отклоняет отзыв."""
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    rejected_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отклонён", callback_data="noop")]
+        ]
+    )
+    await call.message.edit_reply_markup(reply_markup=rejected_kb)
+    await call.answer("Отзыв отклонён.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("gpfix:"))
+async def cb_gamepass_fix(call: CallbackQuery, state: FSMContext) -> None:
+    """Модератор запускает запрос на изменение цены геймпасса."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Только для модератора.", show_alert=True)
+        return
+    try:
+        _, oid_s, uid_s, gp_s = call.data.split(":")
+        order_id = int(oid_s)
+        target_id = int(uid_s)
+        suggested_price = int(gp_s)
+    except ValueError:
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_gp_price)
+    await state.update_data(
+        gp_order_id=order_id,
+        gp_target_id=target_id,
+        gp_admin_chat_id=call.message.chat.id,
+        gp_admin_msg_id=call.message.message_id,
+    )
+
+    prompt = await call.message.answer(
+        f"🎮 Введите новую цену геймпасса в R$ для заказа #{order_id}.\n"
+        f"Расчётная цена: <b>{suggested_price} R$</b>.\n\n"
+        "Отправьте число или /cancel для отмены.",
+        parse_mode="HTML",
+    )
+    await state.update_data(gp_prompt_msg_id=prompt.message_id)
+
+
+@dp.message(AdminStates.waiting_gp_price, Command("cancel"))
+async def msg_gp_price_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Отменено.")
+
+
+@dp.message(AdminStates.waiting_gp_price)
+async def msg_gp_price_input(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        gp_price = int(round(float(raw)))
+        if gp_price <= 0:
+            raise ValueError
+    except ValueError:
+        await _state_edit(
+            message, state,
+            "Введите положительное целое число (R$) или /cancel для отмены.",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+        return
+
+    data = await state.get_data()
+    order_id = data.get("gp_order_id")
+    target_id = data.get("gp_target_id")
+    admin_chat_id = data.get("gp_admin_chat_id")
+    admin_msg_id = data.get("gp_admin_msg_id")
+    prompt_msg_id = data.get("gp_prompt_msg_id")
+    await state.clear()
+
+    if not (order_id and target_id):
+        await message.answer("Контекст потерян. Откройте заявку заново.")
+        return
+
+    try:
+        user_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⚙️ Действия по заказу",
+                        callback_data=f"order_actions:{order_id}",
+                    )
+                ],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ]
+        )
+        await bot.send_message(
+            target_id,
+            f"⚠️ <b>Просьба по заказу #{order_id}</b>\n\n"
+            f"Пожалуйста, измените цену вашего геймпасса в Roblox на "
+            f"<b>{gp_price} R$</b> и пришлите обновлённую ссылку через кнопку "
+            "«🔗 Отправить ссылку на геймпасс».",
+            parse_mode="HTML",
+            reply_markup=user_kb,
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
+        await message.answer("Не удалось отправить запрос покупателю.")
+        return
+
+    if admin_chat_id and admin_msg_id:
+        keep_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Завершить заказ",
+                        callback_data=f"ordone:{order_id}:{target_id}",
+                    )
+                ]
+            ]
+        )
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=admin_chat_id,
+                message_id=admin_msg_id,
+                reply_markup=keep_kb,
+            )
+        except Exception:
+            pass
+
+    if prompt_msg_id:
+        try:
+            await bot.delete_message(admin_chat_id, prompt_msg_id)
+        except Exception:
+            pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await bot.send_message(
+        admin_chat_id,
+        f"📨 Запрос на изменение цены геймпасса по заказу #{order_id} "
+        f"отправлен покупателю: <b>{gp_price} R$</b>.",
+        parse_mode="HTML",
+    )
+
+
+# =====================================================================
+# Админ-панель
+# =====================================================================
+
+
+USERS_PAGE_SIZE = 8
+
+
+def kb_admin_main(user_id: int = 0) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="adm:find")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="adm:users:0")],
+        [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="adm:promos")],
+        [InlineKeyboardButton(text="🛒 Каталог и курсы", callback_data="adm:catalog")],
+        [InlineKeyboardButton(text="🖼️ Картинки", callback_data="adm:images")],
+    ]
+    if _is_founder(user_id):
+        rows.append([InlineKeyboardButton(text="👥 Персонал", callback_data="adm:staff")])
+        if _maintenance["active"]:
+            rows.append([InlineKeyboardButton(
+                text="🔓 Открыть бота (тех. работы активны)",
+                callback_data="adm:maintenance:off",
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text="🔒 Закрыть бота (тех. работы)",
+                callback_data="adm:maintenance",
+            )])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---- вспомогательные словари для каталога ----
+
+_SETTING_LABELS: dict[str, str] = {
+    "robux_gamepass_rate":            "💎 Курс геймпасс (₽/робукс)",
+    "robux_gamepass_pass_price_rate": "🎮 Делитель цены геймпасса",
+    "tg_stars_rate":                  "⭐ Курс Telegram Stars (₽/звезда)",
+    "min_topup":                      "💳 Минимум пополнения (₽)",
+    "min_tg_stars":                   "⭐ Минимум Telegram Stars",
+}
+
+
+async def kb_catalog_categories() -> InlineKeyboardMarkup:
+    cats = await db_all_categories()
+    rows: list[list[InlineKeyboardButton]] = []
+    for cat in cats:
+        status = "⚠️ " if cat["disabled"] else ""
+        if cat["key"] in _SPECIAL_CAT_KEYS:
+            # Нет товаров — ведём сразу в настройки
+            rows.append([InlineKeyboardButton(
+                text=f"{status}{cat['emoji']} {cat['name']} ⚙️",
+                callback_data=f"adm:catcfg:{cat['key']}",
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text=f"{status}{cat['emoji']} {cat['name']}",
+                callback_data=f"adm:catalog:cat:{cat['key']}",
+            )])
+    rows.append([InlineKeyboardButton(text="➕ Создать категорию", callback_data="adm:catalog:new_cat")])
+    rows.append([InlineKeyboardButton(text="⚙️ Курсы и лимиты", callback_data="adm:settings")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_catalog_products_admin(products: list[dict], category: str) -> InlineKeyboardMarkup:
+    """Клавиатура товаров категории + кнопка настроек категории."""
+    rows = []
+    for p in products:
+        status = "✅" if p["active"] else "❌"
+        price_str = f"{int(p['price'])}₽" if float(p["price"]) == int(p["price"]) else f"{p['price']}₽"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{status} {p['name']} — {price_str}",
+                callback_data=f"adm:prod:{p['key']}",
+            ),
+            InlineKeyboardButton(text="🔄", callback_data=f"adm:catalog:toggle:{p['key']}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data=f"adm:catalog:add:{category}")])
+    rows.append([InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{category}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_product_manage(prod_key: str, cat_key: str) -> InlineKeyboardMarkup:
+    """Клавиатура управления конкретным товаром."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:prod:rename:{prod_key}")],
+        [InlineKeyboardButton(text="💰 Изменить цену",  callback_data=f"adm:catalog:price:{prod_key}")],
+        [InlineKeyboardButton(text="🗑 Удалить товар",  callback_data=f"adm:prod:delask:{prod_key}")],
+        [InlineKeyboardButton(text="⬅️ Назад к товарам", callback_data=f"adm:catalog:cat:{cat_key}")],
+    ])
+
+
+# Встроенные категории без списка товаров — только открытие/закрытие и текст после оплаты
+_SPECIAL_CAT_KEYS: frozenset[str] = frozenset({"roblox_gamepass", "tgstars"})
+
+
+def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
+    """Клавиатура настроек категории."""
+    key = cat["key"]
+    disabled = cat.get("disabled", False)
+    needs_code = cat.get("needs_code", False)
+    rows: list[list[InlineKeyboardButton]] = []
+    if disabled:
+        rows.append([InlineKeyboardButton(text="✅ Включить категорию", callback_data=f"adm:catdis:enable:{key}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔴 Отключить категорию", callback_data=f"adm:catdis:start:{key}")])
+    rows.append([InlineKeyboardButton(text="📝 Изменить текст после оплаты", callback_data=f"adm:catlogin:{key}")])
+    nc_label = "🔔 Выключить запрос кода" if needs_code else "🔔 Включить запрос кода"
+    rows.append([InlineKeyboardButton(text=nc_label, callback_data=f"adm:catnc:{key}")])
+    rows.append([
+        InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:catname:{key}"),
+        InlineKeyboardButton(text="🖼 Эмодзи",        callback_data=f"adm:catemoji:{key}"),
+    ])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"adm:catdel:ask:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К товарам", callback_data=f"adm:catalog:cat:{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_cat_config_builtin(cat: dict) -> InlineKeyboardMarkup:
+    """Упрощённая клавиатура настроек для встроенных категорий без товаров
+    (roblox_gamepass, tgstars): только открыть/закрыть и текст после оплаты."""
+    key = cat["key"]
+    disabled = cat.get("disabled", False)
+    rows: list[list[InlineKeyboardButton]] = []
+    if disabled:
+        rows.append([InlineKeyboardButton(text="✅ Включить категорию", callback_data=f"adm:catdis:enable:{key}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔴 Отключить категорию", callback_data=f"adm:catdis:start:{key}")])
+    rows.append([InlineKeyboardButton(text="📝 Изменить текст после оплаты", callback_data=f"adm:catlogin:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К каталогу", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _cat_config_kb(cat: dict) -> InlineKeyboardMarkup:
+    """Выбирает нужную клавиатуру настроек в зависимости от типа категории."""
+    if cat["key"] in _SPECIAL_CAT_KEYS:
+        return kb_cat_config_builtin(cat)
+    return kb_cat_config(cat)
+
+
+def kb_settings_list(settings: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for s in settings:
+        label = _SETTING_LABELS.get(s["key"], s["key"])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{label}: {s['value']}",
+                callback_data=f"adm:settings:edit:{s['key']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_user_row(u: dict) -> str:
+    handle = u.get("username")
+    name = u.get("first_name") or "—"
+    label = f"@{handle}" if handle else (name or f"id{u['tg_id']}")
+    if u.get("is_blacklisted"):
+        label = f"🚫 {label}"
+    return f"{label} · {u['balance']}₽"
+
+
+def kb_admin_users(users: list[dict], page: int, total: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_format_user_row(u),
+                callback_data=f"adm:user:{u['tg_id']}",
+            )
+        ]
+        for u in users
+    ]
+    nav = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(text="⬅️", callback_data=f"adm:users:{page - 1}")
+        )
+    last_page = max(0, (total - 1) // USERS_PAGE_SIZE)
+    nav.append(
+        InlineKeyboardButton(
+            text=f"{page + 1}/{last_page + 1}", callback_data="adm:noop"
+        )
+    )
+    if page < last_page:
+        nav.append(
+            InlineKeyboardButton(text="➡️", callback_data=f"adm:users:{page + 1}")
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(
+        [
+            InlineKeyboardButton(text="🔍 Найти", callback_data="adm:find"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_admin_user(
+    target_id: int, blocked: bool, from_list_page: int | None = None,
+    viewer_id: int = 0,
+) -> InlineKeyboardMarkup:
+    if from_list_page is not None:
+        nav_row = [
+            InlineKeyboardButton(
+                text="⬅️ К списку", callback_data=f"adm:users:{from_list_page}"
+            ),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close"),
+        ]
+    else:
+        nav_row = [
+            InlineKeyboardButton(
+                text="🔍 Другой пользователь", callback_data="adm:find"
+            ),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close"),
+        ]
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="➕ Начислить баланс", callback_data=f"adm:credit:{target_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="♻️ Обнулить баланс", callback_data=f"adm:reset:{target_id}"
+            )
+        ],
+    ]
+    # Блокировка — только Founder и Administrator
+    if _senior_staff(viewer_id):
+        block_btn = (
+            InlineKeyboardButton(
+                text="✅ Убрать из ЧС", callback_data=f"adm:unblock:{target_id}"
+            )
+            if blocked
+            else InlineKeyboardButton(
+                text="🚫 В чёрный список", callback_data=f"adm:block:{target_id}"
+            )
+        )
+        rows.append([block_btn])
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows + [
+            [
+                InlineKeyboardButton(
+                    text="📜 История транзакций",
+                    callback_data=f"adm:tx:{target_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👑 Выдать реф. статус",
+                    callback_data=f"adm:ref_level:{target_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎟️ Реф. промокоды",
+                    callback_data=f"adm:ref_promos:{target_id}",
+                )
+            ],
+            nav_row,
+        ]
+    )
+
+
+async def _get_admin_card_source(state: FSMContext) -> int | None:
+    """Возвращает номер страницы списка, если карточка открыта из списка, иначе None."""
+    data = await state.get_data()
+    page = data.get("admin_user_from_list_page")
+    return int(page) if page is not None else None
+
+
+async def _send_admin_user_card(
+    call: CallbackQuery, target_id: int, state: FSMContext
+) -> None:
+    user_row = await db_find_user(target_id)
+    if not user_row:
+        await send_or_edit(
+            call,
+            f"❌ Пользователь с ID <code>{target_id}</code> не найден.",
+            kb_admin_main(call.from_user.id),
+        )
+        return
+    blocked = bool(user_row.get("is_blacklisted"))
+    orders_cnt = await db_orders_count(target_id)
+    from_list_page = await _get_admin_card_source(state)
+    level = user_row.get("referral_level", 0) or 0
+    ref_count = user_row.get("referral_count", 0) or 0
+    level_name = _ref_level_name(level)
+    discount = _ref_discount_pct(level)
+    text = (
+        "<b>👤 Карточка пользователя</b>\n\n"
+        f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
+        f"Username: @{escape(user_row.get('username') or '—')}\n"
+        f"Имя: {escape(user_row.get('first_name') or '—')}\n"
+        f"Баланс: <b>{user_row['balance']}₽</b>\n"
+        f"Заказов: <b>{orders_cnt}</b>\n"
+        f"Реф. статус: <b>{level_name}</b> (скидка {discount}%)\n"
+        f"Рефералов засчитано: <b>{ref_count}</b>\n"
+        f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
+    )
+    await send_or_edit(
+        call, text, kb_admin_user(target_id, blocked, from_list_page, viewer_id=call.from_user.id)
+    )
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext) -> None:
+    uid = message.from_user.id
+    if not _is_staff(uid):
+        return
+    await state.clear()
+    role = _STAFF_ROLES.get(uid)
+    if role in (ROLE_FOUNDER, ROLE_ADMINISTRATOR):
+        await message.answer(
+            "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
+            reply_markup=kb_admin_main(uid),
+            parse_mode="HTML",
+        )
+    elif role == ROLE_MODERATOR:
+        await message.answer(
+            "<b>🛡️ Панель модератора</b>\n\nВыберите действие:",
+            reply_markup=kb_moderator_panel(),
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            "<b>🤝 Панель помощника</b>\n\nВыберите действие:",
+            reply_markup=kb_helper_panel(),
+            parse_mode="HTML",
+        )
+
+
+@dp.callback_query(F.data == "adm:close")
+async def cb_adm_close(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.answer("Закрыто")
+
+
+@dp.callback_query(F.data == "adm:noop")
+async def cb_adm_noop(call: CallbackQuery) -> None:
+    await call.answer()
+
+
+# =====================================================================
+# Режим технических работ (только Founder)
+# =====================================================================
+
+@dp.callback_query(F.data == "adm:maintenance")
+async def cb_adm_maintenance(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:main")],
+    ])
+    await send_or_edit(
+        call,
+        "🔒 <b>Закрыть бота на тех. работы</b>\n\n"
+        "Введите причину, которую увидят пользователи.\n"
+        "<i>Например: «Обновление — ждите 15 минут»</i>",
+        kb_cancel,
+    )
+    await state.set_state(AdminStates.waiting_maintenance_reason)
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_maintenance_reason)
+async def msg_maintenance_reason(message: Message, state: FSMContext) -> None:
+    if not _is_founder(message.from_user.id):
+        return
+    await _try_delete(message)
+    reason = (message.text or "").strip()
+    if not reason:
+        await state.set_state(AdminStates.waiting_maintenance_reason)
+        return
+    await state.update_data(maintenance_reason=reason)
+    await state.set_state(AdminStates.waiting_maintenance_confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="adm:maintenance:confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="adm:main"),
+        ],
+    ])
+    await message.answer(
+        f"🔒 <b>Закрыть бота?</b>\n\n"
+        f"Причина: <i>{escape(reason)}</i>\n\n"
+        "После подтверждения все пользователи (не персонал) получат уведомление о недоступности бота при любом действии.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data == "adm:maintenance:confirm")
+async def cb_adm_maintenance_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    data = await state.get_data()
+    reason = data.get("maintenance_reason", "Технические работы")
+    _maintenance["active"] = True
+    _maintenance["reason"] = reason
+    await state.clear()
+    await db_audit_staff_action(call.from_user.id, "maintenance_on", None, None)
+    await send_or_edit(
+        call,
+        f"🔒 <b>Бот закрыт на тех. работы</b>\n\n"
+        f"Причина: <i>{escape(reason)}</i>\n\n"
+        "Пользователи видят сообщение о недоступности. Персонал работает в штатном режиме.",
+        kb_admin_main(call.from_user.id),
+    )
+    await call.answer("Тех. работы активированы", show_alert=True)
+
+
+@dp.callback_query(F.data == "adm:maintenance:off")
+async def cb_adm_maintenance_off(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    _maintenance["active"] = False
+    _maintenance["reason"] = ""
+    await db_audit_staff_action(call.from_user.id, "maintenance_off", None, None)
+    await send_or_edit(
+        call,
+        "✅ <b>Бот открыт</b>\n\nРежим тех. работ отключён. Все пользователи снова имеют доступ.",
+        kb_admin_main(call.from_user.id),
+    )
+    await call.answer("Тех. работы отключены", show_alert=True)
+
+
+# =====================================================================
+# Управление каталогом и настройками (модератор)
+# =====================================================================
+
+@dp.callback_query(F.data == "adm:main")
+async def cb_adm_main(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    await send_or_edit(call, "<b>🛠️ Админ-панель</b>\n\nВыберите действие:", kb_admin_main(call.from_user.id))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:catalog")
+async def cb_adm_catalog(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    await send_or_edit(
+        call,
+        "<b>🛒 Каталог и курсы</b>\n\nВыберите категорию или откройте настройки:",
+        await kb_catalog_categories(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:cat:"))
+async def cb_adm_catalog_cat(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    category = call.data.split(":", 3)[3]
+    await state.update_data(catalog_category=category)
+    cat = await db_get_category(category)
+    label = f"{cat['emoji']} {cat['name']}" if cat else category
+    all_prods = await db_all_products()
+    cat_prods = [p for p in all_prods if p["category"] == category]
+    dis_note = "\n⚠️ <i>Категория отключена</i>" if cat and cat.get("disabled") else ""
+    if not cat_prods:
+        text = f"<b>{escape(label)}</b>{dis_note}\n\nТоваров пока нет."
+    else:
+        lines = [
+            ("✅" if p["active"] else "❌") + f" {p['name']} — {p['price']}₽"
+            for p in cat_prods
+        ]
+        text = (f"<b>{escape(label)}</b>{dis_note}\n\n" + "\n".join(lines) +
+                "\n\n✅ = активен  ❌ = скрыт\nНажмите на товар, чтобы изменить цену.\n🔄 — переключить активность.")
+    await send_or_edit(call, text, kb_catalog_products_admin(cat_prods, category))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:toggle:"))
+async def cb_adm_catalog_toggle(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    key = call.data.split(":", 3)[3]
+    new_state = await db_toggle_product(key)
+    status_text = "активирован ✅" if new_state else "скрыт ❌"
+    await call.answer(f"Товар {status_text}", show_alert=True)
+    all_prods = await db_all_products()
+    prod = next((p for p in all_prods if p["key"] == key), None)
+    if prod:
+        category = prod["category"]
+        cat = await db_get_category(category)
+        label = f"{cat['emoji']} {cat['name']}" if cat else category
+        cat_prods = [p for p in all_prods if p["category"] == category]
+        dis_note = "\n⚠️ <i>Категория отключена</i>" if cat and cat.get("disabled") else ""
+        lines = [("✅" if p["active"] else "❌") + f" {p['name']} — {p['price']}₽" for p in cat_prods]
+        text = (f"<b>{escape(label)}</b>{dis_note}\n\n" + "\n".join(lines) +
+                "\n\n✅ = активен  ❌ = скрыт\nНажмите на товар, чтобы изменить цену.\n🔄 — переключить активность.")
+        try:
+            await call.message.edit_text(text, reply_markup=kb_catalog_products_admin(cat_prods, category), parse_mode="HTML")
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:price:"))
+async def cb_adm_catalog_price(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, current_price, _ = product
+    await state.set_state(AdminStates.waiting_edit_product_price)
+    await state.update_data(edit_product_key=key, edit_product_name=name)
+    await send_or_edit(
+        call,
+        f"✏️ <b>Изменение цены: {escape(name)}</b>\n\n"
+        f"Текущая цена: <b>{current_price}₽</b>\n\n"
+        "Введите новую цену в рублях (целое число):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catalog:cat:none")],
+        ]),
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_edit_product_price)
+async def msg_adm_edit_product_price(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    price = parse_positive_int(message.text)
+    if price is None or price <= 0:
+        await _state_edit(
+            message, state,
+            "⚠️ Введите положительное целое число (цену в рублях).",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog:cat:none")]
+            ]),
+        )
+        return
+    data = await state.get_data()
+    key = data.get("edit_product_key", "")
+    name = data.get("edit_product_name", key)
+    await state.clear()
+    await db_update_product_price(key, float(price))
+    await _state_edit(
+        message, state,
+        f"✅ Цена <b>{escape(name)}</b> обновлена: <b>{price}₽</b>",
+        kb_admin_main(message.from_user.id),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catalog:add:"))
+async def cb_adm_catalog_add(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    category = call.data.split(":", 3)[3]
+    await state.set_state(AdminStates.waiting_new_product_key)
+    await state.update_data(new_product_category=category)
+    cat = await db_get_category(category)
+    label = f"{cat['emoji']} {cat['name']}" if cat else category
+    sent = await send_or_edit(
+        call,
+        f"➕ <b>Новый товар в «{escape(label)}»</b>\n\n"
+        "Шаг 1/4. Введите <b>уникальный ключ</b> товара (латинские буквы, цифры, _).\n"
+        "Пример: <code>rb_5000</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_new_product_key)
+async def msg_adm_new_product_key(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
+    if not raw or not all(c.isalnum() or c == "_" for c in raw):
+        await _state_edit(
+            message, state,
+            "⚠️ Ключ может содержать только латинские буквы, цифры и _.\nПопробуйте ещё раз:",
+            _cancel_kb,
+        )
+        return
+    await state.update_data(new_product_key=raw)
+    await state.set_state(AdminStates.waiting_new_product_name)
+    await _state_edit(
+        message, state,
+        "Шаг 2/4. Введите <b>название</b> товара (отображается покупателям).\n"
+        "Пример: <code>5000 робуксов</code>",
+        _cancel_kb,
+    )
+
+
+@dp.message(AdminStates.waiting_new_product_name)
+async def msg_adm_new_product_name(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    name = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
+    if not name:
+        await _state_edit(message, state, "⚠️ Название не может быть пустым. Попробуйте ещё раз:", _cancel_kb)
+        return
+    await state.update_data(new_product_name=name)
+    await state.set_state(AdminStates.waiting_new_product_price)
+    await _state_edit(message, state, "Шаг 3/4. Введите <b>цену</b> в рублях (целое число):", _cancel_kb)
+
+
+@dp.message(AdminStates.waiting_new_product_price)
+async def msg_adm_new_product_price(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    price = parse_positive_int(message.text)
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
+    if price is None or price <= 0:
+        await _state_edit(message, state, "⚠️ Введите положительное целое число. Попробуйте ещё раз:", _cancel_kb)
+        return
+    await state.update_data(new_product_price=price)
+    await state.set_state(AdminStates.waiting_new_product_delivery)
+    await _state_edit(
+        message, state,
+        "Шаг 4/4. Введите <b>способ выдачи</b> товара.\n"
+        "Пример: <code>моментально</code>",
+        _cancel_kb,
+    )
+
+
+@dp.message(AdminStates.waiting_new_product_delivery)
+async def msg_adm_new_product_delivery(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    delivery = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
+    if not delivery:
+        await _state_edit(message, state, "⚠️ Способ выдачи не может быть пустым. Попробуйте ещё раз:", _cancel_kb)
+        return
+    data = await state.get_data()
+    category = data.get("new_product_category", "roblox_instant")
+    key = data.get("new_product_key", "")
+    name = data.get("new_product_name", "")
+    price = float(data.get("new_product_price", 0))
+    await state.clear()
+    ok = await db_add_product(category, key, name, price, delivery)
+    if ok:
+        await _state_edit(
+            message, state,
+            f"✅ Товар <b>{escape(name)}</b> добавлен!\n"
+            f"Ключ: <code>{key}</code>  Цена: <b>{int(price)}₽</b>",
+            kb_admin_main(message.from_user.id),
+        )
+    else:
+        await _state_edit(
+            message, state,
+            f"❌ Товар с ключом <code>{key}</code> уже существует. Выберите другой ключ.",
+            kb_admin_main(message.from_user.id),
+        )
+
+
+# ---- Управление категориями ----
+
+
+@dp.callback_query(F.data == "adm:catalog:new_cat")
+async def cb_adm_catalog_new_cat(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало создания новой категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_new_cat_key)
+    sent = await send_or_edit(
+        call,
+        "➕ <b>Новая категория — Шаг 1/3</b>\n\n"
+        "Введите <b>уникальный ключ</b> категории (латинские буквы, цифры, _).\n"
+        "Это внутренний идентификатор, покупатели его не видят.\n"
+        "Пример: <code>minecraft</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+
+
+@dp.message(AdminStates.waiting_new_cat_key)
+async def msg_adm_new_cat_key(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip().lower()
+    reserved = {"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"}
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+    ])
+    if not raw or not all(c.isalnum() or c == "_" for c in raw):
+        await _state_edit(
+            message, state,
+            "⚠️ Ключ может содержать только латинские буквы, цифры и _. Попробуйте ещё раз:",
+            _cancel_kb,
+        )
+        return
+    if raw in reserved:
+        await _state_edit(
+            message, state,
+            f"⚠️ Ключ <code>{raw}</code> зарезервирован. Выберите другой:",
+            _cancel_kb,
+        )
+        return
+    existing = await db_get_category(raw)
+    if existing:
+        await _state_edit(
+            message, state,
+            f"⚠️ Категория с ключом <code>{raw}</code> уже существует.",
+            _cancel_kb,
+        )
+        return
+    await state.update_data(new_cat_key=raw)
+    await state.set_state(AdminStates.waiting_new_cat_name)
+    await _state_edit(
+        message, state,
+        f"Ключ: <code>{raw}</code>\n\n"
+        "➕ <b>Новая категория — Шаг 2/3</b>\n\n"
+        "Введите <b>название категории</b> (видят покупатели).\n"
+        "Пример: <code>Minecraft</code>",
+        _cancel_kb,
+    )
+
+
+@dp.message(AdminStates.waiting_new_cat_name)
+async def msg_adm_new_cat_name(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    name = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")]
+    ])
+    if not name:
+        await _state_edit(message, state, "⚠️ Название не может быть пустым. Попробуйте ещё раз:", _cancel_kb)
+        return
+    await state.update_data(new_cat_name=name)
+    await state.set_state(AdminStates.waiting_new_cat_emoji)
+    data = await state.get_data()
+    await _state_edit(
+        message, state,
+        f"Ключ: <code>{data['new_cat_key']}</code>  Название: <b>{escape(name)}</b>\n\n"
+        "➕ <b>Новая категория — Шаг 3/3</b>\n\n"
+        "Введите <b>эмодзи</b> для категории (одним символом).\n"
+        "Пример: <code>⛏️</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Пропустить (по умолчанию)", callback_data="adm:newcat:emoji_default")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "adm:newcat:emoji_default")
+async def cb_adm_newcat_emoji_default(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await _finish_create_category(call, state, emoji="🎮")
+
+
+@dp.message(AdminStates.waiting_new_cat_emoji)
+async def msg_adm_new_cat_emoji(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    emoji = (message.text or "").strip()
+    if not emoji:
+        emoji = "🎮"
+    await _finish_create_category(message, state, emoji=emoji)
+
+
+async def _finish_create_category(target, state: FSMContext, emoji: str) -> None:
+    data = await state.get_data()
+    key = data.get("new_cat_key", "")
+    name = data.get("new_cat_name", "")
+    await state.clear()
+    await db_create_category(key, name, emoji)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 В каталог", callback_data="adm:catalog")],
+        [InlineKeyboardButton(text="⚙️ Настроить категорию", callback_data=f"adm:catcfg:{key}")],
+    ])
+    msg_text = (
+        f"✅ <b>Категория создана!</b>\n\n"
+        f"Ключ: <code>{key}</code>\n"
+        f"Название: <b>{escape(name)}</b>\n"
+        f"Эмодзи: {emoji}\n\n"
+        "Теперь добавьте товары и настройте текст после оплаты."
+    )
+    if hasattr(target, "message"):  # CallbackQuery
+        await send_or_edit(target, msg_text, kb)
+    else:
+        await target.answer(msg_text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("adm:catcfg:"))
+async def cb_adm_catcfg(call: CallbackQuery, state: FSMContext) -> None:
+    """Страница настроек категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    dis_icon = "⚠️ " if cat["disabled"] else "✅ "
+    hint_preview = (cat.get("login_hint") or "—")[:60]
+    if len(cat.get("login_hint") or "") > 60:
+        hint_preview += "…"
+    is_special = key in _SPECIAL_CAT_KEYS
+    if is_special:
+        text = (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
+            f"Текст после оплаты: <i>{escape(hint_preview)}</i>"
+        )
+    else:
+        nc_icon = "🔔✅" if cat["needs_code"] else "🔔❌"
+        text = (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
+            f"Текст после оплаты: <i>{escape(hint_preview)}</i>\n"
+            f"Кнопка кода: {nc_icon} {'включена' if cat['needs_code'] else 'выключена'}"
+        )
+    if cat["disabled"] and cat.get("disabled_reason"):
+        text += f"\nПричина отключения: <i>{escape(cat['disabled_reason'])}</i>"
+    await send_or_edit(call, text, _cat_config_kb(cat))
+
+
+@dp.callback_query(F.data.startswith("adm:catdis:enable:"))
+async def cb_adm_catdis_enable(call: CallbackQuery) -> None:
+    """Включить категорию."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await db_set_category_disabled(key, False, None)
+    await call.answer("✅ Категория включена.", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: ✅ активна"
+        ), _cat_config_kb(cat))
+
+
+@dp.callback_query(F.data.startswith("adm:catdis:start:"))
+async def cb_adm_catdis_start(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало отключения категории — запрашиваем причину."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await state.set_state(AdminStates.waiting_cat_disabled_reason)
+    await state.update_data(cat_disable_key=key)
+    await send_or_edit(
+        call,
+        "🔴 <b>Отключение категории</b>\n\n"
+        "Введите <b>причину</b>, которую увидит покупатель при попытке открыть эту категорию.\n\n"
+        "Или нажмите кнопку, чтобы отключить без объяснения:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Без объяснения", callback_data=f"adm:catdis:noreason:{key}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catdis:noreason:"))
+async def cb_adm_catdis_noreason(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await state.clear()
+    await db_set_category_disabled(key, True, None)
+    await call.answer("🔴 Категория отключена.", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: ⚠️ отключена"
+        ), _cat_config_kb(cat))
+
+
+@dp.message(AdminStates.waiting_cat_disabled_reason)
+async def msg_adm_cat_disabled_reason(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    reason = (message.text or "").strip()
+    if not reason:
+        await _state_edit(
+            message, state,
+            "⚠️ Введите причину или нажмите «Без объяснения».",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Без объяснения", callback_data=f"adm:catdis:noreason:{(await state.get_data()).get('cat_disable_key', '')}")]
+            ]),
+        )
+        return
+    data = await state.get_data()
+    key = data.get("cat_disable_key", "")
+    await state.clear()
+    await db_set_category_disabled(key, True, reason)
+    cat = await db_get_category(key)
+    name = f"{cat['emoji']} {cat['name']}" if cat else key
+    await _state_edit(
+        message, state,
+        f"🔴 Категория <b>{escape(name)}</b> отключена.\n"
+        f"Причина: <i>{escape(reason)}</i>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catnc:"))
+async def cb_adm_cat_needscode(call: CallbackQuery) -> None:
+    """Переключить флаг 'нужен код' для категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    new_val = await db_toggle_category_needs_code(key)
+    label = "включён ✅" if new_val else "выключен ❌"
+    await call.answer(f"Запрос кода {label}", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Кнопка «Отправить код»: {'✅ включена' if new_val else '❌ выключена'}"
+        ), _cat_config_kb(cat))
+
+
+@dp.callback_query(F.data.startswith("adm:catlogin:"))
+async def cb_adm_catlogin(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало изменения текста после оплаты."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    current = cat.get("login_hint") or "—"
+    await state.set_state(AdminStates.waiting_cat_login_hint)
+    await state.update_data(cat_login_key=key)
+    await send_or_edit(
+        call,
+        f"📝 <b>Текст после оплаты: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+        f"Текущий текст:\n<i>{escape(current)}</i>\n\n"
+        "Введите новый текст. Он появится в сообщении покупателю после успешной оплаты "
+        "рядом с кнопкой «Отправить данные для входа».\n\n"
+        "Если текст пустой — кнопка входа не показывается.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Убрать текст (кнопка пропадёт)", callback_data=f"adm:catlogin:clear:{key}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catlogin:clear:"))
+async def cb_adm_catlogin_clear(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    await state.clear()
+    await db_update_category_login_hint(key, None)
+    await call.answer("🗑 Текст убран.", show_alert=True)
+    cat = await db_get_category(key)
+    if cat:
+        await send_or_edit(call, (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            "Текст после оплаты: —"
+        ), _cat_config_kb(cat))
+
+
+@dp.message(AdminStates.waiting_cat_login_hint)
+async def msg_adm_cat_login_hint(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("⚠️ Введите текст или нажмите «Убрать текст».")
+        return
+    data = await state.get_data()
+    key = data.get("cat_login_key", "")
+    await state.clear()
+    await db_update_category_login_hint(key, text)
+    cat = await db_get_category(key)
+    name = f"{cat['emoji']} {cat['name']}" if cat else key
+    await message.answer(
+        f"✅ Текст после оплаты для <b>{escape(name)}</b> обновлён:\n\n"
+        f"<i>{escape(text)}</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+# ---- Управление товарами (страница товара) ----
+
+
+@dp.callback_query(F.data.startswith("adm:prod:rename:"))
+async def cb_adm_prod_rename(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало переименования товара."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, current_name, _, _ = product
+    await state.set_state(AdminStates.waiting_rename_product)
+    await state.update_data(rename_prod_key=prod_key)
+    await send_or_edit(
+        call,
+        f"✏️ <b>Переименование товара</b>\n\n"
+        f"Текущее название: <b>{escape(current_name)}</b>\n\n"
+        "Введите новое название:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:prod:{prod_key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_rename_product)
+async def msg_adm_rename_product(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    prod_key = data.get("rename_prod_key", "")
+    cat_key = data.get("prod_manage_cat", "")
+    await state.clear()
+    await db_rename_product(prod_key, new_name)
+    await message.answer(
+        f"✅ Товар переименован: <b>{escape(new_name)}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 К товару", callback_data=f"adm:prod:{prod_key}")],
+            [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adm:catalog:cat:{cat_key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:prod:delask:"))
+async def cb_adm_prod_delask(call: CallbackQuery, state: FSMContext) -> None:
+    """Подтверждение удаления товара."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, name, price, _ = product
+    price_str = f"{int(price)}₽" if price == int(price) else f"{price}₽"
+    await send_or_edit(
+        call,
+        f"🗑 <b>Удалить товар?</b>\n\n"
+        f"<b>{escape(name)}</b> — {price_str}\n\n"
+        "⚠️ Это действие необратимо. Все данные о товаре будут удалены.\n"
+        "История заказов на этот товар сохранится.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"adm:prod:delyes:{prod_key}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:prod:{prod_key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:prod:delyes:"))
+async def cb_adm_prod_delyes(call: CallbackQuery, state: FSMContext) -> None:
+    """Выполнить удаление товара."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    name = product[1] if product else prod_key
+    all_prods = await db_all_products()
+    prod_row = next((p for p in all_prods if p["key"] == prod_key), None)
+    cat_key = prod_row["category"] if prod_row else ""
+    await db_delete_product(prod_key)
+    await send_or_edit(
+        call,
+        f"🗑 Товар <b>{escape(name)}</b> удалён.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К списку товаров", callback_data=f"adm:catalog:cat:{cat_key}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:prod:"))
+async def cb_adm_prod(call: CallbackQuery, state: FSMContext) -> None:
+    """Страница управления конкретным товаром."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    parts = call.data.split(":", 2)
+    prod_key = parts[2]
+
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    key, name, price, delivery = product
+    # Определяем категорию
+    all_prods = await db_all_products()
+    prod_row = next((p for p in all_prods if p["key"] == prod_key), None)
+    cat_key = prod_row["category"] if prod_row else ""
+    cat = await db_get_category(cat_key) if cat_key else None
+    cat_label = f"{cat['emoji']} {cat['name']}" if cat else cat_key
+    status = "✅ активен" if (prod_row and prod_row.get("active")) else "❌ скрыт"
+    price_str = f"{int(price)}₽" if price == int(price) else f"{price}₽"
+    text = (
+        f"📦 <b>{escape(name)}</b>\n\n"
+        f"Цена: <b>{price_str}</b>\n"
+        f"Статус: {status}\n"
+        f"Выдача: {escape(delivery)}\n"
+        f"Категория: {escape(cat_label)}"
+    )
+    await send_or_edit(call, text, kb_product_manage(prod_key, cat_key))
+    await state.update_data(prod_manage_cat=cat_key)
+
+
+# ---- Переименование категории ----
+
+
+@dp.callback_query(F.data.startswith("adm:catname:"))
+async def cb_adm_catname(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало переименования категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_rename_cat_name)
+    await state.update_data(rename_cat_key=key)
+    await send_or_edit(
+        call,
+        f"✏️ <b>Переименование категории</b>\n\n"
+        f"Текущее название: <b>{escape(cat['name'])}</b>\n\n"
+        "Введите новое название (покупатели увидят его в магазине):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_rename_cat_name)
+async def msg_adm_rename_cat_name(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    new_name = (message.text or "").strip()
+    if not new_name:
+        await message.answer("⚠️ Название не может быть пустым. Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    key = data.get("rename_cat_key", "")
+    await state.clear()
+    await db_rename_category(key, new_name)
+    cat = await db_get_category(key)
+    label = f"{cat['emoji']} {new_name}" if cat else new_name
+    await message.answer(
+        f"✅ Категория переименована: <b>{escape(label)}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:catemoji:"))
+async def cb_adm_catemoji(call: CallbackQuery, state: FSMContext) -> None:
+    """Начало смены эмодзи категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 2)[2]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_rename_cat_emoji)
+    await state.update_data(rename_cat_key=key)
+    await send_or_edit(
+        call,
+        f"🖼 <b>Эмодзи категории</b>\n\n"
+        f"Текущий эмодзи: {cat['emoji']}\n\n"
+        "Отправьте новый эмодзи одним сообщением:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_rename_cat_emoji)
+async def msg_adm_rename_cat_emoji(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    emoji = (message.text or "").strip()
+    if not emoji:
+        await message.answer("⚠️ Эмодзи не может быть пустым. Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    key = data.get("rename_cat_key", "")
+    await state.clear()
+    await db_set_category_emoji(key, emoji)
+    cat = await db_get_category(key)
+    label = f"{emoji} {cat['name']}" if cat else emoji
+    await message.answer(
+        f"✅ Эмодзи категории обновлён: <b>{escape(label)}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки категории", callback_data=f"adm:catcfg:{key}")],
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+# ---- Удаление категории ----
+
+
+@dp.callback_query(F.data.startswith("adm:catdel:ask:"))
+async def cb_adm_catdel_ask(call: CallbackQuery, state: FSMContext) -> None:
+    """Предупреждение перед удалением категории."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    key = call.data.split(":", 3)[3]
+    cat = await db_get_category(key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    all_prods = await db_all_products()
+    prod_count = sum(1 for p in all_prods if p["category"] == key)
+    await state.set_state(AdminStates.waiting_cat_delete_confirm)
+    await state.update_data(catdel_key=key)
+    await send_or_edit(
+        call,
+        f"🗑 <b>Удаление категории: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+        f"Вместе с категорией будут удалены <b>{prod_count} товаров</b>.\n"
+        "История заказов сохранится.\n\n"
+        "⚠️ Это действие <b>необратимо</b>.\n\n"
+        "Для подтверждения напишите слово <code>УДАЛИТЬ</code>:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_cat_delete_confirm)
+async def msg_adm_catdel_confirm(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    data = await state.get_data()
+    key = data.get("catdel_key", "")
+    if (message.text or "").strip() != "УДАЛИТЬ":
+        await message.answer(
+            "⚠️ Неверное слово. Напишите ровно <code>УДАЛИТЬ</code> для подтверждения:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+            ]),
+        )
+        return
+    cat = await db_get_category(key)
+    name = f"{cat['emoji']} {cat['name']}" if cat else key
+    await state.clear()
+    await db_delete_category(key)
+    await message.answer(
+        f"🗑 Категория <b>{escape(name)}</b> и все её товары удалены.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Каталог", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+# ---- Настройки (курсы и лимиты) ----
+
+@dp.callback_query(F.data == "adm:settings")
+async def cb_adm_settings(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    settings = await db_all_settings()
+    lines = [
+        f"• {_SETTING_LABELS.get(s['key'], s['key'])}: <b>{s['value']}</b>"
+        for s in settings
+    ]
+    text = "<b>⚙️ Курсы и лимиты</b>\n\n" + "\n".join(lines) + "\n\nНажмите на строку, чтобы изменить значение."
+    await send_or_edit(call, text, kb_settings_list(settings))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:settings:edit:"))
+async def cb_adm_settings_edit(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    key = call.data.split(":", 3)[3]
+    current = await db_get_setting(key, "—")
+    label = _SETTING_LABELS.get(key, key)
+    await state.set_state(AdminStates.waiting_edit_setting_value)
+    await state.update_data(edit_setting_key=key, edit_setting_label=label)
+    await send_or_edit(
+        call,
+        f"✏️ <b>{escape(label)}</b>\n\n"
+        f"Текущее значение: <b>{current}</b>\n\n"
+        "Введите новое значение (число, можно дробное через точку):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:settings")],
+        ]),
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_edit_setting_value)
+async def msg_adm_edit_setting(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        val = float(raw)
+        if val <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("⚠️ Введите положительное число (например: 1.5 или 10). Попробуйте ещё раз:")
+        return
+    data = await state.get_data()
+    key = data.get("edit_setting_key", "")
+    label = data.get("edit_setting_label", key)
+    await state.clear()
+    # Для целочисленных настроек сохраняем без дробной части
+    save_val = str(int(val)) if val == int(val) else str(val)
+    await db_set_setting(key, save_val)
+    await message.answer(
+        f"✅ <b>{escape(label)}</b> обновлено: <b>{save_val}</b>",
+        parse_mode="HTML",
+        reply_markup=kb_admin_main(message.from_user.id),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:users:"))
+async def cb_adm_users(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    try:
+        page = max(0, int(call.data.split(":", 2)[2]))
+    except (ValueError, IndexError):
+        page = 0
+    total = await db_users_count()
+    users = await db_list_users(USERS_PAGE_SIZE, page * USERS_PAGE_SIZE)
+    if not users and page > 0:
+        page = 0
+        users = await db_list_users(USERS_PAGE_SIZE, 0)
+    await state.update_data(admin_users_last_page=page)
+    if total == 0:
+        await send_or_edit(
+            call,
+            "<b>👥 Пользователей пока нет.</b>",
+            kb_admin_main(call.from_user.id),
+        )
+        await call.answer()
+        return
+    text = (
+        f"<b>👥 Пользователи бота</b>\n"
+        f"Всего: <b>{total}</b>\n\n"
+        "Нажмите на пользователя, чтобы открыть карточку."
+    )
+    await send_or_edit(call, text, kb_admin_users(users, page, total))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:user:"))
+async def cb_adm_user_open(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    try:
+        target_id = int(call.data.split(":", 2)[2])
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+    data = await state.get_data()
+    page = int(data.get("admin_users_last_page", 0) or 0)
+    await state.clear()
+    await state.update_data(admin_user_from_list_page=page)
+    await _send_admin_user_card(call, target_id, state)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:find")
+async def cb_adm_find(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    await state.set_state(AdminStates.waiting_user_id)
+    kb_find = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
+        call, "🔍 Отправьте Telegram ID пользователя одним сообщением.", kb_find,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_user_id)
+async def msg_adm_user_id(message: Message, state: FSMContext) -> None:
+    uid = message.from_user.id
+    # Доступно всем сотрудникам: Founder, Admin (через adm:find),
+    # Moderator (через mod:find_user), Helper (через hlp:find_user)
+    if not _is_staff(uid):
+        return
+    await _try_delete(message)
+    target_id = parse_positive_int(message.text)
+    if target_id is None:
+        await _edit_prompt(state, "⚠️ Введите корректный числовой Telegram ID.",
+                           InlineKeyboardMarkup(inline_keyboard=[[
+                               InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")
+                           ]]))
+        return
+    data = await state.get_data()
+    panel_return = data.get("mod_panel_return", "")
+    hlp_mode = data.get("hlp_mode", False)
+    await state.clear()
+    user_row = await db_find_user(target_id)
+    if not user_row:
+        not_found_kb = (
+            kb_helper_panel() if hlp_mode
+            else kb_moderator_panel() if panel_return == "mod:panel"
+            else kb_admin_main(uid)
+        )
+        await _state_edit(
+            message, state,
+            f"❌ Пользователь с ID <code>{target_id}</code> не найден.",
+            not_found_kb,
+        )
+        return
+    blocked = bool(user_row.get("is_blacklisted"))
+    orders_cnt = await db_orders_count(target_id)
+
+    if hlp_mode:
+        # Helper: базовая карточка без баланса и действий
+        text = (
+            "<b>👤 Карточка пользователя</b>\n\n"
+            f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
+            f"Username: @{escape(user_row.get('username') or '—')}\n"
+            f"Имя: {escape(user_row.get('first_name') or '—')}\n"
+            f"Заказов: <b>{orders_cnt}</b>\n"
+            f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
+        )
+        kb_back = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Другой пользователь", callback_data="hlp:find_user")],
+            [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+        ])
+        await _state_edit(message, state, text, kb_back)
+    elif panel_return == "mod:panel":
+        # Moderator: полная карточка, без финансовых действий
+        text = (
+            "<b>👤 Карточка пользователя</b>\n\n"
+            f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
+            f"Username: @{escape(user_row.get('username') or '—')}\n"
+            f"Имя: {escape(user_row.get('first_name') or '—')}\n"
+            f"Баланс: <b>{user_row['balance']}₽</b>\n"
+            f"Заказов: <b>{orders_cnt}</b>\n"
+            f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
+        )
+        kb_back = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Другой пользователь", callback_data="mod:find_user")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="mod:panel")],
+        ])
+        await _state_edit(message, state, text, kb_back)
+    else:
+        # Founder / Administrator: полная карточка с действиями
+        text = (
+            "<b>👤 Карточка пользователя</b>\n\n"
+            f"Telegram ID: <code>{user_row['tg_id']}</code>\n"
+            f"Username: @{escape(user_row.get('username') or '—')}\n"
+            f"Имя: {escape(user_row.get('first_name') or '—')}\n"
+            f"Баланс: <b>{user_row['balance']}₽</b>\n"
+            f"Заказов: <b>{orders_cnt}</b>\n"
+            f"Чёрный список: {'<b>да</b>' if blocked else 'нет'}"
+        )
+        await _state_edit(
+            message, state,
+            text,
+            kb_admin_user(target_id, blocked, from_list_page=None, viewer_id=message.from_user.id),
+        )
+
+
+@dp.callback_query(F.data.startswith("adm:credit:"))
+async def cb_adm_credit(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    target_id = int(call.data.split(":")[2])
+    prev = await state.get_data()
+    saved_source = prev.get("admin_user_from_list_page")
+    await state.set_state(AdminStates.waiting_credit_amount)
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
+        call,
+        f"➕ Сколько рублей начислить пользователю <code>{target_id}</code>?\n"
+        "Отправьте число одним сообщением.",
+        kb_cancel,
+    )
+    await state.update_data(
+        adm_target_id=target_id, admin_user_from_list_page=saved_source,
+        _prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id,
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_credit_amount)
+async def msg_adm_credit(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    amount = parse_positive_int(message.text)
+    if amount is None:
+        await _edit_prompt(state, "⚠️ Введите положительное число рублей.",
+                           InlineKeyboardMarkup(inline_keyboard=[[
+                               InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")
+                           ]]))
+        return
+    data = await state.get_data()
+    target_id = int(data.get("adm_target_id", 0))
+    saved_source = data.get("admin_user_from_list_page")
+    await state.clear()
+    if saved_source is not None:
+        await state.update_data(admin_user_from_list_page=saved_source)
+    if not target_id:
+        await message.answer("Не указан пользователь.", reply_markup=kb_admin_main(message.from_user.id))
+        return
+    new_balance = await db_credit_balance(
+        target_id, amount, kind="admin_add", reason="Начисление администратором"
+    )
+    await db_audit_staff_action(
+        message.from_user.id, "credit_balance", "user", str(target_id)
+    )
+    try:
+        await bot.send_message(
+            target_id,
+            f"✅ <b>Администратор начислил вам {_fmt_price(amount)}₽</b>\n"
+            f"Текущий баланс: <b>{_fmt_price(new_balance)}₽</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    from_list_page = saved_source if saved_source is not None else None
+    from_list_page = int(from_list_page) if from_list_page is not None else None
+    await _state_edit(
+        message, state,
+        f"✅ Начислено {_fmt_price(amount)}₽. Новый баланс: <b>{_fmt_price(new_balance)}₽</b>",
+        kb_admin_user(
+            target_id,
+            await db_is_blacklisted(target_id),
+            from_list_page=from_list_page,
+            viewer_id=message.from_user.id,
+        ),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:reset:"))
+async def cb_adm_reset(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    target_id = int(call.data.split(":")[2])
+    old_balance = await db_get_balance(target_id)
+    await db_set_balance(target_id, 0)
+    await db_audit_staff_action(
+        call.from_user.id, "reset_balance", "user", str(target_id)
+    )
+    if old_balance:
+        await db_add_transaction(
+            target_id,
+            -old_balance,
+            kind="admin_reset",
+            reason="Обнуление администратором",
+        )
+    try:
+        await bot.send_message(
+            target_id,
+            "♻️ <b>Ваш баланс был обнулён администратором.</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await _send_admin_user_card(call, target_id, state)
+    await call.answer("Баланс обнулён")
+
+
+@dp.callback_query(F.data.startswith("adm:block:"))
+async def cb_adm_block(call: CallbackQuery, state: FSMContext) -> None:
+    if not _senior_staff(call.from_user.id):
+        await call.answer("Только Founder и Administrator.", show_alert=True)
+        return
+    target_id = int(call.data.split(":")[2])
+    await db_set_blacklist(target_id, True)
+    await db_audit_staff_action(
+        call.from_user.id, "blacklist_user", "user", str(target_id)
+    )
+    try:
+        await bot.send_message(
+            target_id,
+            "🚫 <b>Вы добавлены в чёрный список магазина.</b>\n"
+            "Доступ к боту ограничен.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await _send_admin_user_card(call, target_id, state)
+    await call.answer("В чёрном списке")
+
+
+@dp.callback_query(F.data.startswith("adm:unblock:"))
+async def cb_adm_unblock(call: CallbackQuery, state: FSMContext) -> None:
+    if not _senior_staff(call.from_user.id):
+        await call.answer("Только Founder и Administrator.", show_alert=True)
+        return
+    target_id = int(call.data.split(":")[2])
+    await db_set_blacklist(target_id, False)
+    await db_audit_staff_action(
+        call.from_user.id, "unblacklist_user", "user", str(target_id)
+    )
+    try:
+        await bot.send_message(
+            target_id,
+            "✅ <b>Вы исключены из чёрного списка.</b> Доступ к боту восстановлен.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await _send_admin_user_card(call, target_id, state)
+    await call.answer("Убран из ЧС")
+
+
+@dp.callback_query(F.data.startswith("adm:tx:"))
+async def cb_adm_transactions(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    parts = call.data.split(":")
+    # формат: adm:tx:<id> или adm:tx:<id>:<page>
+    try:
+        target_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    total = await db_transactions_count(target_id)
+    total_pages = max(1, (total + _TX_PAGE_SIZE - 1) // _TX_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    txs = await db_get_transactions(target_id, limit=_TX_PAGE_SIZE, offset=page * _TX_PAGE_SIZE)
+
+    if not txs and total == 0:
+        text = (
+            f"📜 <b>История транзакций</b>\n"
+            f"Пользователь: <code>{target_id}</code>\n\n"
+            "Операций нет."
+        )
+    else:
+        lines = [f"📜 <b>История транзакций</b>  {page + 1}/{total_pages}\n"
+                 f"Пользователь: <code>{target_id}</code>"]
+        for t in txs:
+            date = _fmt_msk(t["created_at"])
+            sign = "➕" if t["amount"] > 0 else "➖"
+            lines.append(
+                f"{sign} <b>{abs(t['amount'])}₽</b> — {escape(_format_tx_kind(t['kind']))}"
+                + (f"\n<i>{escape(t['reason'])}</i>" if t["reason"] else "")
+                + f"\n<i>{date}</i>"
+            )
+        text = "\n\n".join(lines)
+
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm:tx:{target_id}:{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"adm:tx:{target_id}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")])
+    await show_section(call, "tx_history", text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("adm:back:"))
+async def cb_adm_back(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    await _send_admin_user_card(call, target_id, state)
+
+
+# =====================================================================
+# Реферальные статусы и промокоды — Административная панель
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("adm:ref_level:"))
+async def cb_adm_ref_level(call: CallbackQuery) -> None:
+    """Показывает список уровней для выбора."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    user_row = await db_find_user(target_id)
+    if not user_row:
+        await call.answer("Пользователь не найден.", show_alert=True)
+        return
+
+    current_level = user_row.get("referral_level", 0) or 0
+    current_name = _ref_level_name(current_level)
+
+    text = (
+        f"<b>👑 Выдача реферального статуса</b>\n\n"
+        f"Пользователь: <code>{target_id}</code>\n"
+        f"Текущий статус: <b>{current_name}</b> (ур. {current_level})\n\n"
+        "Выберите новый уровень.\n"
+        "<i>⚠️ При повышении уровня пользователь получит уведомление "
+        "и промокоды на скидку. При понижении промокоды не отзываются.</i>"
+    )
+
+    rows = []
+    for lvl, (name, disc) in REFERRAL_LEVELS.items():
+        marker = " ✓" if lvl == current_level else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{name} — {disc}%{marker}",
+            callback_data=f"adm:set_ref_level:{target_id}:{lvl}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
+    )])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:set_ref_level:"))
+async def cb_adm_set_ref_level(call: CallbackQuery, state: FSMContext) -> None:
+    """Устанавливает реферальный уровень пользователю."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        parts = call.data.split(":")
+        target_id = int(parts[2])
+        new_level = int(parts[3])
+    except (ValueError, IndexError):
+        return
+
+    if new_level not in REFERRAL_LEVELS:
+        await call.answer("Некорректный уровень.", show_alert=True)
+        return
+
+    old_level = await db_admin_set_ref_level(target_id, new_level)
+    level_name = _ref_level_name(new_level)
+    discount = _ref_discount_pct(new_level)
+
+    if new_level > old_level:
+        try:
+            await bot.send_message(
+                target_id,
+                f"🎉 <b>Вам выдан новый реферальный статус!</b>\n\n"
+                f"🏆 Ваш статус: <b>{level_name}</b>\n"
+                f"💰 Скидка на все заказы: <b>{discount}%</b>\n\n"
+                f"Скидка применяется автоматически при каждой покупке.\n"
+                f"<i>Не действует на Telegram Stars.</i>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить {target_id} о новом уровне: {e}")
+    elif new_level < old_level:
+        try:
+            await bot.send_message(
+                target_id,
+                f"ℹ️ Ваш реферальный статус изменён.\n\n"
+                f"Новый статус: <b>{level_name}</b>\n"
+                f"💰 Скидка на все заказы: <b>{discount}%</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    action = "повышен" if new_level > old_level else ("понижен" if new_level < old_level else "не изменён")
+    text = (
+        f"✅ <b>Статус {action}.</b>\n\n"
+        f"Пользователь: <code>{target_id}</code>\n"
+        f"Новый статус: <b>{level_name}</b> (ур. {new_level})"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Реф. промокоды", callback_data=f"adm:ref_promos:{target_id}")],
+        [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:ref_promos:"))
+async def cb_adm_ref_promos(call: CallbackQuery) -> None:
+    """Просмотр реферальных промокодов пользователя."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    promos = await db_admin_get_user_ref_promos(target_id)
+
+    if not promos:
+        text = (
+            f"<b>🎟️ Реферальные промокоды</b>\n"
+            f"Пользователь: <code>{target_id}</code>\n\n"
+            "Промокодов нет."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+        ])
+        await send_or_edit(call, text, kb)
+        return
+
+    lines = [f"<b>🎟️ Реферальные промокоды</b>\nПользователь: <code>{target_id}</code>\n"]
+    rows = []
+    active_count = 0
+    for p in promos:
+        status = "✅ активен" if not p["used_at"] and p["is_active"] else "🔴 использован/отозван"
+        lines.append(f"• <code>{p['code']}</code> — скидка {p['discount_pct']}% — {status}")
+        if not p["used_at"]:
+            active_count += 1
+            rows.append([InlineKeyboardButton(
+                text=f"❌ Удалить {p['code']}",
+                callback_data=f"adm:del_ref_promo:{target_id}:{p['promo_id']}",
+            )])
+
+    if active_count > 0:
+        rows.append([InlineKeyboardButton(
+            text=f"🗑️ Удалить все активные ({active_count})",
+            callback_data=f"adm:del_all_ref_promos:{target_id}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
+    )])
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…"
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:del_ref_promo:"))
+async def cb_adm_del_ref_promo(call: CallbackQuery) -> None:
+    """Удаляет реферальный промокод из инвентаря пользователя."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        parts = call.data.split(":")
+        target_id = int(parts[2])
+        promo_id = int(parts[3])
+    except (ValueError, IndexError):
+        return
+
+    ok = await db_admin_remove_user_promo(target_id, promo_id)
+    if ok:
+        await call.answer("Промокод удалён.", show_alert=False)
+    else:
+        await call.answer("Промокод не найден или уже удалён.", show_alert=True)
+
+    # Обновляем список
+    promos = await db_admin_get_user_ref_promos(target_id)
+    if not promos:
+        text = (
+            f"<b>🎟️ Реферальные промокоды</b>\n"
+            f"Пользователь: <code>{target_id}</code>\n\n"
+            "Промокодов нет."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+        ])
+    else:
+        lines = [f"<b>🎟️ Реферальные промокоды</b>\nПользователь: <code>{target_id}</code>\n"]
+        rows = []
+        active_count = 0
+        for p in promos:
+            status = "✅ активен" if not p["used_at"] and p["is_active"] else "🔴 использован/отозван"
+            lines.append(f"• <code>{p['code']}</code> — скидка {p['discount_pct']}% — {status}")
+            if not p["used_at"]:
+                active_count += 1
+                rows.append([InlineKeyboardButton(
+                    text=f"❌ Удалить {p['code']}",
+                    callback_data=f"adm:del_ref_promo:{target_id}:{p['promo_id']}",
+                )])
+        if active_count > 0:
+            rows.append([InlineKeyboardButton(
+                text=f"🗑️ Удалить все активные ({active_count})",
+                callback_data=f"adm:del_all_ref_promos:{target_id}",
+            )])
+        rows.append([InlineKeyboardButton(
+            text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}"
+        )])
+        text = "\n".join(lines)
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:del_all_ref_promos:"))
+async def cb_adm_del_all_ref_promos(call: CallbackQuery) -> None:
+    """Модератор удаляет все активные реферальные промокоды пользователя."""
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+
+    deleted = await db_delete_all_user_ref_promos(target_id)
+    await call.answer(f"Удалено: {deleted} промокодов", show_alert=True)
+
+    text = (
+        f"<b>🎟️ Реферальные промокоды</b>\n"
+        f"Пользователь: <code>{target_id}</code>\n\n"
+        f"✅ Удалено активных промокодов: <b>{deleted}</b>\n\n"
+        "Промокодов нет."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:back:{target_id}")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+# =====================================================================
+# Промокоды — вспомогательные функции
+# =====================================================================
+
+
+def _promo_is_valid_now(promo: dict) -> bool:
+    """Проверяет, активен ли промокод в данный момент."""
+    if not promo.get("is_active"):
+        return False
+    now = datetime.now(timezone.utc)
+    starts = promo.get("starts_at")
+    expires = promo.get("expires_at")
+    if starts:
+        try:
+            if now < datetime.fromisoformat(starts):
+                return False
+        except ValueError:
+            pass
+    if expires:
+        try:
+            if now > datetime.fromisoformat(expires):
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def _fmt_promo_dates(promo: dict) -> str:
+    starts = promo.get("starts_at")
+    expires = promo.get("expires_at")
+    if not starts and not expires:
+        return "Бессрочно"
+    parts = []
+    if starts:
+        try:
+            dt = datetime.fromisoformat(starts)
+            parts.append(f"с {dt.strftime('%d.%m.%Y')}")
+        except ValueError:
+            parts.append(f"с {starts}")
+    if expires:
+        try:
+            dt = datetime.fromisoformat(expires)
+            parts.append(f"по {dt.strftime('%d.%m.%Y')}")
+        except ValueError:
+            parts.append(f"по {expires}")
+    return " ".join(parts)
+
+
+def _parse_date_iso(date_str: str) -> str | None:
+    try:
+        d = datetime.strptime(date_str.strip(), "%d.%m.%Y")
+        return d.replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return None
+
+
+# =====================================================================
+# Промокоды — Административная панель
+# =====================================================================
+
+
+def kb_admin_promos(promos: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for p in promos:
+        icon = "✅" if p["is_active"] else "🔴"
+        if p.get("discount_pct", 0) > 0 and p.get("promo_price", 0) == 0:
+            label = f"{icon} {p['code']} — скидка {p['discount_pct']}% ({p['product_title']})"
+        else:
+            label = f"{icon} {p['code']} — {p['product_title']} ({p['promo_price']}₽)"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"adm:promo:{p['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="adm:promo_create")])
+    if promos:
+        rows.append([InlineKeyboardButton(text="🗑️ Удалить все промокоды", callback_data="adm:del_all_promos")])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def kb_promo_game_select() -> InlineKeyboardMarkup:
+    # Захардкоженные категории (ключи)
+    _HARDCODED_KEYS = {"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"}
+    rows = [
+        [InlineKeyboardButton(text="🟦 Roblox", callback_data="adm:promo_game:Roblox")],
+        [InlineKeyboardButton(text="⭐ Brawl Stars", callback_data="adm:promo_game:Brawl Stars")],
+        [InlineKeyboardButton(text="✨ Telegram Stars", callback_data="adm:promo_game:Telegram Stars")],
+        [InlineKeyboardButton(text="📦 Другое", callback_data="adm:promo_game:Другое")],
+    ]
+    # Добавляем категории, созданные через админку (не зарезервированные, не отключённые)
+    try:
+        cats = await db_all_categories()
+        for cat in cats:
+            if cat["key"] not in _HARDCODED_KEYS and not cat.get("disabled"):
+                label = f"{cat['emoji']} {cat['name']}"
+                rows.append([InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"adm:promo_game:{cat['name']}",
+                )])
+    except Exception:
+        pass
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm:panel")
+async def cb_adm_panel(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    await send_or_edit(
+        call,
+        "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
+        kb_admin_main(call.from_user.id),
+    )
+
+
+@dp.callback_query(F.data == "adm:promos")
+async def cb_adm_promos(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    promos = await db_list_regular_promos()
+    text = "<b>🎟️ Промокоды</b>\n\n"
+    if promos:
+        text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления."
+    else:
+        text += "Промокодов пока нет. Создайте первый!"
+    await send_or_edit(call, text, kb_admin_promos(promos))
+
+
+@dp.callback_query(F.data == "adm:del_all_promos")
+async def cb_adm_del_all_promos(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    deleted = await db_delete_all_regular_promos()
+    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
+    text = (
+        "<b>🎟️ Промокоды</b>\n\n"
+        f"✅ Удалено промокодов: <b>{deleted}</b>\n\n"
+        "Промокодов пока нет. Создайте первый!"
+    )
+    await send_or_edit(call, text, kb_admin_promos([]))
+
+
+@dp.callback_query(F.data == "adm:promo_create")
+async def cb_adm_promo_create(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.set_state(PromoStates.waiting_code_input)
+    sent = await send_or_edit(
+        call,
+        "📝 <b>Создание промокода</b>\n\n"
+        "Введите <b>код промокода</b> (только латинские буквы, цифры и знак «_», без пробелов).\n\n"
+        "Например: <code>SALE20</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+        ])
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+
+
+@dp.message(PromoStates.waiting_code_input)
+async def msg_promo_code_input(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    code = (message.text or "").strip().upper()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
+    if not code or not code.replace("_", "").isalnum():
+        await _state_edit(
+            message, state,
+            "⚠️ Код может содержать только латинские буквы, цифры и «_». Попробуйте ещё раз.",
+            _cancel_kb,
+        )
+        return
+    existing = await db_get_promo_by_code(code)
+    if existing:
+        await _state_edit(
+            message, state,
+            f"⚠️ Промокод <code>{escape(code)}</code> уже существует. Введите другой.",
+            _cancel_kb,
+        )
+        return
+    await state.update_data(promo_code=code)
+    await state.set_state(PromoStates.waiting_discount_type)
+    await _state_edit(
+        message, state,
+        f"Код: <code>{escape(code)}</code>\n\n"
+        "📋 Выберите <b>тип промокода</b>:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏷️ Фиксированная цена", callback_data="adm:promo_type:price")],
+            [InlineKeyboardButton(text="💸 Скидка %", callback_data="adm:promo_type:pct")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:promo_type:"))
+async def cb_adm_promo_type(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    data = await state.get_data()
+    if not data.get("promo_code"):
+        return
+    promo_type = call.data.split(":")[2]
+    code = data.get("promo_code", "?")
+
+    if promo_type == "pct":
+        await state.update_data(promo_game="pct_discount")
+        await state.set_state(PromoStates.waiting_product)
+        await send_or_edit(
+            call,
+            f"Код: <code>{escape(code)}</code>  |  Тип: <b>Скидка %</b>\n\n"
+            "📦 Введите <b>описание промокода</b>\n"
+            "Например: <code>Скидка на любой товар</code>",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+            ])
+        )
+    else:
+        await state.set_state(None)
+        await send_or_edit(
+            call,
+            f"Код: <code>{escape(code)}</code>\n\n"
+            "🎮 Выберите <b>игру</b>, для которой действует промокод:",
+            await kb_promo_game_select()
+        )
+
+
+@dp.callback_query(F.data.startswith("adm:promo_game:"))
+async def cb_adm_promo_game(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    game = call.data.split(":", 2)[2]
+    await state.update_data(promo_game=game)
+    await state.set_state(PromoStates.waiting_product)
+    data = await state.get_data()
+    code = data.get("promo_code", "?")
+    await send_or_edit(
+        call,
+        f"Код: <code>{escape(code)}</code>  |  Игра: <b>{escape(game)}</b>\n\n"
+        "📦 Введите <b>название товара</b>\n"
+        "Например: <code>800 Robux</code> или <code>Brawl Pass Plus</code>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+        ])
+    )
+
+
+@dp.message(PromoStates.waiting_product)
+async def msg_promo_product(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    product = (message.text or "").strip()
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
+    if not product:
+        await _state_edit(message, state, "⚠️ Название товара не может быть пустым. Введите ещё раз.", _cancel_kb)
+        return
+    await state.update_data(promo_product=product)
+    data = await state.get_data()
+    code = data.get("promo_code", "?")
+    game = data.get("promo_game", "?")
+
+    if game == "pct_discount":
+        await state.set_state(PromoStates.waiting_discount_pct)
+        await _state_edit(
+            message, state,
+            f"Код: <code>{escape(code)}</code>  |  Тип: <b>Скидка %</b>\n"
+            f"Описание: <b>{escape(product)}</b>\n\n"
+            "💸 Введите <b>размер скидки в процентах</b> (целое число, например: <code>10</code>):",
+            _cancel_kb,
+        )
+    else:
+        await state.set_state(PromoStates.waiting_price)
+        await _state_edit(
+            message, state,
+            f"Код: <code>{escape(code)}</code>  |  Игра: <b>{escape(game)}</b>\n"
+            f"Товар: <b>{escape(product)}</b>\n\n"
+            "💰 Введите <b>цену по промокоду</b> (целое число в рублях, например: <code>150</code>):",
+            _cancel_kb,
+        )
+
+
+@dp.message(PromoStates.waiting_discount_pct)
+async def msg_promo_discount_pct(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    pct = parse_positive_int(message.text)
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
+    if pct is None or pct > 99:
+        await _state_edit(message, state, "⚠️ Введите корректное значение от 1 до 99.", _cancel_kb)
+        return
+    await state.update_data(promo_discount_pct=pct)
+    await state.set_state(PromoStates.waiting_dates)
+    await _state_edit(
+        message, state,
+        f"Скидка: <b>{pct}%</b>\n\n"
+        "📅 Введите <b>срок действия</b> промокода:\n\n"
+        "• Дата окончания: <code>31.12.2026</code>\n"
+        "• Диапазон дат: <code>01.07.2026 - 31.12.2026</code>\n"
+        "• Или нажмите кнопку ниже, если промокод бессрочный:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♾️ Бессрочно", callback_data="adm:promo_dates:forever")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ]),
+    )
+
+
+@dp.message(PromoStates.waiting_price)
+async def msg_promo_price_input(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    price = parse_positive_int(message.text)
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
+    if price is None:
+        await _state_edit(message, state, "⚠️ Введите корректную сумму (целое число больше 0).", _cancel_kb)
+        return
+    await state.update_data(promo_price=price)
+    await state.set_state(PromoStates.waiting_dates)
+    await _state_edit(
+        message, state,
+        "📅 Введите <b>срок действия</b> промокода:\n\n"
+        "• Дата окончания: <code>31.12.2026</code>\n"
+        "• Диапазон дат: <code>01.07.2026 - 31.12.2026</code>\n"
+        "• Или нажмите кнопку ниже, если промокод бессрочный:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♾️ Бессрочно", callback_data="adm:promo_dates:forever")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "adm:promo_dates:forever")
+async def cb_adm_promo_dates_forever(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.update_data(promo_starts_at=None, promo_expires_at=None)
+    await state.set_state(PromoStates.waiting_max_uses)
+    data = await state.get_data()
+    code = data.get("promo_code", "?")
+    await send_or_edit(
+        call,
+        f"Код: <code>{escape(code)}</code>  |  Срок: ♾️ Бессрочно\n\n"
+        "🔢 Введите <b>лимит активаций</b> (сколько раз можно использовать этот промокод).\n\n"
+        "Или нажмите кнопку, если промокод без ограничений:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ]),
+    )
+
+
+@dp.message(PromoStates.waiting_dates)
+async def msg_promo_dates(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    starts_at = None
+    expires_at = None
+    _cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
+    ])
+    separators = [" - ", "–", "—", " — "]
+    sep_found = next((s for s in separators if s in text), None)
+    if sep_found:
+        parts = text.split(sep_found, 1)
+        starts_at = _parse_date_iso(parts[0])
+        expires_at = _parse_date_iso(parts[1])
+        if not starts_at or not expires_at:
+            await _state_edit(
+                message, state,
+                "⚠️ Не удалось распознать даты. Используйте формат:\n"
+                "<code>01.07.2026 - 31.12.2026</code>",
+                _cancel_kb,
+            )
+            return
+    else:
+        expires_at = _parse_date_iso(text)
+        if not expires_at:
+            await _state_edit(
+                message, state,
+                "⚠️ Не удалось распознать дату. Введите в формате <code>31.12.2026</code>.",
+                _cancel_kb,
+            )
+            return
+    data = await state.get_data()
+    await state.update_data(promo_starts_at=starts_at, promo_expires_at=expires_at)
+    await state.set_state(PromoStates.waiting_max_uses)
+    code = data.get("promo_code", "?")
+    await _state_edit(
+        message, state,
+        f"Код: <code>{escape(code)}</code>  |  Срок установлен.\n\n"
+        "🔢 Введите <b>лимит активаций</b> (сколько раз можно использовать этот промокод).\n\n"
+        "Или нажмите кнопку, если промокод без ограничений:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+        ]),
+    )
+
+
+async def _save_promo_and_confirm(
+    call: CallbackQuery,
+    data: dict,
+    starts_at: str | None,
+    expires_at: str | None,
+    max_uses: int | None = None,
+) -> None:
+    code = data.get("promo_code")
+    game = data.get("promo_game")
+    product = data.get("promo_product")
+    price = data.get("promo_price")
+    discount_pct = data.get("promo_discount_pct", 0)
+    is_pct = game == "pct_discount"
+    if not all([code, game, product]) or (not is_pct and not price):
+        await send_or_edit(call, "❌ Ошибка: данные утеряны. Начните заново.", kb_admin_promos([]))
+        return
+    promo_id = await db_create_promo(
+        code, game, product,
+        0 if is_pct else int(price),
+        starts_at, expires_at,
+        discount_pct=int(discount_pct) if is_pct else 0,
+        max_uses=max_uses,
+    )
+    dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    uses_str = f"<b>{max_uses}</b>" if max_uses is not None else "♾️ без ограничений"
+    if is_pct:
+        detail_line = f"💸 Скидка: <b>{discount_pct}%</b>\n"
+    else:
+        detail_line = f"💰 Цена: <b>{price}₽</b>\n"
+    text = (
+        "✅ <b>Промокод создан!</b>\n\n"
+        f"🎟️ Код: <code>{escape(code)}</code>\n"
+        f"🎮 Тип: {escape(game)}\n"
+        f"📦 Описание: {escape(product)}\n"
+        f"{detail_line}"
+        f"📅 Срок: {dates_str}\n"
+        f"🔢 Лимит активаций: {uses_str}\n"
+        f"🆔 ID: {promo_id}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Все промокоды", callback_data="adm:promos")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+async def _save_promo_and_confirm_msg(
+    message: Message,
+    data: dict,
+    starts_at: str | None,
+    expires_at: str | None,
+    max_uses: int | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    code = data.get("promo_code")
+    game = data.get("promo_game")
+    product = data.get("promo_product")
+    price = data.get("promo_price")
+    discount_pct = data.get("promo_discount_pct", 0)
+    is_pct = game == "pct_discount"
+    _kb_err = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Начать заново", callback_data="adm:promo_create")]
+    ])
+    if not all([code, game, product]) or (not is_pct and not price):
+        if state:
+            await _state_edit(message, state, "❌ Ошибка: данные утеряны. Начните заново.", _kb_err)
+        else:
+            await message.answer("❌ Ошибка: данные утеряны. Начните заново.", reply_markup=_kb_err)
+        return
+    promo_id = await db_create_promo(
+        code, game, product,
+        0 if is_pct else int(price),
+        starts_at, expires_at,
+        discount_pct=int(discount_pct) if is_pct else 0,
+        max_uses=max_uses,
+    )
+    dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
+    uses_str = f"<b>{max_uses}</b>" if max_uses is not None else "♾️ без ограничений"
+    if is_pct:
+        detail_line = f"💸 Скидка: <b>{discount_pct}%</b>\n"
+    else:
+        detail_line = f"💰 Цена: <b>{price}₽</b>\n"
+    text = (
+        "✅ <b>Промокод создан!</b>\n\n"
+        f"🎟️ Код: <code>{escape(code)}</code>\n"
+        f"🎮 Тип: {escape(game)}\n"
+        f"📦 Описание: {escape(product)}\n"
+        f"{detail_line}"
+        f"📅 Срок: {dates_str}\n"
+        f"🔢 Лимит активаций: {uses_str}\n"
+        f"🆔 ID: {promo_id}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Все промокоды", callback_data="adm:promos")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:panel")],
+    ])
+    if state:
+        await _state_edit(message, state, text, kb)
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "adm:promo_maxuses:unlimited")
+async def cb_adm_promo_maxuses_unlimited(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    data = await state.get_data()
+    await state.clear()
+    starts_at = data.get("promo_starts_at")
+    expires_at = data.get("promo_expires_at")
+    await _save_promo_and_confirm(call, data, starts_at=starts_at, expires_at=expires_at, max_uses=None)
+
+
+@dp.message(PromoStates.waiting_max_uses)
+async def msg_promo_max_uses(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    val = parse_positive_int(message.text)
+    if val is None or val <= 0:
+        await _state_edit(
+            message, state,
+            "⚠️ Введите положительное целое число (например: <code>100</code>) "
+            "или нажмите кнопку «Без ограничений».",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+            ]),
+        )
+        return
+    data = await state.get_data()
+    await state.clear()
+    starts_at = data.get("promo_starts_at")
+    expires_at = data.get("promo_expires_at")
+    await _save_promo_and_confirm_msg(message, data, starts_at=starts_at, expires_at=expires_at, max_uses=val, state=state)
+
+
+@dp.callback_query(F.data.startswith("adm:promo:"))
+async def cb_adm_promo_detail(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    parts = call.data.split(":")
+    if len(parts) < 3:
+        return
+    try:
+        promo_id = int(parts[2])
+    except ValueError:
+        return
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+    usage_cnt = await db_promo_usage_count(promo_id)
+    status_text = "✅ Активен" if promo["is_active"] else "🔴 Отключён"
+    toggle_text = "🔴 Отключить" if promo["is_active"] else "✅ Включить"
+    dates_str = _fmt_promo_dates(promo)
+    valid_now = _promo_is_valid_now(promo)
+    max_uses = promo.get("max_uses")
+    if max_uses is not None:
+        uses_line = f"🔢 Использовано: <b>{usage_cnt} / {max_uses}</b>"
+    else:
+        uses_line = f"🔢 Использовано: <b>{usage_cnt}</b>  (♾️ без лимита)"
+    is_pct = promo.get("game") == "pct_discount"
+    price_line = (
+        f"💸 Скидка: <b>{promo['discount_pct']}%</b>"
+        if is_pct and promo.get("discount_pct", 0) > 0
+        else f"💰 Цена: <b>{promo['promo_price']}₽</b>"
+    )
+    text = (
+        f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"{price_line}\n"
+        f"📅 Срок: {dates_str}\n"
+        f"📊 Статус: {status_text}  |  Сейчас: {'🟢 работает' if valid_now else '🔴 не работает'}\n"
+        f"{uses_line}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"adm:promo_toggle:{promo_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"adm:promo_del:{promo_id}")],
+        [InlineKeyboardButton(text="⬅️ К промокодам", callback_data="adm:promos")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:promo_toggle:"))
+async def cb_adm_promo_toggle(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        promo_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+    new_state = not bool(promo["is_active"])
+    await db_toggle_promo(promo_id, new_state)
+    status_word = "включён" if new_state else "отключён"
+    await call.answer(f"Промокод {status_word}.", show_alert=True)
+    promo["is_active"] = int(new_state)
+    usage_cnt = await db_promo_usage_count(promo_id)
+    toggle_text = "🔴 Отключить" if new_state else "✅ Включить"
+    dates_str = _fmt_promo_dates(promo)
+    valid_now = _promo_is_valid_now(promo)
+    status_text = "✅ Активен" if new_state else "🔴 Отключён"
+    text = (
+        f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Цена: <b>{promo['promo_price']}₽</b>\n"
+        f"📅 Срок: {dates_str}\n"
+        f"📊 Статус: {status_text}  |  Сейчас: {'🟢 работает' if valid_now else '🔴 не работает'}\n"
+        f"🛒 Использовано: <b>{usage_cnt}</b> раз"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"adm:promo_toggle:{promo_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"adm:promo_del:{promo_id}")],
+        [InlineKeyboardButton(text="⬅️ К промокодам", callback_data="adm:promos")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:promo_del:"))
+async def cb_adm_promo_del(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        promo_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+    text = (
+        f"❓ Удалить промокод <code>{escape(promo['code'])}</code>?\n\n"
+        "Все данные об использовании тоже будут удалены."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Да, удалить", callback_data=f"adm:promo_del_yes:{promo_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:promo:{promo_id}")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("adm:promo_del_yes:"))
+async def cb_adm_promo_del_yes(call: CallbackQuery) -> None:
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        promo_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    await db_delete_promo(promo_id)
+    await call.answer("Промокод удалён.", show_alert=True)
+    promos = await db_list_regular_promos()
+    text = "<b>🎟️ Промокоды</b>\n\n"
+    text += f"Всего промокодов: <b>{len(promos)}</b>\n\nНажмите на промокод для управления." if promos else "Промокодов пока нет."
+    await send_or_edit(call, text, kb_admin_promos(promos))
+
+
+# =====================================================================
+# Промокоды — Покупатель
+# =====================================================================
+
+
+@dp.callback_query(F.data == "enter_promo")
+async def cb_enter_promo(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await state.set_state(ShopStates.waiting_promo_input)
+    sent = await send_or_edit(
+        call,
+        "✏️ <b>Ввести промокод</b>\n\n"
+        "Отправьте код промокода одним сообщением.\n"
+        "Промокод появится в разделе «Мои промокоды».",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")]
+        ])
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+
+
+@dp.message(ShopStates.waiting_promo_input)
+async def msg_promo_input(message: Message, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    kb_back = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")]
+    ])
+    if not code:
+        await _state_edit(message, state, "Введите код промокода.", kb_back)
+        return
+
+    promo = await db_get_promo_by_code(code)
+
+    if not promo:
+        await _state_edit(
+            message, state,
+            "❌ Промокод не найден. Проверьте правильность написания.",
+            kb_back,
+        )
+        return
+
+    if not _promo_is_valid_now(promo):
+        await _state_edit(
+            message, state,
+            "❌ Этот промокод недействителен или истёк.",
+            kb_back,
+        )
+        return
+
+    claimed = await db_claim_promo(message.from_user.id, promo["id"])
+    await state.clear()
+
+    if not claimed:
+        await message.answer(
+            f"ℹ️ Промокод <code>{escape(promo['code'])}</code> уже есть в вашем профиле.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎟️ Мои промокоды", callback_data="my_promos")],
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+            ])
+        )
+        return
+
+    await message.answer(
+        f"✅ Промокод <code>{escape(promo['code'])}</code> добавлен!\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Цена по промокоду: <b>{promo['promo_price']}₽</b>\n"
+        f"📅 Срок: {_fmt_promo_dates(promo)}\n\n"
+        "Найдите его в разделе <b>«Мои промокоды»</b> и воспользуйтесь предложением!",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎟️ Мои промокоды", callback_data="my_promos")],
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+        ])
+    )
+
+
+@dp.callback_query(F.data == "my_promos")
+async def cb_my_promos(call: CallbackQuery) -> None:
+    await call.answer()
+    all_promos = await db_get_user_promos(call.from_user.id)
+    # Реферальные промокоды — только в отдельной вкладке
+    user_promos = [up for up in all_promos if up.get("game") != "ref_discount"]
+
+    if not user_promos:
+        await send_or_edit(
+            call,
+            "🎟️ <b>Мои промокоды</b>\n\n"
+            "У вас пока нет промокодов.\n"
+            "Нажмите «Ввести промокод», чтобы добавить.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")],
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+            ])
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for up in user_promos:
+        used = up.get("used_at") is not None
+        valid = _promo_is_valid_now(up) and not used
+        if used:
+            icon = "✔️"
+        elif valid:
+            icon = "✅"
+        else:
+            icon = "🔴"
+        if up.get("game") == "pct_discount" and up.get("discount_pct", 0) > 0:
+            label = f"{icon} {up['code']} — скидка {up['discount_pct']}% ({up['product_title']})"
+        else:
+            label = f"{icon} {up['code']} — {up['product_title']} ({up['promo_price']}₽)"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"promo_detail:{up['promo_id']}")])
+
+    rows.append([InlineKeyboardButton(text="🗑️ Удалить использованные", callback_data="del_all_my_promos")])
+    rows.append([InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")])
+    rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")])
+
+    await send_or_edit(
+        call,
+        "🎟️ <b>Мои промокоды</b>\n\n"
+        "✅ — доступен  |  ✔️ — использован  |  🔴 — недействителен\n\n"
+        "Нажмите на промокод, чтобы посмотреть детали.",
+        InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+@dp.callback_query(F.data.startswith("promo_detail:"))
+async def cb_promo_detail(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+
+    if not user_promo:
+        await call.answer("Этот промокод не принадлежит вам.", show_alert=True)
+        return
+
+    used = user_promo.get("used_at") is not None
+    valid_now = _promo_is_valid_now(promo)
+    dates_str = _fmt_promo_dates(promo)
+
+    is_pct_type = promo.get("game") == "pct_discount"
+    if is_pct_type and promo.get("discount_pct", 0) > 0:
+        price_line = f"💸 Скидка: <b>{promo['discount_pct']}%</b>\n"
+    else:
+        price_line = f"💰 Цена по промокоду: <b>{promo['promo_price']}₽</b>\n"
+
+    text = (
+        f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"{price_line}"
+        f"📅 Срок: {dates_str}\n\n"
+    )
+
+    if used:
+        text += "✔️ <b>Промокод уже использован.</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+        ])
+    elif not valid_now:
+        text += "🔴 <b>Промокод недействителен или истёк.</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+        ])
+    else:
+        text += "✅ <b>Промокод активен!</b> Воспользуйтесь предложением ниже."
+        if promo.get("game") in ("ref_discount", "pct_discount"):
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🎯 Применить скидку к следующей покупке",
+                    callback_data=f"activate_ref_promo:{promo_id}",
+                )],
+                [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+            ])
+        else:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛒 Воспользоваться предложением", callback_data=f"use_promo_confirm:{promo_id}")],
+                [InlineKeyboardButton(text="⬅️ Мои промокоды", callback_data="my_promos")],
+            ])
+
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("use_promo_confirm:"))
+async def cb_use_promo_confirm(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+
+    if not user_promo or user_promo.get("used_at") is not None:
+        await call.answer("Промокод уже использован или недоступен.", show_alert=True)
+        return
+
+    if not _promo_is_valid_now(promo):
+        await call.answer("Промокод недействителен или истёк.", show_alert=True)
+        return
+
+    balance = await db_get_balance(call.from_user.id)
+    price = float(promo["promo_price"])
+
+    text = (
+        "<b>🛒 Подтверждение покупки по промокоду</b>\n\n"
+        f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Сумма: <b>{_fmt_price(price)}₽</b>\n"
+        f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
+        "Оплата спишется с внутреннего баланса бота.\n"
+        "Подтвердите покупку:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Оплатить", callback_data=f"use_promo_go:{promo_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"promo_detail:{promo_id}")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data.startswith("use_promo_go:"))
+async def cb_use_promo_go(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo:
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+
+    if not user_promo or user_promo.get("used_at") is not None:
+        await call.answer("Промокод уже использован или недоступен.", show_alert=True)
+        return
+
+    if not _promo_is_valid_now(promo):
+        await call.answer("Промокод недействителен или истёк.", show_alert=True)
+        return
+
+    user = call.from_user
+    price = float(promo["promo_price"])
+    title = f"[Промокод {promo['code']}] {promo['game']} — {promo['product_title']}"
+
+    if user.id in _processing_payments:
+        await call.answer("Платёж уже обрабатывается, подождите...", show_alert=True)
+        return
+    _processing_payments.add(user.id)
+    try:
+        ok = await db_try_charge(user.id, price)
+        if not ok:
+            balance = await db_get_balance(user.id)
+            text = (
+                "❌ <b>Недостаточно средств на балансе.</b>\n\n"
+                f"Сумма заказа: {_fmt_price(price)}₽\n"
+                f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
+                "Пополните баланс и повторите попытку."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+            ])
+            await send_or_edit(call, text, kb)
+            return
+
+        order_id = await db_create_order(user.id, title, price, status="Оплачен", category="promo")
+        await db_add_transaction(user.id, -price, kind="purchase", reason=f"Заказ #{order_id}: {title}")
+        await db_use_promo(user.id, promo_id)
+    finally:
+        _processing_payments.discard(user.id)
+
+    new_balance = await db_get_balance(user.id)
+
+    text = (
+        "✅ <b>Оплата прошла успешно. Заказ принят в обработку.</b>\n\n"
+        f"🧾 Номер заказа: <code>#{order_id}</code>\n"
+        f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Сумма: <b>{_fmt_price(price)}₽</b>\n"
+        f"💼 Остаток на балансе: <b>{_fmt_price(new_balance)}₽</b>\n\n"
+        "С вами свяжется модератор. Вы также можете написать первым."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Связаться с модератором", callback_data=f"contact_mod:{order_id}")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(call, text, kb)
+
+    username = f"@{user.username}" if user.username else "—"
+    admin_text = (
+        f"🎟️ <b>Новый заказ по промокоду!</b>\n\n"
+        f"👤 {escape(user.first_name or '?')} ({username})\n"
+        f"🆔 TG ID: <code>{user.id}</code>\n"
+        f"🧾 Заказ: <code>#{order_id}</code>\n"
+        f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
+        f"🎮 Игра: {escape(promo['game'])}\n"
+        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"💰 Сумма: <b>{_fmt_price(price)}₽</b>"
+    )
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Выполнен #{order_id}", callback_data=f"mod:done:{order_id}")],
+        [InlineKeyboardButton(text="📧 Запросить код из почты", callback_data=f"mod:req_email:{order_id}:{user.id}")],
+        [InlineKeyboardButton(text="💸 Возврат", callback_data=f"mod:refund:{order_id}")],
+    ])
+    await notify_moderator_order(
+        admin_text, reply_markup=admin_kb, order_id=order_id
+    )
+
+
+@dp.callback_query(F.data.startswith("mod:done:"))
+async def cb_mod_done(call: CallbackQuery) -> None:
+    """Модератор отмечает заказ выполненным через кнопку в чате модератора."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        order_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    order = await db_get_order(order_id)
+    if not order:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.get("status") == "Выполнен":
+        await call.answer("Этот заказ уже отмечен как выполненный.", show_alert=True)
+        return
+
+    tg_id = order["tg_id"]
+    await db_update_order_status(order_id, "Выполнен")
+
+    referrer_id, level_up, new_level, is_first = await db_process_referral(tg_id)
+    if is_first and referrer_id:
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎉 По вашей реферальной ссылке совершена первая покупка!\n"
+                f"{'📈 Ваш уровень повышен до ' + str(new_level) + '!' if level_up else ''}",
+            )
+        except Exception:
+            pass
+
+    try:
+        user_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить получение",
+                        callback_data=f"confirm_receipt:{order_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отклонить",
+                        callback_data=f"reject_receipt:{order_id}",
+                    )
+                ],
+            ]
+        )
+        confirm_msg = await bot.send_message(
+            tg_id,
+            f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+            "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
+            "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
+            "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
+            "прислать скриншот из игры в качестве доказательства.\n\n"
+            "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
+            parse_mode="HTML",
+            reply_markup=user_kb,
+        )
+        await db_set_confirm_pending(order_id, True)
+        asyncio.create_task(
+            _auto_confirm_receipt(order_id, tg_id, confirm_msg.message_id)
+        )
+    except Exception:
+        pass
+
+    await call.answer(f"Заказ #{order_id} отмечен выполненным.", show_alert=True)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    try:
+        await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("mod:req_email:"))
+async def cb_mod_req_email_code(call: CallbackQuery) -> None:
+    """Модератор запрашивает у покупателя код из письма на почте."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        parts = call.data.split(":")
+        order_id = int(parts[2])
+        tg_id = int(parts[3])
+    except (ValueError, IndexError):
+        return
+
+    try:
+        await bot.send_message(
+            tg_id,
+            f"📧 <b>Требуется код из письма</b>\n\n"
+            f"По вашему заказу <b>#{order_id}</b> модератор ожидает код подтверждения,\n"
+            "который был отправлен на вашу электронную почту.\n\n"
+            "Пожалуйста, откройте письмо и пришлите код следующим сообщением.",
+            parse_mode="HTML",
+        )
+        # Ставим покупателю состояние ожидания кода удалённо
+        buyer_key = StorageKey(bot_id=bot.id, chat_id=tg_id, user_id=tg_id)
+        buyer_fsm = FSMContext(storage=dp.storage, key=buyer_key)
+        await buyer_fsm.set_state(ShopStates.waiting_email_code)
+        await buyer_fsm.update_data(email_code_order_id=order_id)
+        await call.answer("Запрос отправлен покупателю.", show_alert=True)
+    except Exception:
+        await call.answer("Не удалось отправить уведомление покупателю.", show_alert=True)
+
+
+@dp.message(ShopStates.waiting_email_code)
+async def msg_email_code(message: Message, state: FSMContext) -> None:
+    """Покупатель прислал код из почты — пересылаем модератору."""
+    data = await state.get_data()
+    order_id = data.get("email_code_order_id", "?")
+    await state.clear()
+
+    await notify_moderator(
+        f"📧 <b>Код из почты по заказу #{order_id}</b>\n\n"
+        f"<code>{escape(message.text or '(нет текста)')}</code>"
+    )
+    await message.answer(
+        "✅ Код отправлен модератору. Ожидайте выполнения заказа.",
+    )
+
+
+@dp.callback_query(F.data.startswith("mod:refund:"))
+async def cb_mod_refund(call: CallbackQuery, state: FSMContext) -> None:
+    """Модератор инициирует возврат — запрашивает причину."""
+    await call.answer()
+    if not _is_moderator(call.from_user.id):
+        return
+    try:
+        order_id = int(call.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+
+    order = await db_get_order(order_id)
+    if not order:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.get("status") == "Возврат":
+        await call.answer("Возврат по этому заказу уже был выполнен.", show_alert=True)
+        return
+
+    # Сохраняем данные и переходим в состояние ожидания причины
+    await state.set_state(AdminStates.waiting_refund_reason)
+    await state.update_data(
+        refund_order_id=order_id,
+        refund_tg_id=order["tg_id"],
+        refund_amount=float(order["price"]),
+        refund_msg_chat_id=call.message.chat.id,
+        refund_msg_id=call.message.message_id,
+    )
+    await call.message.reply(
+        f"💸 <b>Возврат по заказу #{order_id}</b>\n\n"
+        f"Сумма: <b>{_fmt_price(float(order['price']))}₽</b>\n\n"
+        "Введите <b>причину возврата</b> — она будет отправлена покупателю.\n"
+        "Или нажмите кнопку, чтобы отменить.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="mod:refund_cancel")]
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "mod:refund_cancel")
+async def cb_mod_refund_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    """Отмена ввода причины возврата."""
+    await call.answer()
+    await state.clear()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+
+@dp.message(AdminStates.waiting_refund_reason)
+async def msg_mod_refund_reason(message: Message, state: FSMContext) -> None:
+    """Модератор ввёл причину — выполняем возврат."""
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer(
+            "⚠️ Причина не может быть пустой. Введите текст причины возврата.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="mod:refund_cancel")]
+            ]),
+        )
+        return
+
+    data = await state.get_data()
+    order_id: int = data["refund_order_id"]
+    tg_id: int = data["refund_tg_id"]
+    refund_amount: float = data["refund_amount"]
+    orig_chat_id: int = data["refund_msg_chat_id"]
+    orig_msg_id: int = data["refund_msg_id"]
+    await state.clear()
+
+    # Проверяем — вдруг уже сделан другим модератором
+    order = await db_get_order(order_id)
+    if not order or order.get("status") == "Возврат":
+        await message.answer("⚠️ Возврат по этому заказу уже был выполнен.")
+        return
+
+    await db_update_order_status(order_id, "Возврат")
+    await db_credit_balance(tg_id, refund_amount, kind="refund",
+                             reason=f"Возврат по заказу #{order_id}: {reason}")
+
+    # Уведомление покупателю с причиной
+    try:
+        await bot.send_message(
+            tg_id,
+            f"💸 <b>Возврат по заказу #{order_id}</b>\n\n"
+            f"На ваш баланс возвращено <b>{_fmt_price(refund_amount)}₽</b>.\n\n"
+            f"📝 <b>Причина:</b> {escape(reason)}\n\n"
+            "Если остались вопросы — обратитесь в поддержку.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    # Редактируем оригинальное сообщение модератора — убираем кнопки, добавляем статус
+    try:
+        orig_msg = await bot.edit_message_reply_markup(
+            chat_id=orig_chat_id, message_id=orig_msg_id, reply_markup=None
+        )
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            orig_chat_id,
+            f"💸 <b>Возврат по заказу #{order_id} выполнен</b>\n"
+            f"Сумма: <b>{_fmt_price(refund_amount)}₽</b>\n"
+            f"Причина: {escape(reason)}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    try:
+        await bot.unpin_chat_message(orig_chat_id, orig_msg_id)
+    except Exception:
+        pass
+
+    await message.answer(
+        f"✅ Возврат {_fmt_price(refund_amount)}₽ по заказу #{order_id} выполнен.",
+        parse_mode="HTML",
+    )
+
+
+# =====================================================================
+# Запуск
+# =====================================================================
+
+
+def _acquire_single_instance_lock() -> None:
+    """Не даём запустить больше одной копии бота на хосте."""
+    import fcntl
+    lock_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), ".bot.lock"
+    )
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logging.error(
+            "Другая копия бота уже запущена. Завершаю текущий процесс."
+        )
+        raise SystemExit(0)
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    globals()["_bot_lock_file"] = lock_file
+
+
+# =====================================================================
+# Ответ покупателю из чата модератора
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("reply_buyer:"))
+async def cb_reply_buyer(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник нажимает «Ответить покупателю» — бот просит написать текст."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    buyer_id = int(call.data.split(":")[1])
+    await state.set_state(AdminStates.waiting_mod_reply)
+    await state.update_data(mod_reply_buyer_id=buyer_id)
+    await call.message.answer(
+        f"✍️ Напишите сообщение покупателю (поддерживается текст и фото).\n\n"
+        f"Для отмены нажмите кнопку ниже.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="mod_reply_cancel"),
+        ]]),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mod_reply_cancel")
+async def cb_mod_reply_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_staff(call.from_user.id):
+        return
+    await state.clear()
+    await call.message.edit_text("❌ Ответ покупателю отменён.")
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_mod_reply)
+async def msg_mod_reply(message: Message, state: FSMContext) -> None:
+    if not _is_staff(message.from_user.id):
+        return
+    data = await state.get_data()
+    buyer_id = int(data.get("mod_reply_buyer_id", 0))
+    await state.clear()
+    try:
+        await bot.copy_message(
+            chat_id=buyer_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await message.answer("✅ Сообщение отправлено покупателю.")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить: {e}")
+
+
+# =====================================================================
+# Написать покупателю из управления заказом (ord_write_buyer)
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("ord_write_buyer:"))
+async def cb_ord_write_buyer(call: CallbackQuery, state: FSMContext) -> None:
+    """Сотрудник нажимает «Написать покупателю» в управлении заказом."""
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":")
+        order_id = int(parts[1])
+        buyer_id = int(parts[2])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    await state.set_state(AdminStates.waiting_ord_buyer_reply)
+    await state.update_data(ord_reply_order_id=order_id, ord_reply_buyer_id=buyer_id)
+    await call.message.answer(
+        f"✍️ <b>Написать покупателю (заказ #{order_id})</b>\n\n"
+        "Отправьте текст или фото — покупатель получит его с пометкой «Сообщение от администратора».\n\n"
+        "Для отмены нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="ord_write_buyer_cancel"),
+        ]]),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "ord_write_buyer_cancel")
+async def cb_ord_write_buyer_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_staff(call.from_user.id):
+        return
+    await state.clear()
+    await call.message.edit_text("❌ Отправка сообщения покупателю отменена.")
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_ord_buyer_reply)
+async def msg_ord_buyer_reply(message: Message, state: FSMContext) -> None:
+    if not _is_staff(message.from_user.id):
+        return
+    data = await state.get_data()
+    order_id = int(data.get("ord_reply_order_id", 0))
+    buyer_id = int(data.get("ord_reply_buyer_id", 0))
+    await state.clear()
+
+    # Кнопка «Ответить администратору» — появится у покупателя под сообщением
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✍️ Ответить администратору",
+            callback_data=f"buyer_write_admin:{order_id}",
+        )
+    ]])
+
+    try:
+        # Пересылаем контент и добавляем пометку
+        caption_prefix = f"📩 <b>Сообщение от администратора по заказу #{order_id}</b>"
+        if message.photo:
+            await bot.send_photo(
+                chat_id=buyer_id,
+                photo=message.photo[-1].file_id,
+                caption=(
+                    f"{caption_prefix}\n\n{escape(message.caption or '')}"
+                    if message.caption
+                    else caption_prefix
+                ),
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+        elif message.text:
+            await bot.send_message(
+                chat_id=buyer_id,
+                text=f"{caption_prefix}\n\n{escape(message.text)}",
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+        else:
+            # Любой другой тип (голос, документ и т.д.) — форвард + отдельное сообщение
+            await bot.forward_message(
+                chat_id=buyer_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            await bot.send_message(
+                chat_id=buyer_id,
+                text=caption_prefix,
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+        await message.answer(f"✅ Сообщение по заказу #{order_id} отправлено покупателю.")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить покупателю: {e}")
+
+
+# =====================================================================
+# Покупатель пишет администратору (buyer_write_admin)
+# =====================================================================
+
+
+@dp.callback_query(F.data.startswith("buyer_write_admin:"))
+async def cb_buyer_write_admin(call: CallbackQuery, state: FSMContext) -> None:
+    """Покупатель нажимает «Написать администратору» после оплаты заказа."""
+    try:
+        order_id = int(call.data.split(":")[1])
+    except (IndexError, ValueError):
+        await call.answer()
+        return
+    # Проверяем, что этот пользователь — владелец заказа
+    order = await db_get_order(order_id)
+    if not order or int(order.get("tg_id", 0)) != call.from_user.id:
+        await call.answer("Заказ не найден или недоступен.", show_alert=True)
+        return
+    await state.set_state(ShopStates.waiting_buyer_msg)
+    await state.update_data(buyer_msg_order_id=order_id)
+    sent = await send_or_edit(
+        call,
+        f"✍️ <b>Написать администратору (заказ #{order_id})</b>\n\n"
+        "Отправьте ваш вопрос или сообщение — текст или фото.\n\n"
+        "Для отмены нажмите кнопку ниже.",
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"buyer_msg_cancel:{order_id}"),
+        ]]),
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("buyer_msg_cancel:"))
+async def cb_buyer_msg_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        order_id = int(call.data.split(":")[1])
+    except (IndexError, ValueError):
+        order_id = 0
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await send_or_edit(call, f"❌ Отправка сообщения отменена.", kb)
+    await call.answer()
+
+
+@dp.message(ShopStates.waiting_buyer_msg)
+async def msg_buyer_write_admin(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    data = await state.get_data()
+    order_id = int(data.get("buyer_msg_order_id", 0))
+    await state.clear()
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "—"
+    caption_prefix = (
+        f"💬 <b>Сообщение от покупателя по заказу #{order_id}</b>\n\n"
+        f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
+        f"Telegram ID: <code>{user.id}</code>"
+    )
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="✍️ Написать покупателю",
+            callback_data=f"ord_write_buyer:{order_id}:{user.id}",
+        )
+    ]])
+
+    # Отправляем назначенному сотруднику, или всем Founder/Admin если никто не взял
+    order = await db_get_order(order_id) if order_id else None
+    sent_to_staff = False
+    if order and order.get("assigned_to"):
+        staff_id = int(order["assigned_to"])
+        try:
+            if message.photo:
+                await bot.send_photo(
+                    chat_id=staff_id,
+                    photo=message.photo[-1].file_id,
+                    caption=(
+                        f"{caption_prefix}\n\n{escape(message.caption or '')}"
+                        if message.caption
+                        else caption_prefix
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=reply_kb,
+                )
+            elif message.text:
+                await bot.send_message(
+                    chat_id=staff_id,
+                    text=f"{caption_prefix}\n\n{escape(message.text)}",
+                    parse_mode="HTML",
+                    reply_markup=reply_kb,
+                )
+            else:
+                await bot.send_message(staff_id, caption_prefix, parse_mode="HTML")
+                await bot.forward_message(
+                    chat_id=staff_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
+                await bot.send_message(staff_id, "⬆️ Сообщение покупателя", reply_markup=reply_kb)
+            sent_to_staff = True
+        except Exception as e:
+            logging.warning(f"Не удалось отправить сообщение покупателя сотруднику {staff_id}: {e}")
+
+    if not sent_to_staff:
+        # Заказ не назначен — рассылаем всем Founder + Admin
+        recipients = await db_get_order_staff_recipients()
+        for staff in recipients:
+            sid = int(staff["tg_id"])
+            try:
+                if message.photo:
+                    await bot.send_photo(
+                        chat_id=sid,
+                        photo=message.photo[-1].file_id,
+                        caption=(
+                            f"{caption_prefix}\n\n{escape(message.caption or '')}"
+                            if message.caption
+                            else caption_prefix
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=reply_kb,
+                    )
+                elif message.text:
+                    await bot.send_message(
+                        chat_id=sid,
+                        text=f"{caption_prefix}\n\n{escape(message.text)}",
+                        parse_mode="HTML",
+                        reply_markup=reply_kb,
+                    )
+                else:
+                    await bot.send_message(sid, caption_prefix, parse_mode="HTML")
+                    await bot.forward_message(
+                        chat_id=sid,
+                        from_chat_id=message.chat.id,
+                        message_id=message.message_id,
+                    )
+                    await bot.send_message(sid, "⬆️ Сообщение покупателя", reply_markup=reply_kb)
+            except Exception as e:
+                logging.warning(f"Не удалось отправить сообщение покупателя сотруднику {sid}: {e}")
+
+    kb_after = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✍️ Написать ещё",
+            callback_data=f"buyer_write_admin:{order_id}",
+        )],
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+    ])
+    await message.answer(
+        f"✅ Ваше сообщение по заказу <b>#{order_id}</b> передано администратору.\n\n"
+        "Когда он ответит — вы получите уведомление прямо в боте.",
+        parse_mode="HTML",
+        reply_markup=kb_after,
+    )
+
+
+# =====================================================================
+# Реферальная программа — пользовательские callback'и
+# =====================================================================
+
+
+@dp.callback_query(F.data == "referral_info")
+async def cb_referral_info(call: CallbackQuery) -> None:
+    await call.answer()
+    user_row, _ = await db_get_or_create_user(call.from_user)
+    level = user_row.get("referral_level", 0)
+    ref_count = user_row.get("referral_count", 0)
+    ref_code = user_row.get("referral_code") or ""
+    discount = _ref_discount_pct(level)
+    level_name = _ref_level_name(level)
+
+    # Ссылка вида https://t.me/BOTNAME?start=ref_CODE
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{ref_code}"
+
+    next_level = level + 1
+    if next_level <= 5:
+        next_refs_needed = next_level * REFERRAL_REFS_PER_LEVEL
+        refs_left = next_refs_needed - ref_count
+        next_level_name, next_discount = REFERRAL_LEVELS[next_level]
+        progress_text = (
+            f"\n📈 До уровня <b>{next_level_name}</b>: ещё <b>{refs_left}</b> реферал(ов)"
+        )
+    else:
+        progress_text = "\n🏆 Максимальный уровень достигнут!"
+
+    text = (
+        "<b>👥 Реферальная программа</b>\n\n"
+        f"Ваш статус: <b>{level_name}</b>\n"
+        f"Рефералов засчитано: <b>{ref_count}</b>\n"
+        f"Ваша скидка на заказы: <b>{discount}%</b>{' (не действует на Telegram Stars)' if discount else ''}\n"
+        f"{progress_text}\n\n"
+        f"🔗 Ваша реферальная ссылка:\n<code>{ref_link}</code>\n\n"
+        "<b>Как это работает:</b>\n"
+        "1. Поделитесь ссылкой с друзьями\n"
+        "2. Приглашённый получит 3 промокода на скидку 5%, если перейдёт по вашей ссылке\n"
+        "3. Когда приглашённый совершит первую покупку — вам засчитается реферал\n"
+        "4. Каждые 2 реферала — новый уровень с бонусными промокодами на скидку\n\n"
+        "<b>Уровни:</b>\n"
+    )
+    for lvl, (name, disc) in REFERRAL_LEVELS.items():
+        refs = lvl * REFERRAL_REFS_PER_LEVEL
+        current = " ← <b>Вы здесь</b>" if lvl == level else ""
+        text += f"• {name} — {refs} реф., скидка {disc}%{current}\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎟️ Мои реф. промокоды", callback_data="my_ref_promos")],
+        [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+@dp.callback_query(F.data == "my_ref_promos")
+async def cb_my_ref_promos(call: CallbackQuery) -> None:
+    """Реферальные промокоды пользователя — отдельная вкладка."""
+    await call.answer()
+    all_promos = await db_get_user_promos(call.from_user.id)
+    ref_promos = [up for up in all_promos if up.get("game") == "ref_discount"]
+
+    if not ref_promos:
+        await send_or_edit(
+            call,
+            "🎟️ <b>Мои реферальные промокоды</b>\n\n"
+            "У вас пока нет реферальных промокодов.\n"
+            "Приглашайте друзей и повышайте уровень!",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👥 Реф. программа", callback_data="referral_info")],
+                [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+            ])
+        )
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    active_count = 0
+    for up in ref_promos:
+        used = up.get("used_at") is not None
+        valid = _promo_is_valid_now(up) and not used
+        disc = up.get("discount_pct", 0)
+        if used:
+            label = f"✔️ {up['code']} — {disc}% (использован)"
+            rows.append([InlineKeyboardButton(text=label, callback_data="referral_info")])
+        elif valid:
+            active_count += 1
+            label = f"✅ {up['code']} — скидка {disc}%"
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"activate_ref_promo:{up['promo_id']}")])
+        else:
+            label = f"🔴 {up['code']} — {disc}% (недействителен)"
+            rows.append([InlineKeyboardButton(text=label, callback_data="referral_info")])
+
+    if active_count > 0:
+        rows.append([InlineKeyboardButton(
+            text=f"🗑️ Удалить все активные ({active_count})",
+            callback_data="del_all_ref_promos",
+        )])
+    rows.append([InlineKeyboardButton(text="👥 Реф. программа", callback_data="referral_info")])
+    rows.append([InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")])
+
+    await send_or_edit(
+        call,
+        f"🎟️ <b>Мои реферальные промокоды</b>\n\n"
+        f"✅ — активен (нажмите, чтобы применить к покупке)\n"
+        f"✔️ — использован  |  🔴 — недействителен\n\n"
+        f"Всего: <b>{len(ref_promos)}</b>, активных: <b>{active_count}</b>",
+        InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+@dp.callback_query(F.data == "del_all_ref_promos")
+async def cb_del_all_ref_promos(call: CallbackQuery) -> None:
+    """Пользователь удаляет все свои активные реферальные промокоды."""
+    deleted = await db_delete_all_user_ref_promos(call.from_user.id)
+    await call.answer(f"Удалено промокодов: {deleted}", show_alert=True)
+    await send_or_edit(
+        call,
+        "🎟️ <b>Мои реферальные промокоды</b>\n\n"
+        "Активных реферальных промокодов нет.\n"
+        "Приглашайте друзей и повышайте уровень!",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Реф. программа", callback_data="referral_info")],
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+        ])
+    )
+
+
+@dp.callback_query(F.data == "del_all_my_promos")
+async def cb_del_all_my_promos(call: CallbackQuery) -> None:
+    """Пользователь удаляет все использованные промокоды из своего инвентаря."""
+    deleted = await db_delete_all_used_user_promos(call.from_user.id)
+    await call.answer(f"Удалено использованных промокодов: {deleted}", show_alert=True)
+    await send_or_edit(
+        call,
+        "🎟️ <b>Мои промокоды</b>\n\n"
+        "У вас нет промокодов.\n"
+        "Нажмите «Ввести промокод», чтобы добавить.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Ввести промокод", callback_data="enter_promo")],
+            [InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile")],
+        ])
+    )
+
+
+@dp.callback_query(F.data.startswith("activate_ref_promo:"))
+async def cb_activate_ref_promo(call: CallbackQuery) -> None:
+    await call.answer()
+    try:
+        promo_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+
+    promo = await db_get_promo_by_id(promo_id)
+    if not promo or promo.get("game") not in ("ref_discount", "pct_discount"):
+        await call.answer("Промокод не найден.", show_alert=True)
+        return
+
+    user_promos = await db_get_user_promos(call.from_user.id)
+    user_promo = next((up for up in user_promos if up["promo_id"] == promo_id), None)
+    if not user_promo or user_promo.get("used_at") is not None:
+        await call.answer("Промокод уже использован или недоступен.", show_alert=True)
+        return
+
+    await db_set_active_ref_promo(call.from_user.id, promo_id)
+
+    discount = promo.get("discount_pct", 0)
+    text = (
+        f"✅ <b>Скидка {discount}% активирована!</b>\n\n"
+        f"При следующей покупке (кроме Telegram Stars) скидка применится автоматически.\n\n"
+        f"Промокод: <code>{promo['code']}</code>\n"
+        f"Скидка действует на один заказ.\n\n"
+        f"Перейдите в меню и выберите товар."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 В магазин", callback_data="shop")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main")],
+    ])
+    await send_or_edit(call, text, kb)
+
+
+# =====================================================================
+# Рассылка всем пользователям (только модератор)
+# =====================================================================
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext) -> None:
+    """Команда /broadcast — начать рассылку всем пользователям."""
+    if not _is_moderator(message.from_user.id):
+        return
+    await state.set_state(AdminStates.waiting_broadcast)
+    user_count = await db_users_count()
+    await message.answer(
+        f"📢 <b>Рассылка</b>\n\n"
+        f"Всего получателей: <b>{user_count}</b> чел.\n\n"
+        f"Пришлите сообщение (текст, фото, видео — любой формат).\n"
+        f"Оно будет отправлено каждому пользователю бота.\n\n"
+        f"Для отмены: /cancel",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("cancel"), AdminStates.waiting_broadcast)
+async def cmd_broadcast_cancel(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("❌ Рассылка отменена.")
+
+
+@dp.message(AdminStates.waiting_broadcast)
+async def msg_broadcast(message: Message, state: FSMContext) -> None:
+    """Получает сообщение от модератора и рассылает всем пользователям."""
+    if not _is_moderator(message.from_user.id):
+        return
+    await state.clear()
+    user_ids = await db_get_all_user_ids()
+    sent = 0
+    failed = 0
+    status_msg = await message.answer(
+        f"⏳ Рассылка запущена — {len(user_ids)} получателей..."
+    )
+    for uid in user_ids:
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # не превышаем лимиты Telegram (20 msg/s)
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"📨 Отправлено: <b>{sent}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>",
+        parse_mode="HTML",
+    )
+
+
+# =====================================================================
+# Экспорт данных (только модератор)
+# =====================================================================
+
+
+def _xlsx_style_sheet(ws, headers: list[str], rows: list[list], header_hex: str) -> None:
+    """Оформляет лист Excel: цветная шапка, автоширина колонок, зебра-подсветка, рамки, freeze panes."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    header_fill = PatternFill(start_color=header_hex, end_color=header_hex, fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True, size=11)
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    zebra_fill = PatternFill(start_color="F2F6FC", end_color="F2F6FC", fill_type="solid")
+
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    ws.freeze_panes = "A2"
+
+    for r_idx, row in enumerate(rows, start=2):
+        ws.append(row)
+        for cell in ws[r_idx]:
+            cell.border = border
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if r_idx % 2 == 0:
+                cell.fill = zebra_fill
+
+    for col_idx, header in enumerate(headers, start=1):
+        col_letter = get_column_letter(col_idx)
+        max_len = len(str(header))
+        for row in rows:
+            val = row[col_idx - 1]
+            max_len = max(max_len, len(str(val)) if val is not None else 0)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 45)
+
+    if rows:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(rows) + 1}"
+
+
+@dp.message(Command("export"))
+async def cmd_export(message: Message) -> None:
+    """Команда /export — красивая выгрузка всех данных магазина в Excel (только модератор)."""
+    if not _is_moderator(message.from_user.id):
+        return
+
+    wait_msg = await message.answer("⏳ Собираю данные и формирую отчёт, подождите...")
+
+    pool = await get_pool()
+
+    # Тестовый аккаунт модератора исключаем из всей статистики —
+    # его транзакции/заказы не отражают реальную активность магазина.
+    users = await pool.fetch(
+        "SELECT tg_id, username, first_name, balance, is_blacklisted, "
+        "referral_level, referral_count, created_at "
+        "FROM users WHERE tg_id != $1 ORDER BY tg_id",
+        MODERATOR_CHAT_ID,
+    )
+    orders = await pool.fetch(
+        "SELECT id, tg_id, title, price, status, category, contact, login_data, created_at "
+        "FROM orders WHERE tg_id != $1 ORDER BY id",
+        MODERATOR_CHAT_ID,
+    )
+    transactions = await pool.fetch(
+        "SELECT id, tg_id, amount, kind, reason, created_at "
+        "FROM transactions WHERE tg_id != $1 ORDER BY id",
+        MODERATOR_CHAT_ID,
+    )
+
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, PieChart, Reference
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+
+    # ---------- Лист "Сводка" ----------
+    ws_sum = wb.active
+    ws_sum.title = "📊 Сводка"
+
+    total_balance = sum(float(u["balance"] or 0) for u in users)
+    blacklisted_count = sum(1 for u in users if u["is_blacklisted"])
+    total_orders = len(orders)
+    completed_orders = sum(1 for o in orders if o["status"] == "Выполнен")
+    paid_orders = sum(1 for o in orders if o["status"] == "Оплачен")
+    refunded_orders = sum(1 for o in orders if "озврат" in (o["status"] or ""))
+    revenue = sum(float(o["price"] or 0) for o in orders if o["status"] in ("Выполнен", "Оплачен"))
+    topups = sum(float(t["amount"] or 0) for t in transactions if t["kind"] == "topup")
+    purchases_sum = sum(-float(t["amount"] or 0) for t in transactions if t["kind"] == "purchase")
+    avg_check = revenue / completed_orders if completed_orders else 0.0
+    success_rate = (completed_orders / total_orders * 100) if total_orders else 0.0
+
+    product_sales: dict[str, int] = {}
+    for o in orders:
+        if o["status"] in ("Выполнен", "Оплачен"):
+            product_sales[o["title"] or "—"] = product_sales.get(o["title"] or "—", 0) + 1
+    top_products = sorted(product_sales.items(), key=lambda kv: kv[1], reverse=True)[:10]
+
+    now_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d_%H-%M")
+
+    ws_sum["A1"] = "🛍️ Отчёт по магазину"
+    ws_sum["A1"].font = Font(size=20, bold=True, color="2F5597")
+    ws_sum.merge_cells("A1:D1")
+    ws_sum["A2"] = f"Сформировано: {now_str} МСК"
+    ws_sum["A2"].font = Font(size=10, italic=True, color="808080")
+    ws_sum.merge_cells("A2:D2")
+
+    kpi_rows = [
+        ("👥 Всего пользователей", len(users)),
+        ("🚫 В чёрном списке", blacklisted_count),
+        ("💰 Суммарный баланс пользователей (₽)", round(total_balance, 2)),
+        ("🛒 Всего заказов", total_orders),
+        ("✅ Выполнено заказов", completed_orders),
+        ("🕓 Ожидают выполнения (Оплачен)", paid_orders),
+        ("💸 Возвраты", refunded_orders),
+        ("📊 Успешность заказов (%)", round(success_rate, 1)),
+        ("🧮 Средний чек (₽)", round(avg_check, 2)),
+        ("📈 Выручка по заказам (₽)", round(revenue, 2)),
+        ("➕ Пополнений баланса (₽)", round(topups, 2)),
+        ("➖ Списано на покупки (₽)", round(purchases_sum, 2)),
+        ("🧾 Всего транзакций", len(transactions)),
+    ]
+    start_row = 4
+    ws_sum[f"A{start_row}"] = "Показатель"
+    ws_sum[f"B{start_row}"] = "Значение"
+    for col in ("A", "B"):
+        c = ws_sum[f"{col}{start_row}"]
+        c.font = Font(color="FFFFFF", bold=True)
+        c.fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
+        c.alignment = Alignment(horizontal="center")
+    for i, (label, value) in enumerate(kpi_rows, start=start_row + 1):
+        ws_sum[f"A{i}"] = label
+        ws_sum[f"B{i}"] = value
+        if i % 2 == 0:
+            for col in ("A", "B"):
+                ws_sum[f"{col}{i}"].fill = PatternFill(
+                    start_color="F2F6FC", end_color="F2F6FC", fill_type="solid"
+                )
+    ws_sum.column_dimensions["A"].width = 42
+    ws_sum.column_dimensions["B"].width = 20
+
+    # Круговая диаграмма по статусам заказов
+    status_counts: dict[str, int] = {}
+    for o in orders:
+        status_counts[o["status"] or "—"] = status_counts.get(o["status"] or "—", 0) + 1
+    if status_counts:
+        chart_start = start_row + len(kpi_rows) + 3
+        ws_sum[f"A{chart_start}"] = "Статус заказа"
+        ws_sum[f"B{chart_start}"] = "Количество"
+        for i, (status, count) in enumerate(status_counts.items(), start=chart_start + 1):
+            ws_sum[f"A{i}"] = status
+            ws_sum[f"B{i}"] = count
+        pie = PieChart()
+        pie.title = "Заказы по статусам"
+        data = Reference(ws_sum, min_col=2, min_row=chart_start, max_row=chart_start + len(status_counts))
+        cats = Reference(ws_sum, min_col=1, min_row=chart_start + 1, max_row=chart_start + len(status_counts))
+        pie.add_data(data, titles_from_data=True)
+        pie.set_categories(cats)
+        pie.height = 8
+        pie.width = 12
+        ws_sum.add_chart(pie, f"D{start_row}")
+
+    # Таблица "ТОП товаров"
+    if top_products:
+        top_start = chart_start + len(status_counts) + 3 if status_counts else start_row + len(kpi_rows) + 3
+        ws_sum[f"A{top_start}"] = "🏆 ТОП товаров"
+        ws_sum[f"A{top_start}"].font = Font(size=13, bold=True, color="2F5597")
+        ws_sum.merge_cells(f"A{top_start}:B{top_start}")
+
+        header_row = top_start + 1
+        ws_sum[f"A{header_row}"] = "Товар"
+        ws_sum[f"B{header_row}"] = "Продаж"
+        for col in ("A", "B"):
+            c = ws_sum[f"{col}{header_row}"]
+            c.font = Font(color="FFFFFF", bold=True)
+            c.fill = PatternFill(start_color="ED7D31", end_color="ED7D31", fill_type="solid")
+            c.alignment = Alignment(horizontal="center")
+
+        for i, (product, count) in enumerate(top_products, start=header_row + 1):
+            ws_sum[f"A{i}"] = product
+            ws_sum[f"B{i}"] = count
+            if i % 2 == 0:
+                for col in ("A", "B"):
+                    ws_sum[f"{col}{i}"].fill = PatternFill(
+                        start_color="FCE9DA", end_color="FCE9DA", fill_type="solid"
+                    )
+
+    # ---------- Лист "Пользователи" ----------
+    ws_u = wb.create_sheet("👥 Пользователи")
+    u_headers = ["TG ID", "Username", "Имя", "Баланс (₽)", "Реф. уровень", "Реф. кол-во", "Чёрный список", "Дата регистрации"]
+    u_rows = [
+        [
+            u["tg_id"],
+            f"@{u['username']}" if u["username"] else "—",
+            u["first_name"] or "—",
+            round(float(u["balance"] or 0), 2),
+            u["referral_level"] or 0,
+            u["referral_count"] or 0,
+            "🚫 Да" if u["is_blacklisted"] else "Нет",
+            _fmt_msk(u["created_at"]),
+        ]
+        for u in users
+    ]
+    _xlsx_style_sheet(ws_u, u_headers, u_rows, "2F5597")
+
+    # ---------- Лист "Заказы" ----------
+    ws_o = wb.create_sheet("🛒 Заказы")
+    o_headers = ["ID", "TG ID", "Товар", "Цена (₽)", "Статус", "Категория", "Контакт", "Данные входа", "Дата"]
+    o_rows = [
+        [
+            o["id"],
+            o["tg_id"],
+            o["title"],
+            round(float(o["price"] or 0), 2),
+            o["status"],
+            o["category"] or "—",
+            o["contact"] or "—",
+            o["login_data"] or "—",
+            _fmt_msk(o["created_at"]),
+        ]
+        for o in orders
+    ]
+    _xlsx_style_sheet(ws_o, o_headers, o_rows, "1F7A46")
+    status_col = o_headers.index("Статус") + 1
+    status_colors = {
+        "Выполнен": "C6EFCE",
+        "Оплачен": "FFEB9C",
+    }
+    from openpyxl.styles import PatternFill as _PF
+    for r_idx, o in enumerate(orders, start=2):
+        color = status_colors.get(o["status"])
+        if "озврат" in (o["status"] or ""):
+            color = "FFC7CE"
+        if color:
+            ws_o.cell(row=r_idx, column=status_col).fill = _PF(
+                start_color=color, end_color=color, fill_type="solid"
+            )
+
+    # ---------- Лист "Транзакции" ----------
+    ws_t = wb.create_sheet("💳 Транзакции")
+    t_headers = ["ID", "TG ID", "Сумма (₽)", "Тип", "Причина", "Дата"]
+    t_rows = [
+        [
+            t["id"],
+            t["tg_id"],
+            round(float(t["amount"] or 0), 2),
+            t["kind"],
+            t["reason"] or "—",
+            _fmt_msk(t["created_at"]),
+        ]
+        for t in transactions
+    ]
+    _xlsx_style_sheet(ws_t, t_headers, t_rows, "7B3FA0")
+    amount_col = t_headers.index("Сумма (₽)") + 1
+    for r_idx, t in enumerate(transactions, start=2):
+        cell = ws_t.cell(row=r_idx, column=amount_col)
+        cell.font = Font(color="1F7A46" if float(t["amount"] or 0) >= 0 else "C00000", bold=True)
+
+    if orders:
+        bar = BarChart()
+        bar.title = "Заказы по категориям"
+        bar.type = "col"
+        cat_counts: dict[str, int] = {}
+        for o in orders:
+            cat_counts[o["category"] or "—"] = cat_counts.get(o["category"] or "—", 0) + 1
+        helper_row = len(o_rows) + 4
+        ws_o.cell(row=helper_row, column=1, value="Категория")
+        ws_o.cell(row=helper_row, column=2, value="Кол-во")
+        for i, (cat, count) in enumerate(cat_counts.items(), start=helper_row + 1):
+            ws_o.cell(row=i, column=1, value=cat)
+            ws_o.cell(row=i, column=2, value=count)
+        data = Reference(ws_o, min_col=2, min_row=helper_row, max_row=helper_row + len(cat_counts))
+        cats = Reference(ws_o, min_col=1, min_row=helper_row + 1, max_row=helper_row + len(cat_counts))
+        bar.add_data(data, titles_from_data=True)
+        bar.set_categories(cats)
+        bar.height = 8
+        bar.width = 14
+        ws_o.add_chart(bar, f"K2")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    xlsx_bytes = buf.getvalue()
+
+    await wait_msg.delete()
+    await message.answer_document(
+        BufferedInputFile(xlsx_bytes, filename=f"shop_export_{now_str}.xlsx"),
+        caption=(
+            f"📊 <b>Полный отчёт по магазину</b>\n\n"
+            f"👥 Пользователей: <b>{len(users)}</b>\n"
+            f"🛒 Заказов: <b>{len(orders)}</b> (✅ {completed_orders} / 🕓 {paid_orders} / 💸 {refunded_orders})\n"
+            f"📊 Успешность заказов: <b>{success_rate:.1f}%</b>\n"
+            f"🧮 Средний чек: <b>{_fmt_price(avg_check)}₽</b>\n"
+            f"💳 Транзакций: <b>{len(transactions)}</b>\n"
+            f"📈 Выручка: <b>{_fmt_price(revenue)}₽</b>\n\n"
+            f"🕒 Сформировано: {now_str} МСК"
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def _health_server() -> None:
+    """Маленький HTTP-сервер для health-check на Render Web Service."""
+    from aiohttp import web
+
+    async def handle(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    port = int(os.environ.get("PORT", 8000))
+    app = web.Application()
+    app.router.add_get("/", handle)
+    app.router.add_get("/health", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("Health-check сервер запущен на порту %s", port)
+    await asyncio.Event().wait()
+
+
+@dp.errors()
+async def global_error_handler(event: ErrorEvent) -> bool:
+    """Глобальный обработчик ошибок: логирует падение хендлера,
+    уведомляет модератора и мягко отвечает пользователю, чтобы
+    сбои не оставались незамеченными молча."""
+    update = event.update
+    exception = event.exception
+    logging.exception(
+        "Необработанная ошибка при обработке апдейта %s: %s", update, exception
+    )
+
+    try:
+        error_text = (
+            f"⚠️ <b>Ошибка в боте</b>\n\n"
+            f"<code>{escape(str(exception))[:500]}</code>\n\n"
+            f"Тип апдейта: <code>{escape(update.event_type or '?')}</code>"
+        )
+        await notify_moderator(error_text)
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить модератора об ошибке: {e}")
+
+    try:
+        call = update.callback_query
+        if call is not None:
+            try:
+                await call.answer(
+                    "⚠️ Произошла ошибка. Попробуйте ещё раз или обратитесь в поддержку.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+        else:
+            message = update.message
+            chat_id = message.chat.id if message else None
+            if chat_id is not None:
+                await bot.send_message(
+                    chat_id,
+                    "⚠️ Произошла ошибка при обработке запроса. "
+                    "Попробуйте ещё раз или обратитесь в поддержку.",
+                )
+    except Exception as e:
+        logging.warning(f"Не удалось уведомить пользователя об ошибке: {e}")
+
+    return True
+
+
+
+# =====================================================================
+# АДМИН — управление картинками категорий и товаров
+# =====================================================================
+
+
+@dp.callback_query(F.data == "adm:images")
+async def cb_adm_images(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    await call.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Картинки разделов", callback_data="adm:images:secs")],
+        [InlineKeyboardButton(text="📂 Картинки категорий", callback_data="adm:images:cats")],
+        [InlineKeyboardButton(text="🎁 Картинки товаров", callback_data="adm:images:prods")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:admin")],
+    ])
+    await send_or_edit(
+        call,
+        "<b>🖼️ Управление картинками</b>\n\n"
+        "Выберите раздел:\n\n"
+        "• <b>Разделы</b> — меню, профиль, пополнение и другие экраны бота\n"
+        "• <b>Категории</b> — картинки при выборе категории в магазине\n"
+        "• <b>Товары</b> — картинки на карточках отдельных товаров",
+        kb,
+    )
+
+
+@dp.callback_query(F.data == "adm:images:cats")
+async def cb_adm_images_cats(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    cats = await db_all_categories()
+    rows = []
+    for cat in cats:
+        has_img = bool(await db_get_image(f"cat:{cat['key']}"))
+        icon = "🖼️ " if has_img else "⬜ "
+        rows.append([InlineKeyboardButton(
+            text=f"{icon}{cat['emoji']} {cat['name']}",
+            callback_data=f"adm:images:cat:{cat['key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:images")])
+    await send_or_edit(
+        call,
+        "<b>📂 Картинки категорий</b>\n\n"
+        "🖼️ — картинка задана   ⬜ — картинки нет\n\n"
+        "Нажмите на категорию, чтобы задать или удалить картинку.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:cat:"))
+async def cb_adm_images_cat(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    cat_key = call.data.split(":", 3)[3]
+    cat = await db_get_category(cat_key)
+    if not cat:
+        await call.answer("Категория не найдена.", show_alert=True)
+        return
+    name = f"{cat['emoji']} {cat['name']}"
+    existing = await db_get_image(f"cat:{cat_key}")
+    status = "🖼️ Картинка уже задана." if existing else "⬜ Картинки пока нет."
+    await state.set_state(AdminStates.waiting_image_photo)
+    await state.update_data(image_target=f"cat:{cat_key}", image_label=name)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        *([[InlineKeyboardButton(
+            text="🗑️ Удалить картинку",
+            callback_data=f"adm:images:del:cat:{cat_key}",
+        )]] if existing else []),
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:images:cats")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>🖼️ Картинка: {escape(name)}</b>\n\n"
+        f"{status}\n\n"
+        "Пришлите фото в этот чат — бот установит его как картинку категории.\n"
+        "<i>Только одна картинка, текстовые сообщения игнорируются.</i>",
+        kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:del:cat:"))
+async def cb_adm_images_del_cat(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    cat_key = call.data.split(":", 4)[4]
+    await db_delete_image(f"cat:{cat_key}")
+    await call.answer("✅ Картинка категории удалена.", show_alert=False)
+    # Обновляем список
+    await cb_adm_images_cats(call)
+
+
+@dp.callback_query(F.data == "adm:images:prods")
+async def cb_adm_images_prods(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    cats = await db_all_categories()
+    rows = []
+    for cat in cats:
+        rows.append([InlineKeyboardButton(
+            text=f"{cat['emoji']} {cat['name']}",
+            callback_data=f"adm:images:prodcat:{cat['key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:images")])
+    await send_or_edit(
+        call,
+        "<b>🎁 Картинки товаров</b>\n\n"
+        "Выберите категорию, чтобы увидеть её товары.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:prodcat:"))
+async def cb_adm_images_prodcat(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    cat_key = call.data.split(":", 3)[3]
+    cat = await db_get_category(cat_key)
+    cat_name = f"{cat['emoji']} {cat['name']}" if cat else cat_key
+    products = await db_get_products(cat_key)
+    if not products:
+        await call.answer("В этой категории нет товаров.", show_alert=True)
+        return
+    rows = []
+    for key, name, price, _ in products:
+        has_img = bool(await db_get_image(f"prod:{key}"))
+        icon = "🖼️ " if has_img else "⬜ "
+        rows.append([InlineKeyboardButton(
+            text=f"{icon}{name} — {price}₽",
+            callback_data=f"adm:images:prod:{key}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:images:prods")])
+    await send_or_edit(
+        call,
+        f"<b>🎁 Товары: {escape(cat_name)}</b>\n\n"
+        "🖼️ — картинка задана   ⬜ — нет\n\n"
+        "Нажмите на товар, чтобы задать картинку.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:prod:"))
+async def cb_adm_images_prod(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    prod_key = call.data.split(":", 3)[3]
+    product = await db_get_product_by_key(prod_key)
+    if not product:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    _, prod_name, price, _ = product
+    existing = await db_get_image(f"prod:{prod_key}")
+    status = "🖼️ Картинка уже задана." if existing else "⬜ Картинки пока нет."
+    await state.set_state(AdminStates.waiting_image_photo)
+    await state.update_data(image_target=f"prod:{prod_key}", image_label=prod_name)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        *([[InlineKeyboardButton(
+            text="🗑️ Удалить картинку",
+            callback_data=f"adm:images:del:prod:{prod_key}",
+        )]] if existing else []),
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:images:prods")],
+    ])
+    await send_or_edit(
+        call,
+        f"<b>🖼️ Картинка товара: {escape(prod_name)}</b>\n\n"
+        f"{status}\n\n"
+        "Пришлите фото в этот чат — бот установит его как картинку товара.\n"
+        "<i>Только одна картинка, текстовые сообщения игнорируются.</i>",
+        kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:del:prod:"))
+async def cb_adm_images_del_prod(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    prod_key = call.data.split(":", 4)[4]
+    await db_delete_image(f"prod:{prod_key}")
+    await call.answer("✅ Картинка товара удалена.", show_alert=False)
+    await cb_adm_images_prods(call)
+
+
+@dp.callback_query(F.data == "adm:images:secs")
+async def cb_adm_images_secs(call: CallbackQuery, state: FSMContext) -> None:
+    """Список разделов бота для управления картинками."""
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    await call.answer()
+    rows = []
+    for sec_key, sec_label in _SECTION_IMAGE_LABELS.items():
+        db_img = await db_get_image(f"section:{sec_key}")
+        # Для встроенных категорий смотрим cat-ключ, для остальных — section-ключ
+        if sec_key in ("roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"):
+            db_img = await db_get_image(f"cat:{sec_key}") or db_img
+        has_img = bool(db_img) or bool(SECTION_IMAGES.get(sec_key))
+        icon = "🖼️ " if db_img else ("🔗 " if SECTION_IMAGES.get(sec_key) else "⬜ ")
+        rows.append([InlineKeyboardButton(
+            text=f"{icon}{sec_label}",
+            callback_data=f"adm:images:sec:{sec_key}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:images")])
+    await send_or_edit(
+        call,
+        "<b>🏠 Картинки разделов бота</b>\n\n"
+        "🖼️ — своя картинка установлена   🔗 — картинка по умолчанию   ⬜ — картинки нет\n\n"
+        "Нажмите на раздел, чтобы установить или удалить картинку.",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:sec:"))
+async def cb_adm_images_sec(call: CallbackQuery, state: FSMContext) -> None:
+    """Установка картинки для конкретного раздела."""
+    if not _is_moderator(call.from_user.id):
+        return
+    await call.answer()
+    sec_key = call.data.split(":", 3)[3]
+    sec_label = _SECTION_IMAGE_LABELS.get(sec_key, sec_key)
+    # Для встроенных категорий смотрим cat-ключ
+    is_cat = sec_key in ("roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other")
+    db_key = f"cat:{sec_key}" if is_cat else f"section:{sec_key}"
+    existing = await db_get_image(db_key)
+    default_img = SECTION_IMAGES.get(sec_key)
+    if existing:
+        status = "🖼️ <b>Пользовательская картинка установлена.</b>"
+    elif default_img:
+        status = "🔗 Сейчас используется картинка по умолчанию."
+    else:
+        status = "⬜ Картинки нет."
+    await state.set_state(AdminStates.waiting_image_photo)
+    await state.update_data(image_target=db_key, image_label=sec_label, image_back="adm:images:secs")
+    kb_rows = []
+    if existing:
+        kb_rows.append([InlineKeyboardButton(
+            text="🗑️ Удалить пользовательскую картинку",
+            callback_data=f"adm:images:del:sec:{sec_key}",
+        )])
+    kb_rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:images:secs")])
+    await send_or_edit(
+        call,
+        f"<b>🖼️ Картинка раздела: {escape(sec_label)}</b>\n\n"
+        f"{status}\n\n"
+        "Пришлите фото — бот заменит картинку для этого раздела.\n"
+        "<i>Текстовые сообщения игнорируются.</i>",
+        InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:images:del:sec:"))
+async def cb_adm_images_del_sec(call: CallbackQuery, state: FSMContext) -> None:
+    """Удаление пользовательской картинки раздела."""
+    if not _is_moderator(call.from_user.id):
+        return
+    await state.clear()
+    sec_key = call.data.split(":", 4)[4]
+    is_cat = sec_key in ("roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other")
+    db_key = f"cat:{sec_key}" if is_cat else f"section:{sec_key}"
+    await db_delete_image(db_key)
+    # Сбрасываем section-кеш в памяти на значение по умолчанию (если не cat)
+    if not is_cat:
+        # Восстанавливаем оригинал из конфига (URL или None)
+        # _SECTION_IMAGES_DEFAULT хранит изначальные значения
+        default = _SECTION_IMAGES_DEFAULT.get(sec_key)
+        SECTION_IMAGES[sec_key] = default
+    await call.answer("✅ Пользовательская картинка удалена.", show_alert=False)
+    await cb_adm_images_secs(call)
+
+
+@dp.message(AdminStates.waiting_image_photo)
+async def msg_adm_image_photo(message: Message, state: FSMContext) -> None:
+    """Модератор присылает фото — бот сохраняет file_id в БД."""
+    if not _is_moderator(message.from_user.id):
+        return
+    if not message.photo:
+        # Игнорируем текст и другие типы сообщений
+        return
+    data = await state.get_data()
+    target = data.get("image_target", "")
+    label = data.get("image_label", target)
+    back_cb = data.get("image_back", "adm:images")
+    await state.clear()
+
+    file_id = message.photo[-1].file_id
+    await db_set_image(target, file_id)
+
+    # Если это картинка раздела — обновляем сразу и in-memory словарь
+    if target.startswith("section:"):
+        sec_key = target[len("section:"):]
+        SECTION_IMAGES[sec_key] = file_id
+
+    await message.answer(
+        f"✅ <b>Картинка для «{escape(label)}» сохранена!</b>\n\n"
+        "Теперь она будет показываться пользователям при просмотре этого раздела.\n\n"
+        "Чтобы поменять — откройте раздел снова и пришлите новое фото.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🖼️ К картинкам", callback_data=back_cb)],
+            [InlineKeyboardButton(text="🛠️ Админ-панель", callback_data="adm:admin")],
+        ]),
+    )
+
+# =====================================================================
+# Управление персоналом (только Founder)
+# =====================================================================
+
+def kb_staff_list(staff: list[dict], viewer_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in staff:
+        if int(s["tg_id"]) == viewer_id:
+            continue  # себя не показываем
+        label_role = STAFF_ROLE_LABELS.get(s["role"], s["role"])
+        name = s.get("first_name") or s.get("username") or str(s["tg_id"])
+        handle = f"@{s['username']}" if s.get("username") else f"id{s['tg_id']}"
+        rows.append([InlineKeyboardButton(
+            text=f"[{label_role}] {name} ({handle})",
+            callback_data=f"adm:staff:member:{s['tg_id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Добавить сотрудника", callback_data="adm:staff:add")])
+    rows.append([InlineKeyboardButton(text="📋 Журнал действий", callback_data="adm:staff:journal")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_staff_member(tg_id: int, role: str) -> InlineKeyboardMarkup:
+    assignable = [r for r in STAFF_ROLES if r != ROLE_FOUNDER]
+    rows: list[list[InlineKeyboardButton]] = []
+    for r in assignable:
+        label = STAFF_ROLE_LABELS[r]
+        mark = "✅ " if r == role else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{mark}{label}",
+            callback_data=f"adm:staff:setrole:{tg_id}:{r}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔥 Уволить", callback_data=f"adm:staff:fire:{tg_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К персоналу", callback_data="adm:staff")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm:staff")
+async def cb_adm_staff(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    await state.clear()
+    staff = await db_list_staff()
+    text = f"<b>👥 Персонал</b>\n\nВсего сотрудников: <b>{len(staff)}</b>"
+    await send_or_edit(call, text, kb_staff_list(staff, call.from_user.id))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:staff:member:"))
+async def cb_adm_staff_member(call: CallbackQuery) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        tg_id = int(call.data.split(":", 3)[3])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    role = await db_get_staff_role(tg_id) or ROLE_HELPER
+    staff_list = await db_list_staff()
+    member = next((s for s in staff_list if int(s["tg_id"]) == tg_id), None)
+    if not member:
+        await call.answer("Сотрудник не найден.", show_alert=True)
+        return
+    name = member.get("first_name") or member.get("username") or str(tg_id)
+    handle = f"@{member['username']}" if member.get("username") else f"id{tg_id}"
+    label_role = STAFF_ROLE_LABELS.get(role, role)
+    text = (
+        f"<b>Сотрудник: {escape(name)} ({escape(handle)})</b>\n\n"
+        f"Telegram ID: <code>{tg_id}</code>\n"
+        f"Роль: <b>{label_role}</b>\n\n"
+        "Выберите действие:"
+    )
+    await send_or_edit(call, text, kb_staff_member(tg_id, role))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:staff:setrole:"))
+async def cb_adm_staff_setrole(call: CallbackQuery) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":", 4)
+        tg_id = int(parts[3])
+        new_role = parts[4]
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    if new_role not in STAFF_ROLES or new_role == ROLE_FOUNDER:
+        await call.answer("Недопустимая роль.", show_alert=True)
+        return
+    await db_upsert_staff(tg_id, new_role)
+    await db_audit_staff_action(call.from_user.id, "change_role", "staff", str(tg_id))
+    label = STAFF_ROLE_LABELS[new_role]
+    try:
+        await bot.send_message(
+            tg_id,
+            f"🔔 <b>Ваша роль в магазине изменена.</b>\n\nНовая роль: <b>{label}</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.answer(f"✅ Роль изменена на {label}", show_alert=True)
+    staff_list = await db_list_staff()
+    member = next((s for s in staff_list if int(s["tg_id"]) == tg_id), None)
+    name = (member.get("first_name") or member.get("username") or str(tg_id)) if member else str(tg_id)
+    handle = (f"@{member['username']}" if member and member.get("username") else f"id{tg_id}")
+    text = (
+        f"<b>Сотрудник: {escape(name)} ({escape(handle)})</b>\n\n"
+        f"Telegram ID: <code>{tg_id}</code>\n"
+        f"Роль: <b>{label}</b>\n\n"
+        "Выберите действие:"
+    )
+    await send_or_edit(call, text, kb_staff_member(tg_id, new_role))
+
+
+@dp.callback_query(F.data.startswith("adm:staff:fire:"))
+async def cb_adm_staff_fire(call: CallbackQuery) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        tg_id = int(call.data.split(":", 3)[3])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    removed = await db_remove_staff(tg_id)
+    if not removed:
+        await call.answer("Нельзя уволить Founder.", show_alert=True)
+        return
+    await db_audit_staff_action(call.from_user.id, "fire_staff", "staff", str(tg_id))
+    try:
+        await bot.send_message(
+            tg_id,
+            "🔔 <b>Вы больше не являетесь сотрудником магазина.</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.answer("✅ Сотрудник уволен", show_alert=True)
+    staff = await db_list_staff()
+    text = f"<b>👥 Персонал</b>\n\nВсего сотрудников: <b>{len(staff)}</b>"
+    await send_or_edit(call, text, kb_staff_list(staff, call.from_user.id))
+
+
+@dp.callback_query(F.data == "adm:staff:add")
+async def cb_adm_staff_add(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_staff_add_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:staff")]
+    ])
+    sent = await send_or_edit(
+        call,
+        "➕ <b>Добавление сотрудника</b>\n\n"
+        "Отправьте <b>Telegram ID</b> нового сотрудника одним числом.",
+        kb,
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_staff_add_id)
+async def msg_staff_add_id(message: Message, state: FSMContext) -> None:
+    if not _is_founder(message.from_user.id):
+        return
+    await _try_delete(message)
+    tg_id = parse_positive_int(message.text)
+    kb_cancel = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:staff")]
+    ])
+    if tg_id is None:
+        await _edit_prompt(state, "⚠️ Введите числовой Telegram ID.", kb_cancel)
+        return
+    if tg_id == message.from_user.id:
+        await _edit_prompt(state, "⚠️ Нельзя добавить себя.", kb_cancel)
+        return
+    await state.update_data(staff_new_tg_id=tg_id)
+    assignable = [r for r in STAFF_ROLES if r != ROLE_FOUNDER]
+    role_rows = [
+        [InlineKeyboardButton(
+            text=STAFF_ROLE_LABELS[r],
+            callback_data=f"adm:staff:addconfirm:{tg_id}:{r}",
+        )]
+        for r in assignable
+    ]
+    role_rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="adm:staff")])
+    await _edit_prompt(
+        state,
+        f"👤 <b>Пользователь: <code>{tg_id}</code></b>\n\nВыберите роль:",
+        InlineKeyboardMarkup(inline_keyboard=role_rows),
+    )
+
+
+@dp.callback_query(F.data.startswith("adm:staff:addconfirm:"))
+async def cb_adm_staff_addconfirm(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    try:
+        parts = call.data.split(":", 4)
+        tg_id = int(parts[3])
+        role = parts[4]
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    if role not in STAFF_ROLES or role == ROLE_FOUNDER:
+        await call.answer("Недопустимая роль.", show_alert=True)
+        return
+    await state.clear()
+    await db_upsert_staff(tg_id, role)
+    await db_audit_staff_action(call.from_user.id, "add_staff", "staff", str(tg_id))
+    label = STAFF_ROLE_LABELS[role]
+    try:
+        await bot.send_message(
+            tg_id,
+            f"🎉 <b>Вы назначены сотрудником магазина!</b>\n\nВаша роль: <b>{label}</b>\n\n"
+            "Используйте /admin для доступа к панели.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.answer(f"✅ Сотрудник добавлен с ролью {label}", show_alert=True)
+    staff = await db_list_staff()
+    text = f"<b>👥 Персонал</b>\n\nВсего сотрудников: <b>{len(staff)}</b>"
+    await send_or_edit(call, text, kb_staff_list(staff, call.from_user.id))
+
+
+# =====================================================================
+# Журнал действий персонала (только Founder)
+# =====================================================================
+
+def _journal_nav_kb(
+    page: int,
+    total: int,
+    staff_filter: int | None,
+    staff_list: list[dict],
+    viewer_id: int,
+) -> InlineKeyboardMarkup:
+    """Строит клавиатуру журнала: фильтр по сотруднику + пагинация."""
+    rows: list[list[InlineKeyboardButton]] = []
+    total_pages = max(1, (total + JOURNAL_PAGE_SIZE - 1) // JOURNAL_PAGE_SIZE)
+
+    # --- фильтр по сотруднику ---
+    filter_buttons: list[InlineKeyboardButton] = []
+    all_cb = f"adm:staff:journal:p:{page}" if staff_filter is not None else "adm:staff:journal"
+    # кнопка «Все»
+    all_mark = "" if staff_filter is not None else "✅ "
+    filter_buttons.append(InlineKeyboardButton(
+        text=f"{all_mark}Все", callback_data="adm:staff:journal",
+    ))
+    for s in staff_list:
+        sid = int(s["tg_id"])
+        if sid == viewer_id:
+            continue
+        name = s.get("first_name") or s.get("username") or str(sid)
+        mark = "✅ " if staff_filter == sid else ""
+        filter_buttons.append(InlineKeyboardButton(
+            text=f"{mark}{name}",
+            callback_data=f"adm:staff:journal:s:{sid}:p:0",
+        ))
+    # по 2 в ряд
+    for i in range(0, len(filter_buttons), 2):
+        rows.append(filter_buttons[i:i+2])
+
+    # --- пагинация ---
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        if staff_filter is not None:
+            prev_cb = f"adm:staff:journal:s:{staff_filter}:p:{page - 1}"
+        else:
+            prev_cb = f"adm:staff:journal:p:{page - 1}"
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=prev_cb))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+    if (page + 1) * JOURNAL_PAGE_SIZE < total:
+        if staff_filter is not None:
+            next_cb = f"adm:staff:journal:s:{staff_filter}:p:{page + 1}"
+        else:
+            next_cb = f"adm:staff:journal:p:{page + 1}"
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=next_cb))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="⬅️ К персоналу", callback_data="adm:staff")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_journal_text(
+    entries: list[dict],
+    total: int,
+    page: int,
+    staff_filter: int | None,
+    stats: dict | None = None,
+) -> str:
+    filter_label = f" (фильтр по сотруднику ID {staff_filter})" if staff_filter else ""
+    header = f"<b>📋 Журнал действий персонала{filter_label}</b>\nВсего записей: <b>{total}</b>"
+    if stats:
+        header += (
+            f"\n\n<b>📊 Статистика по сотруднику:</b>\n"
+            f"  Взял заказов: всего <b>{stats['claimed_total']}</b> | "
+            f"сегодня <b>{stats['claimed_today']}</b> | "
+            f"неделя <b>{stats['claimed_week']}</b>\n"
+            f"  Выполнил: всего <b>{stats['completed_total']}</b> | "
+            f"сегодня <b>{stats['completed_today']}</b> | "
+            f"неделя <b>{stats['completed_week']}</b>"
+        )
+    header += "\n"
+    if not entries:
+        return header + "\n<i>Записей нет.</i>"
+    lines = [header]
+    for e in entries:
+        staff_name = e.get("first_name") or (
+            f"@{e['username']}" if e.get("username") else f"id{e['staff_id']}"
+        )
+        role_label = STAFF_ROLE_LABELS.get(e["role"], e["role"])
+        action_label = _action_label(e["action"])
+        entity = ""
+        if e.get("entity_type") and e.get("entity_id"):
+            etype = _ENTITY_LABELS.get(e["entity_type"], e["entity_type"])
+            entity = f" → {etype} #{e['entity_id']}"
+        ts = _fmt_msk(e["created_at"])
+        lines.append(
+            f"\n<b>{escape(staff_name)}</b> [{role_label}]\n"
+            f"  {action_label}{entity}\n"
+            f"  <i>{ts}</i>"
+        )
+    return "\n".join(lines)
+
+
+async def _show_journal(
+    call: CallbackQuery,
+    page: int,
+    staff_filter: int | None,
+) -> None:
+    if not _is_founder(call.from_user.id):
+        await call.answer("Только для Founder.", show_alert=True)
+        return
+    entries, total = await db_get_staff_journal(page=page, staff_filter=staff_filter)
+    staff_list = await db_list_staff()
+    stats = await db_staff_order_stats(staff_filter) if staff_filter is not None else None
+    text = _build_journal_text(entries, total, page, staff_filter, stats=stats)
+    kb = _journal_nav_kb(page, total, staff_filter, staff_list, call.from_user.id)
+    await send_or_edit(call, text, kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:staff:journal")
+async def cb_adm_staff_journal(call: CallbackQuery) -> None:
+    await _show_journal(call, page=0, staff_filter=None)
+
+
+@dp.callback_query(F.data.startswith("adm:staff:journal:p:"))
+async def cb_adm_staff_journal_page(call: CallbackQuery) -> None:
+    try:
+        page = int(call.data.split(":")[-1])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    await _show_journal(call, page=page, staff_filter=None)
+
+
+@dp.callback_query(F.data.startswith("adm:staff:journal:s:"))
+async def cb_adm_staff_journal_staff(call: CallbackQuery) -> None:
+    # format: adm:staff:journal:s:{staff_id}:p:{page}
+    try:
+        parts = call.data.split(":")
+        staff_id = int(parts[4])
+        page = int(parts[6])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+    await _show_journal(call, page=page, staff_filter=staff_id)
+
+
+# =====================================================================
+# Панель модератора (Moderator role)
+# =====================================================================
+
+def kb_moderator_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="mod:find_user")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="mod:users:0")],
+        [InlineKeyboardButton(text="🎟️ Промокоды (просмотр)", callback_data="mod:promos")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+    ])
+
+
+@dp.callback_query(F.data == "mod:panel")
+async def cb_mod_panel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_staff(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    if _is_moderator(call.from_user.id):
+        await send_or_edit(
+            call,
+            "<b>🛠️ Админ-панель</b>\n\nВыберите действие:",
+            kb_admin_main(call.from_user.id),
+        )
+    else:
+        await send_or_edit(
+            call,
+            "<b>🛡️ Панель модератора</b>\n\nВыберите действие:",
+            kb_moderator_panel(),
+        )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mod:find_user")
+async def cb_mod_find_user(call: CallbackQuery, state: FSMContext) -> None:
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.waiting_user_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
+        call, "🔍 Отправьте Telegram ID пользователя одним сообщением.", kb
+    )
+    await state.update_data(
+        _prompt_chat_id=sent.chat.id,
+        _prompt_msg_id=sent.message_id,
+        mod_panel_return="mod:panel",
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("mod:users:"))
+async def cb_mod_users(call: CallbackQuery, state: FSMContext) -> None:
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    try:
+        page = max(0, int(call.data.split(":", 2)[2]))
+    except (ValueError, IndexError):
+        page = 0
+    total = await db_users_count()
+    users = await db_list_users(USERS_PAGE_SIZE, page * USERS_PAGE_SIZE)
+    if not users and page > 0:
+        page = 0
+        users = await db_list_users(USERS_PAGE_SIZE, 0)
+    await state.update_data(admin_users_last_page=page, mod_panel_return="mod:panel")
+    if total == 0:
+        await send_or_edit(call, "<b>👥 Пользователей пока нет.</b>", kb_moderator_panel())
+        await call.answer()
+        return
+    text = (
+        f"<b>👥 Пользователи бота</b>\n"
+        f"Всего: <b>{total}</b>\n\n"
+        "Нажмите на пользователя, чтобы открыть карточку."
+    )
+    await send_or_edit(call, text, kb_admin_users(users, page, total))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mod:promos")
+async def cb_mod_promos(call: CallbackQuery, state: FSMContext) -> None:
+    if not _can_moderate(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    promos = await db_list_regular_promos()
+    text = "<b>🎟️ Промокоды (просмотр)</b>\n\n"
+    if promos:
+        for p in promos:
+            disc = f"{p['discount_pct']}%" if p.get("discount_pct") else f"{p.get('fixed_discount', 0)}₽"
+            use_count = p.get("use_count", 0)
+            max_uses = p.get("max_uses")
+            uses_str = f"{use_count}/{max_uses}" if max_uses else f"{use_count}/∞"
+            text += f"• <code>{escape(p['code'])}</code> — скидка {disc}, использований: {uses_str}\n"
+    else:
+        text += "Промокодов нет."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="mod:panel")]
+    ])
+    await send_or_edit(call, text, kb)
+    await call.answer()
+
+
+# =====================================================================
+# Панель помощника (Helper role)
+# =====================================================================
+
+def kb_helper_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="hlp:find_user")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="adm:close")],
+    ])
+
+
+@dp.callback_query(F.data == "hlp:panel")
+async def cb_hlp_panel(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_helper_role(call.from_user.id):
+        await call.answer()
+        return
+    await state.clear()
+    await send_or_edit(
+        call,
+        "<b>🤝 Панель помощника</b>\n\nВыберите действие:",
+        kb_helper_panel(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "hlp:find_user")
+async def cb_hlp_find_user(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_staff(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.waiting_user_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:close")]
+    ])
+    sent = await send_or_edit(
+        call, "🔍 Отправьте Telegram ID пользователя одним сообщением.", kb
+    )
+    await state.update_data(
+        _prompt_chat_id=sent.chat.id,
+        _prompt_msg_id=sent.message_id,
+        mod_panel_return="hlp:panel",
+        hlp_mode=True,
+    )
+    await call.answer()
+
+
+async def _preload_local_section_images() -> None:
+    """При старте загружает картинки в Telegram и кеширует file_id в БД.
+    Источник данных: локальный файл (если есть) или _EMBEDDED_IMAGES (встроенные).
+    После кеширования show_section использует file_id напрямую."""
+    if not MODERATOR_CHAT_ID:
+        logging.warning("MODERATOR_CHAT_ID не задан — картинки секций не будут загружены.")
+        return
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Собираем уникальные (ключ → имя встроенного образа) пары
+    # SECTION_IMAGES может содержать несколько ключей с одним путём — кешируем каждый отдельно
+    for key, path in list(SECTION_IMAGES.items()):
+        if not path:
+            continue
+        if isinstance(path, str) and path.startswith(("http://", "https://")):
+            continue  # URL — уже готово, Telegram принимает напрямую
+
+        # Проверяем кеш в БД первым делом
+        cache_key = f"img_file_id_{key}"
+        cached_fid = await db_get_setting(cache_key, "")
+        if cached_fid:
+            SECTION_IMAGES[key] = cached_fid
+            logging.info(f"Секция '{key}': file_id загружен из кеша БД.")
+            continue
+
+        # Определяем источник байт: локальный файл или встроенные данные
+        img_bytes: bytes | None = None
+        filename = "image.jpg"
+
+        if isinstance(path, str):
+            abs_path = path if os.path.isabs(path) else os.path.join(script_dir, path)
+            if not os.path.exists(abs_path):
+                abs_path = os.path.abspath(path)
+            if os.path.exists(abs_path):
+                try:
+                    with open(abs_path, "rb") as f:
+                        img_bytes = f.read()
+                    filename = os.path.basename(abs_path)
+                except Exception as e:
+                    logging.warning(f"Ошибка чтения файла '{abs_path}': {e}")
+
+        # Если файл не найден — пробуем встроенные данные
+        # Маппинг: ключи секций → ключ в _EMBEDDED_IMAGES
+        _key_to_embedded = {
+            "shop":       "shop",
+            "pubg":       "pubg",
+            "orders":     "history",
+            "tx_history": "history",
+        }
+        if img_bytes is None:
+            emb_key = _key_to_embedded.get(key)
+            if emb_key and emb_key in _EMBEDDED_IMAGES:
+                img_bytes = _EMBEDDED_IMAGES[emb_key]
+                filename = f"{emb_key}.jpg"
+                logging.info(f"Секция '{key}': используем встроенный образ '{emb_key}'.")
+            else:
+                logging.warning(f"Нет данных для картинки секции '{key}' — пропускаем.")
+                continue
+
+        # Загружаем в Telegram, получаем file_id
+        try:
+            msg = await bot.send_photo(
+                MODERATOR_CHAT_ID,
+                photo=BufferedInputFile(img_bytes, filename=filename),
+                caption=f"[img-cache:{key}]",
+            )
+            file_id = msg.photo[-1].file_id
+            await db_set_setting(cache_key, file_id)
+            SECTION_IMAGES[key] = file_id
+            try:
+                await bot.delete_message(MODERATOR_CHAT_ID, msg.message_id)
+            except Exception:
+                pass
+            logging.info(f"Секция '{key}': file_id получен и закеширован.")
+        except Exception as e:
+            logging.warning(f"Не удалось загрузить картинку для секции '{key}': {e}")
+
+    # Загружаем пользовательские картинки разделов из БД (перекрывают дефолты).
+    # Это позволяет картинкам, установленным через adminку, переживать перезапуск бота.
+    for sec_key in list(_SECTION_IMAGE_LABELS.keys()):
+        # Для встроенных категорий (brawl, roblox_instant…) картинка хранится под ключом cat:*
+        # и применяется напрямую в хендлере — SECTION_IMAGES обновлять не нужно.
+        if sec_key in ("roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"):
+            continue
+        db_img = await db_get_image(f"section:{sec_key}")
+        if db_img:
+            SECTION_IMAGES[sec_key] = db_img
+            logging.info(f"Секция '{sec_key}': пользовательская картинка загружена из БД.")
+
+
+async def main() -> None:
+    _acquire_single_instance_lock()
+    await db_init()
+    logging.info("Бот запускается...")
+    await _preload_local_section_images()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.gather(
+        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types()),
+        _health_server(),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+        return dt_msk.strftime("%Y-%m-%d %H:%M МСК")
+    except Exception:
+        return s
+from html import escape
+
+import os
+
+import asyncpg
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    ErrorEvent,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+# =====================================================================
+# CONFIG  --  ОТРЕДАКТИРУЙТЕ ЭТИ ЗНАЧЕНИЯ
+# =====================================================================
+
+# --- Основное ---
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+# Telegram ID модератора (узнайте у @userinfobot).
+# Сюда будут приходить уведомления о новых заказах и сообщения от клиентов.
+# Если оставить 0 — пересылка будет отключена.
+MODERATOR_CHAT_ID = 1727614596
+
+# Иерархия сотрудников. MODERATOR_CHAT_ID сохраняется как обратная
+# совместимость с прежней конфигурацией, но теперь он является Founder.
+ROLE_FOUNDER = "founder"
+ROLE_ADMINISTRATOR = "administrator"
+ROLE_MODERATOR = "moderator"
+ROLE_HELPER = "helper"
+STAFF_ROLES = (
+    ROLE_FOUNDER,
+    ROLE_ADMINISTRATOR,
+    ROLE_MODERATOR,
+    ROLE_HELPER,
+)
+STAFF_ROLE_LABELS = {
+    ROLE_FOUNDER: "Founder",
+    ROLE_ADMINISTRATOR: "Administrator",
+    ROLE_MODERATOR: "Moderator",
+    ROLE_HELPER: "Helper",
+}
+_STAFF_ROLES: dict[int, str] = {}
+
+# Юзернеймы (везде, где упоминается @username)
+SUPPORT_USERNAME = "@cheeze0729"  # Поддержка
+OTHER_APPS_USERNAME = "@cheeze0729"  # Донат в других приложениях
+BRAWL_PROMO_USERNAME = "@cheeze0729"  # Акции по Brawl Stars
+
+# Стартовое изображение (URL или file_id Telegram).
+# Можно заменить на свою картинку.
+WELCOME_IMAGE_URL = "https://i.postimg.cc/SxHKrmbd/IMG-3992.png"
+
+# Реквизиты для пополнения баланса (карта/СБП).
+# Эти реквизиты будут показаны пользователю после ввода суммы.
+# Поддерживается HTML-разметка: <code>...</code> делает текст кликабельным
+# для копирования в Telegram.
+CARD_DETAILS = (
+    "💳 <b>Карта Т-Банк:</b>\n"
+    "<code>2200 7017 3823 7798</code>\n\n"
+    "👤 <b>Получатель:</b> Марсель С.\n\n"
+    "ℹ️ При невозможности оплаты по карте обратитесь в поддержку для оплаты по СБП."
+)
+
+# Ссылка на отзывы (канал, чат или страница с отзывами клиентов)
+REVIEWS_URL = "https://t.me/cheezereviews"
+# Username канала для публикации отзывов (бот должен быть администратором канала)
+REVIEWS_CHANNEL = "@cheezereviews"
+
+# =====================================================================
+# КАРТИНКИ ДЛЯ КАЖДОГО РАЗДЕЛА
+# =====================================================================
+# Чтобы добавить картинку — впишите ссылку (URL) или Telegram file_id
+# вместо None. Картинка будет показана над текстом раздела.
+# Если оставить None — раздел будет без картинки.
+# Подсказка: длина текста с картинкой не должна превышать 1024 символа.
+
+# Метки для раздела «Картинки разделов» в админке.
+# Ключи совпадают с ключами SECTION_IMAGES и используются в show_section.
+_SECTION_IMAGE_LABELS: dict[str, str] = {
+    "welcome":     "🏠 Главное меню (/start)",
+    "shop":        "🛒 Выбор категории (Магазин)",
+    "profile":     "👤 Профиль",
+    "orders":      "📦 История заказов",
+    "topup":       "💳 Пополнение баланса",
+    "tx_history":  "💹 История транзакций",
+    "support":     "💬 Поддержка",
+    "guarantee":   "🛡️ Гарантия",
+    "info":        "ℹ️ О магазине",
+    "roblox_instant":  "🟦 Roblox — моментально",
+    "roblox_gamepass": "🎮 Roblox — геймпассом",
+    "brawl":       "⭐ Brawl Stars",
+    "tgstars":     "✨ Telegram Stars",
+    "other":       "🌐 Другие приложения",
+}
+
+SECTION_IMAGES: dict[str, str | None] = {
+    "welcome": WELCOME_IMAGE_URL,  # /start, главное меню
+    "shop": "images/shop.png",  # «Купить донат» (локальный файл)
+    "roblox_instant": "https://i.ibb.co/0R5v4qFd/A48-CAFDF-8-C92-4-CA1-9-C68-E462-DD8-A34-D9.png",  # Roblox моментально
+    "roblox_gamepass": "https://i.ibb.co/0R5v4qFd/A48-CAFDF-8-C92-4-CA1-9-C68-E462-DD8-A34-D9.png",  # Roblox геймпассом
+    "brawl": "https://i.ibb.co/xqp3GzrQ/F42684-C7-1395-43-EF-A49-B-E817-B7-E73551.png",  # Brawl Stars
+    "tgstars": "https://i.ibb.co/N2JJ5SHb/42-E499-C6-7-FE1-4-E03-94-A4-47-E6-A705-FEAA.png",  # Telegram Stars
+    "other": None,  # Другие приложения
+    "profile": "https://i.ibb.co/5x2bNNJK/56-D6214-E-F8-F0-4-BFE-AF06-EBA573966-CD0.png",  # Профиль
+    "orders": "images/history.png",     # Мои заказы / История заказов
+    "tx_history": "images/history.png", # История транзакций (админ)
+    "topup": None,  # Пополнение баланса
+    "support": "https://i.ibb.co/pvcyff13/13-B5-AB68-5-FDA-4598-B1-D7-12-F98-A0188-D7.png",  # Поддержка
+    "info": "https://i.ibb.co/n8gT4YRD/4-AF7623-F-D966-4130-9-D7-F-592-ED9-C22935.png",  # Информация о магазине
+    "guarantee": None,  # Гарантия
+    # Карточки товаров (общие для всех товаров категории):
+    "card_roblox_instant": None,
+    "card_brawl": None,
+    # Динамические категории из админки:
+    "pubg": "images/pubg.png",
+}
+
+# Копия начальных значений SECTION_IMAGES — используется при удалении пользовательской картинки
+# (чтобы восстановить дефолт, не перезапуская бота)
+_SECTION_IMAGES_DEFAULT: dict[str, str | None] = dict(SECTION_IMAGES)
+
+_EMBEDDED_IMAGES: dict[str, bytes] = {
+    'shop': base64.b64decode('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'),
+    'pubg': base64.b64decode('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'),
+    'history': base64.b64decode('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'),
+}
+
+
+# =====================================================================
+# КАСТОМНЫЕ ЭМОДЗИ — система
+# =====================================================================
+# Именованные слоты: key → (fallback_символ, описание_для_админки)
+_EMOJI_SLOTS: dict[str, tuple[str, str]] = {
+    # Игровые иконки
+    "roblox":          ("🎮", "Roblox"),
+    "robux":           ("💎", "Робуксы"),
+    "tg_stars":        ("⭐", "Telegram Stars"),
+    "brawl_pass":      ("🏆", "Brawl Pass"),
+    "brawl_pass_plus": ("💫", "Brawl Pass Plus"),
+    "pro_pass":        ("👑", "Pro Pass"),
+    # UI разделов
+    "shop":            ("🛒", "Купить донат"),
+    "profile":         ("👤", "Профиль"),
+    "orders":          ("📦", "История заказов"),
+    "transactions":    ("📜", "История транзакций"),
+    "support":         ("🆘", "Поддержка"),
+    "info":            ("ℹ️", "Информация"),
+    "guarantee":       ("🛡️", "Гарантия"),
+    "topup":           ("💳", "Пополнение"),
+    "referral":        ("🎁", "Реферальная программа"),
+    "review":          ("⭐", "Оценка / отзыв"),
+    "promo":           ("🎟️", "Промокод"),
+    "balance":         ("💰", "Баланс"),
+    "success":         ("✅", "Успех"),
+    "warning":         ("⚠️", "Предупреждение"),
+    "error":           ("❌", "Ошибка"),
+    "back":            ("⬅️", "Назад"),
+    "close":           ("❌", "Закрыть"),
+}
+
+# Встроенные ID кастомных эмодзи (от пользователя)
+_BUILTIN_EMOJI_IDS: dict[str, str] = {
+    "roblox":          "5190667938008425635",
+    "robux":           "5202189539967267386",
+    "tg_stars":        "5924870095925942277",
+    "brawl_pass":      "5269736980257711970",
+    "brawl_pass_plus": "5469867449635584742",
+    "pro_pass":        "5314756604116111906",
+}
+
+# Runtime-словарь: заполняется при старте из БД + встроенных
+_EMOJIS: dict[str, str] = {}
+
+
+def tg_emoji(emoji_id: str, fallback: str) -> str:
+    """HTML-тег кастомного эмодзи для parse_mode='HTML'."""
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
+def e(name: str) -> str:
+    """Возвращает строку эмодзи для именованного слота."""
+    return _EMOJIS.get(name, _EMOJI_SLOTS.get(name, ("❓", ""))[0])
+
+
+async def _load_custom_emojis() -> None:
+    """Загружает кастомные emoji_id из БД; приоритет БД > встроенные > fallback."""
+    for key, (fallback, _) in _EMOJI_SLOTS.items():
+        db_id = await db_get_setting(f"emoji:{key}", "")
+        if db_id:
+            _EMOJIS[key] = tg_emoji(db_id, fallback)
+        elif key in _BUILTIN_EMOJI_IDS:
+            _EMOJIS[key] = tg_emoji(_BUILTIN_EMOJI_IDS[key], fallback)
+        else:
+            _EMOJIS[key] = fallback
+    logging.info("Кастомные эмодзи загружены.")
+
+# Курсы и лимиты теперь хранятся в таблице settings (управляются через /admin → Каталог и курсы).
+# Начальные значения задаются в db_init() и применяются только при первом запуске.
+
+# =====================================================================
+# РЕФЕРАЛЬНАЯ ПРОГРАММА — настройки
+# =====================================================================
+REFERRAL_LEVELS = {
+    0: ("Новичок",      0),
+    1: ("🥉 Приятель",  2),
+    2: ("🥈 Знакомый",  4),
+    3: ("🥇 Партнёр",   6),
+    4: ("💎 Советник",  8),
+    5: ("👑 Легенда",  10),
+}
+REFERRAL_REFS_PER_LEVEL     = 2  # рефералов для перехода на следующий уровень
+REFERRAL_DISCOUNT_PER_LEVEL = 2  # % скидки за каждый уровень
+REFERRAL_PROMOS_PER_LEVELUP = 3  # промокодов за повышение уровня
+
+# --- Тексты ---
+WELCOME_TEXT = (
+    "<b>Добро пожаловать в магазин цифровых товаров.</b>\n\n"
+    "Здесь вы можете быстро и удобно купить донат, "
+    "пополнить баланс и связаться с поддержкой."
+)
+
+INFO_TEXT = (
+    "<b>О магазине</b>\n\n"
+    "Мы предлагаем удобную покупку цифровых товаров и доната "
+    "по выгодным ценам.\n\n"
+    "<b>Почему выбирают нас:</b>\n"
+    "— Быстрое оформление заказов\n"
+    "— Удобное пополнение баланса\n"
+    "— Поддержка клиентов\n"
+    "— Широкий выбор услуг\n\n"
+    "<b>Время работы поддержки:</b>\n"
+    "Ежедневно: 10:00 – 22:00 МСК\n\n"
+    f"По всем вопросам: {SUPPORT_USERNAME}"
+)
+
+SUPPORT_TEXT = (
+    "<b>Поддержка</b>\n\n"
+    "Если у вас возникли вопросы, напишите в поддержку: "
+    f"{SUPPORT_USERNAME}"
+)
+
+GUARANTEE_TEXT = (
+    "<b>🛡️ Наша гарантия</b>\n\n"
+    "Почему нам можно доверять:\n"
+    "— Работаем официально и долго\n"
+    "— Тысячи довольных клиентов\n"
+    "— Деньги возвращаются, если заказ не выполнен\n"
+    "— Поддержка отвечает каждый день\n"
+    "— Прозрачные цены без скрытых комиссий\n\n"
+    "Все отзывы реальных покупателей доступны по кнопке ниже."
+)
+
+# =====================================================================
+# Подсказки по данным для входа (для каждой категории — своя)
+# =====================================================================
+# Если значение задано — после оплаты бот попросит покупателя
+# отправить эти данные сообщением, сохранит их к заказу и перешлёт
+# модератору. Если оставить None — данные не запрашиваются.
+
+# login_hint для категорий со специальными хендлерами (не управляются через DB)
+LOGIN_HINTS = {
+    "roblox_gamepass": "После оплаты создайте геймпасс в Roblox и отправьте сюда ссылку на него одним сообщением.",
+    "tgstars": "Отправьте @username аккаунта Telegram для зачисления звёзд.",
+}
+# Стандартные категории из DB теперь хранят login_hint и needs_code в таблице categories
+
+# =====================================================================
+# КАТАЛОГ ТОВАРОВ
+# Каталог товаров теперь хранится в таблице products (управляется через /admin → Каталог и курсы).
+# Начальные товары добавляются в db_init() и применяются только при первом запуске.
+
+# =====================================================================
+# Инициализация бота
+# =====================================================================
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# Пользователи, для которых прямо сейчас обрабатывается платёж —
+# защита от двойного списания при повторном/двойном нажатии кнопки оплаты.
+_processing_payments: set[int] = set()
+
+# ---- Режим технических работ ----
+_maintenance: dict = {"active": False, "reason": ""}
+
+
+class BlacklistMiddleware(BaseMiddleware):
+    """Блокирует все действия пользователей из чёрного списка.
+    Модератор всегда пропускается. Покупателю показывается сообщение
+    с кнопкой связи с поддержкой.
+    """
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        if MODERATOR_CHAT_ID and user.id == MODERATOR_CHAT_ID:
+            return await handler(event, data)
+        try:
+            blocked = await db_is_blacklisted(user.id)
+        except Exception:
+            blocked = False
+        if not blocked:
+            return await handler(event, data)
+        text = (
+            "🚫 <b>Вы в чёрном списке.</b>\n\n"
+            "Доступ к боту ограничен. Если считаете, что это ошибка — "
+            "свяжитесь с поддержкой."
+        )
+        kb = kb_support()
+        try:
+            from aiogram.types import CallbackQuery as _CQ, Message as _MSG
+
+            if isinstance(event, _CQ):
+                await event.answer("Вы в чёрном списке", show_alert=True)
+                try:
+                    await event.message.answer(text, reply_markup=kb, parse_mode="HTML")
+                except Exception:
+                    pass
+            elif isinstance(event, _MSG):
+                await event.answer(text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            logging.warning(f"BlacklistMiddleware error: {e}")
+        return None
+
+
+dp.message.middleware(BlacklistMiddleware())
+dp.callback_query.middleware(BlacklistMiddleware())
+
+
+# StaffAuditMiddleware удалён: важные действия логируются явно в обработчиках
+# (claim_order, complete_order, blacklist_user, credit_balance и др.)
+
+
+class MaintenanceMiddleware(BaseMiddleware):
+    """Блокирует все действия обычных пользователей во время тех. работ.
+    Персонал всегда пропускается.
+    """
+
+    async def __call__(self, handler, event, data):
+        if not _maintenance["active"]:
+            return await handler(event, data)
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        # Персонал пропускаем всегда
+        if _STAFF_ROLES.get(user.id) in STAFF_ROLES:
+            return await handler(event, data)
+        reason = _maintenance["reason"] or "Скоро вернёмся!"
+        text = (
+            "🔧 <b>Бот временно недоступен</b>\n\n"
+            f"<i>{escape(reason)}</i>\n\n"
+            "Приносим извинения за неудобства. Попробуйте позже."
+        )
+        try:
+            from aiogram.types import CallbackQuery as _CQ, Message as _MSG
+            if isinstance(event, _CQ):
+                await event.answer("🔧 Тех. работы. Попробуйте позже.", show_alert=True)
+            elif isinstance(event, _MSG):
+                await event.answer(text, parse_mode="HTML")
+        except Exception as exc:
+            logging.warning(f"MaintenanceMiddleware error: {exc}")
+        return None
+
+
+dp.message.middleware(MaintenanceMiddleware())
+dp.callback_query.middleware(MaintenanceMiddleware())
+
+# =====================================================================
+# База данных (PostgreSQL через asyncpg + Neon)
+# =====================================================================
+
+_pool: asyncpg.Pool | None = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    """Возвращает глобальный пул соединений с Neon PostgreSQL."""
+    global _pool
+    if _pool is None:
+        dsn = os.environ.get("CONNECTION_STRING") or os.environ.get("DATABASE_URL")
+        if not dsn:
+            raise RuntimeError("Не задан CONNECTION_STRING или DATABASE_URL")
+        _pool = await asyncpg.create_pool(
+            dsn,
+            min_size=1,
+            max_size=5,
+        )
+    return _pool
+
+
+async def db_init() -> None:
+    """Создаёт таблицы в PostgreSQL, если их ещё нет."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                tg_id          BIGINT PRIMARY KEY,
+                username       TEXT,
+                first_name     TEXT,
+                balance        INTEGER NOT NULL DEFAULT 0,
+                is_blacklisted BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at     TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id         SERIAL PRIMARY KEY,
+                tg_id      BIGINT NOT NULL,
+                title      TEXT NOT NULL,
+                price      INTEGER NOT NULL,
+                status     TEXT NOT NULL,
+                category   TEXT,
+                contact    TEXT,
+                login_data TEXT,
+                login_code TEXT,
+                gamepass_price INTEGER,
+                assigned_to BIGINT,
+                assigned_at TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS gamepass_price INTEGER"
+        )
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS assigned_to BIGINT"
+        )
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS assigned_at TEXT"
+        )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS staff_members (
+                tg_id       BIGINT PRIMARY KEY,
+                role        TEXT NOT NULL,
+                username    TEXT,
+                first_name  TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS staff_order_messages (
+                order_id    INTEGER NOT NULL,
+                staff_id    BIGINT NOT NULL,
+                chat_id     BIGINT NOT NULL,
+                message_id  BIGINT NOT NULL,
+                message_text TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                PRIMARY KEY (order_id, staff_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS staff_audit_log (
+                id          SERIAL PRIMARY KEY,
+                staff_id    BIGINT NOT NULL,
+                role        TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                entity_type TEXT,
+                entity_id   TEXT,
+                created_at  TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id         SERIAL PRIMARY KEY,
+                tg_id      BIGINT NOT NULL,
+                amount     INTEGER NOT NULL,
+                kind       TEXT NOT NULL,
+                reason     TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS reviews (
+                id            SERIAL PRIMARY KEY,
+                order_id      INTEGER NOT NULL UNIQUE,
+                tg_id         BIGINT NOT NULL,
+                photo_file_id TEXT,
+                comment       TEXT,
+                created_at    TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                id            SERIAL PRIMARY KEY,
+                code          TEXT UNIQUE NOT NULL,
+                game          TEXT NOT NULL,
+                product_title TEXT NOT NULL,
+                promo_price   INTEGER NOT NULL,
+                starts_at     TEXT,
+                expires_at    TEXT,
+                is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at    TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_promos (
+                id         SERIAL PRIMARY KEY,
+                tg_id      BIGINT NOT NULL,
+                promo_id   INTEGER NOT NULL,
+                claimed_at TEXT NOT NULL,
+                used_at    TEXT,
+                UNIQUE(tg_id, promo_id)
+            )
+        """)
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_level "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_count "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.execute(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS active_ref_promo INTEGER"
+        )
+        await conn.execute(
+            "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS "
+            "discount_pct INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.execute(
+            "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS "
+            "max_uses INTEGER DEFAULT NULL"
+        )
+        if MODERATOR_CHAT_ID:
+            now = datetime.now(timezone.utc).isoformat()
+            await conn.execute(
+                "INSERT INTO staff_members "
+                "(tg_id, role, username, first_name, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $5) "
+                "ON CONFLICT (tg_id) DO UPDATE SET role = $2, updated_at = $5",
+                MODERATOR_CHAT_ID, ROLE_FOUNDER, None, "Founder", now,
+            )
+        staff_rows = await conn.fetch(
+            "SELECT tg_id, role FROM staff_members"
+        )
+        _STAFF_ROLES.clear()
+        _STAFF_ROLES.update({
+            int(row["tg_id"]): row["role"]
+            for row in staff_rows
+            if row["role"] in STAFF_ROLES
+        })
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS referral_purchases (
+                id          SERIAL PRIMARY KEY,
+                buyer_id    BIGINT NOT NULL,
+                referrer_id BIGINT NOT NULL,
+                created_at  TEXT NOT NULL,
+                UNIQUE(buyer_id)
+            )
+        """)
+        # Каталог товаров
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id         SERIAL PRIMARY KEY,
+                category   TEXT NOT NULL,
+                key        TEXT NOT NULL UNIQUE,
+                name       TEXT NOT NULL,
+                price      NUMERIC(12,2) NOT NULL,
+                delivery   TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                active     BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        """)
+        # Настройки (курсы, лимиты)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        # Заполняем настройки начальными значениями
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES
+                ('robux_gamepass_rate',           '0.65'),
+                ('robux_gamepass_pass_price_rate','0.7'),
+                ('tg_stars_rate',                 '1.3'),
+                ('min_topup',                     '10'),
+                ('min_tg_stars',                  '50')
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Таблица категорий (для динамического магазина)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                key             TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                emoji           TEXT NOT NULL DEFAULT '🎮',
+                sort_order      INTEGER NOT NULL DEFAULT 0,
+                disabled        BOOLEAN NOT NULL DEFAULT FALSE,
+                disabled_reason TEXT DEFAULT NULL,
+                login_hint      TEXT DEFAULT NULL,
+                needs_code      BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        await conn.execute("""
+            INSERT INTO categories (key, name, emoji, sort_order, disabled, login_hint, needs_code) VALUES
+                ('roblox_instant', 'Roblox — моментально', '🟦', 0, FALSE,
+                 'Отправьте логин (никнейм) в Roblox.', TRUE),
+                ('brawl', 'Brawl Stars', '⭐', 1, FALSE,
+                 'Отправьте почту, привязанную к вашему аккаунту и ожидайте код.', TRUE)
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Добавляем встроенные специальные категории (геймпасс и звёзды), если их ещё нет
+        await conn.execute("""
+            INSERT INTO categories (key, name, emoji, sort_order, disabled, login_hint, needs_code) VALUES
+                ('roblox_gamepass', 'Roblox — геймпассом', '🎮', 2, FALSE,
+                 'Отправьте ссылку на созданный геймпасс в Roblox.', FALSE),
+                ('tgstars', 'Telegram Stars', '✨', 3, FALSE, NULL, FALSE)
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Миграция: добавляем встроенные специальные категории если таблица уже была
+        await conn.execute("""
+            INSERT INTO categories (key, name, emoji, sort_order, disabled, login_hint, needs_code) VALUES
+                ('roblox_gamepass', 'Roblox — геймпассом', '🎮', 2, FALSE,
+                 'Отправьте ссылку на созданный геймпасс в Roblox.', FALSE),
+                ('tgstars', 'Telegram Stars', '✨', 3, FALSE, NULL, FALSE)
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Миграция: добавляем новые колонки категорий если таблица уже была
+        for col_sql in [
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS disabled_reason TEXT DEFAULT NULL",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS login_hint TEXT DEFAULT NULL",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS needs_code BOOLEAN NOT NULL DEFAULT FALSE",
+        ]:
+            await conn.execute(col_sql)
+        # Заполняем каталог начальными товарами (не перезаписываем существующие)
+        await conn.execute("""
+            INSERT INTO products (category, key, name, price, delivery, sort_order) VALUES
+                ('roblox_instant','rb_40',   '40 робуксов',   79,   'моментально', 0),
+                ('roblox_instant','rb_80',   '80 робуксов',   99,   'моментально', 1),
+                ('roblox_instant','rb_200',  '200 робуксов',  279,  'моментально', 2),
+                ('roblox_instant','rb_400',  '400 робуксов',  459,  'моментально', 3),
+                ('roblox_instant','rb_500',  '500 робуксов',  499,  'моментально', 4),
+                ('roblox_instant','rb_1000', '1000 робуксов', 909,  'моментально', 5),
+                ('roblox_instant','rb_1700', '1700 робуксов', 1619, 'моментально', 6),
+                ('roblox_instant','rb_2000', '2000 робуксов', 1819, 'моментально', 7),
+                ('roblox_instant','rb_3600', '3600 робуксов', 3299, 'моментально', 8),
+                ('brawl','bs_pass',      'Brawl Pass',      899,  'по согласованию через Telegram', 0),
+                ('brawl','bs_pass_plus', 'Brawl Pass Plus', 1239, 'по согласованию через Telegram', 1),
+                ('brawl','bs_pro',       'Pro Pass',        2249, 'по согласованию через Telegram', 2)
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Миграция: добавляем флаг ожидания подтверждения получения заказа
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS "
+            "confirm_pending BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        # Миграция: переводим денежные колонки в NUMERIC для поддержки копеек
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='users' AND column_name='balance' AND data_type='integer'
+                ) THEN
+                    ALTER TABLE users ALTER COLUMN balance TYPE NUMERIC(12,2)
+                        USING balance::NUMERIC(12,2);
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='transactions' AND column_name='amount' AND data_type='integer'
+                ) THEN
+                    ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(12,2)
+                        USING amount::NUMERIC(12,2);
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='orders' AND column_name='price' AND data_type='integer'
+                ) THEN
+                    ALTER TABLE orders ALTER COLUMN price TYPE NUMERIC(12,2)
+                        USING price::NUMERIC(12,2);
+                END IF;
+            END $$;
+        """)
+        # Тикеты поддержки
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id            SERIAL PRIMARY KEY,
+                user_tg_id    BIGINT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'open',
+                assigned_to   BIGINT DEFAULT NULL,
+                description   TEXT,
+                photo_file_id TEXT,
+                created_at    TEXT NOT NULL,
+                closed_at     TEXT DEFAULT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_ticket_notify (
+                ticket_id  INTEGER NOT NULL,
+                staff_id   BIGINT NOT NULL,
+                chat_id    BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                PRIMARY KEY (ticket_id, staff_id)
+            )
+        """)
+
+
+async def db_get_or_create_user(user) -> tuple[dict, bool]:
+    """Возвращает запись пользователя, создавая её при первом обращении.
+    Возвращает (запись, is_new_user) — is_new_user True, если запись только что создана."""
+    pool = await get_pool()
+    ref_code = secrets.token_urlsafe(8)
+    row = await pool.fetchrow(
+        """
+        INSERT INTO users (tg_id, username, first_name, balance, referral_code, created_at)
+        VALUES ($1, $2, $3, 0, $4, $5)
+        ON CONFLICT (tg_id) DO UPDATE
+            SET username      = EXCLUDED.username,
+                first_name    = EXCLUDED.first_name,
+                referral_code = COALESCE(users.referral_code, EXCLUDED.referral_code)
+        RETURNING *, (xmax = 0) AS _is_new
+        """,
+        user.id,
+        user.username,
+        user.first_name,
+        ref_code,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    data = dict(row)
+    is_new = bool(data.pop("_is_new", False))
+    return data, is_new
+
+
+async def db_get_balance(tg_id: int) -> float:
+    pool = await get_pool()
+    val = await pool.fetchval("SELECT balance FROM users WHERE tg_id = $1", tg_id)
+    return float(val) if val is not None else 0.0
+
+
+async def db_add_balance(tg_id: int, amount: float) -> float:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET balance = balance + $1 WHERE tg_id = $2",
+        amount, tg_id,
+    )
+    return await db_get_balance(tg_id)
+
+
+async def db_credit_balance(
+    tg_id: int, amount: float, kind: str, reason: str | None = None
+) -> float:
+    """Атомарно начисляет/списывает баланс и записывает транзакцию.
+    Оба действия выполняются в одной БД-транзакции — никакого расхождения при сбое.
+    amount: положительное — начисление, отрицательное — списание.
+    Возвращает новый баланс."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1 WHERE tg_id = $2",
+                amount, tg_id,
+            )
+            await conn.execute(
+                "INSERT INTO transactions (tg_id, amount, kind, reason, created_at)"
+                " VALUES ($1, $2, $3, $4, $5)",
+                tg_id, amount, kind, reason,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+            row = await conn.fetchrow(
+                "SELECT balance FROM users WHERE tg_id = $1", tg_id
+            )
+            return float(row["balance"]) if row else 0.0
+
+
+async def db_try_charge(tg_id: int, amount: float) -> bool:
+    """Списывает amount с баланса, если денег достаточно. Возвращает True/False."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT balance FROM users WHERE tg_id = $1 FOR UPDATE",
+                tg_id,
+            )
+            if not row or float(row["balance"]) < amount:
+                return False
+            await conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE tg_id = $2",
+                amount, tg_id,
+            )
+            return True
+
+
+async def db_create_order(
+    tg_id: int,
+    title: str,
+    price: float,
+    status: str = "Оплачен",
+    category: str | None = None,
+    gamepass_price: int | None = None,
+) -> int:
+    pool = await get_pool()
+    order_id = await pool.fetchval(
+        "INSERT INTO orders "
+        "(tg_id, title, price, status, category, gamepass_price, created_at)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        tg_id,
+        title,
+        price,
+        status,
+        category,
+        gamepass_price,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    return order_id
+
+
+async def db_set_order_status(order_id: int, status: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET status = $1 WHERE id = $2",
+        status, order_id,
+    )
+
+
+async def db_set_confirm_pending(order_id: int, value: bool) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET confirm_pending = $1 WHERE id = $2",
+        value, order_id,
+    )
+
+
+async def db_get_confirm_pending(order_id: int) -> bool:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT confirm_pending FROM orders WHERE id = $1", order_id
+    )
+    return bool(val) if val is not None else False
+
+
+# =====================================================================
+# Каталог товаров и настройки (DB)
+# =====================================================================
+
+async def db_get_products(category: str) -> list[tuple]:
+    """Возвращает активные товары категории: [(key, name, price, delivery), ...]."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT key, name, price, delivery FROM products "
+        "WHERE category = $1 AND active = TRUE ORDER BY sort_order, id",
+        category,
+    )
+    return [(r["key"], r["name"], float(r["price"]), r["delivery"]) for r in rows]
+
+
+async def db_get_product_by_key(key: str) -> tuple | None:
+    """Возвращает товар по ключу: (key, name, price, delivery) или None."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT key, name, price, delivery FROM products WHERE key = $1", key
+    )
+    return (row["key"], row["name"], float(row["price"]), row["delivery"]) if row else None
+
+
+async def db_all_products() -> list[dict]:
+    """Все товары (для админ-панели)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT id, category, key, name, price, delivery, sort_order, active "
+        "FROM products ORDER BY category, sort_order, id"
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_update_product_price(key: str, price: float) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE products SET price = $1 WHERE key = $2", price, key)
+
+
+async def db_toggle_product(key: str) -> bool:
+    """Переключает флаг active товара, возвращает новое значение."""
+    pool = await get_pool()
+    new_val = await pool.fetchval(
+        "UPDATE products SET active = NOT active WHERE key = $1 RETURNING active", key
+    )
+    return bool(new_val)
+
+
+async def db_add_product(
+    category: str, key: str, name: str, price: float, delivery: str
+) -> bool:
+    """Добавляет товар. Возвращает False, если ключ уже существует."""
+    pool = await get_pool()
+    try:
+        sort_max = await pool.fetchval(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM products WHERE category = $1",
+            category,
+        )
+        await pool.execute(
+            "INSERT INTO products (category, key, name, price, delivery, sort_order) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            category, key, name, price, delivery, int(sort_max or 0),
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def db_rename_product(key: str, name: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE products SET name = $1 WHERE key = $2", name, key)
+
+
+async def db_delete_product(key: str) -> None:
+    pool = await get_pool()
+    await pool.execute("DELETE FROM products WHERE key = $1", key)
+
+
+async def db_rename_category(key: str, name: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE categories SET name = $1 WHERE key = $2", name, key)
+
+
+async def db_set_category_emoji(key: str, emoji: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE categories SET emoji = $1 WHERE key = $2", emoji, key)
+
+
+async def db_delete_category(key: str) -> None:
+    """Удаляет категорию и все её товары (в одной транзакции)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM products WHERE category = $1", key)
+            await conn.execute("DELETE FROM categories WHERE key = $1", key)
+
+
+async def db_get_setting(key: str, default: str = "") -> str:
+    pool = await get_pool()
+    val = await pool.fetchval("SELECT value FROM settings WHERE key = $1", key)
+    return val if val is not None else default
+
+
+async def db_set_setting(key: str, value: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO settings (key, value) VALUES ($1, $2) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        key, value,
+    )
+
+
+async def db_all_settings() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch("SELECT key, value FROM settings ORDER BY key")
+    return [dict(r) for r in rows]
+
+
+async def db_get_image(key: str) -> str | None:
+    """Возвращает file_id картинки по ключу (cat:{key} или prod:{key}), или None."""
+    val = await db_get_setting(f"img:{key}", "")
+    return val or None
+
+
+async def db_set_image(key: str, file_id: str) -> None:
+    """Сохраняет file_id картинки по ключу."""
+    await db_set_setting(f"img:{key}", file_id)
+
+
+async def db_delete_image(key: str) -> None:
+    """Удаляет картинку по ключу."""
+    await db_set_setting(f"img:{key}", "")
+
+
+async def db_all_categories() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code "
+        "FROM categories ORDER BY sort_order, key"
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_get_category(key: str) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code "
+        "FROM categories WHERE key = $1", key
+    )
+    return dict(row) if row else None
+
+
+async def db_create_category(key: str, name: str, emoji: str) -> None:
+    pool = await get_pool()
+    sort_max = await pool.fetchval("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories")
+    await pool.execute(
+        "INSERT INTO categories (key, name, emoji, sort_order) VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (key) DO NOTHING",
+        key, name, emoji, int(sort_max or 0),
+    )
+
+
+async def db_set_category_disabled(key: str, disabled: bool, reason: str | None = None) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE categories SET disabled = $1, disabled_reason = $2 WHERE key = $3",
+        disabled, reason, key,
+    )
+
+
+async def db_update_category_login_hint(key: str, text: str | None) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE categories SET login_hint = $1 WHERE key = $2", text, key
+    )
+
+
+async def db_toggle_category_needs_code(key: str) -> bool:
+    pool = await get_pool()
+    new_val = await pool.fetchval(
+        "UPDATE categories SET needs_code = NOT needs_code WHERE key = $1 RETURNING needs_code",
+        key,
+    )
+    return bool(new_val)
+
+
+async def db_get_order(order_id: int) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT * FROM orders WHERE id = $1", order_id)
+    return dict(row) if row else None
+
+
+async def db_update_order_status(order_id: int, status: str) -> None:
+    pool = await get_pool()
+    await pool.execute("UPDATE orders SET status = $1 WHERE id = $2", status, order_id)
+
+
+async def db_get_staff_role(tg_id: int) -> str | None:
+    """Возвращает роль сотрудника и поддерживает быстрый runtime-кэш."""
+    if tg_id == MODERATOR_CHAT_ID:
+        _STAFF_ROLES[tg_id] = ROLE_FOUNDER
+        return ROLE_FOUNDER
+    pool = await get_pool()
+    role = await pool.fetchval(
+        "SELECT role FROM staff_members WHERE tg_id = $1", tg_id
+    )
+    if role in STAFF_ROLES:
+        _STAFF_ROLES[tg_id] = role
+        return role
+    _STAFF_ROLES.pop(tg_id, None)
+    return None
+
+
+async def db_list_staff() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, role, username, first_name, created_at, updated_at "
+        "FROM staff_members ORDER BY CASE role "
+        "WHEN 'founder' THEN 1 WHEN 'administrator' THEN 2 "
+        "WHEN 'moderator' THEN 3 ELSE 4 END, tg_id"
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_upsert_staff(
+    tg_id: int,
+    role: str,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> None:
+    if role not in STAFF_ROLES:
+        raise ValueError("Неизвестная роль сотрудника")
+    now = datetime.now(timezone.utc).isoformat()
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO staff_members "
+        "(tg_id, role, username, first_name, created_at, updated_at) "
+        "VALUES ($1, $2, $3, $4, $5, $5) "
+        "ON CONFLICT (tg_id) DO UPDATE SET role = $2, "
+        "username = COALESCE($3, staff_members.username), "
+        "first_name = COALESCE($4, staff_members.first_name), updated_at = $5",
+        tg_id, role, username, first_name, now,
+    )
+    _STAFF_ROLES[tg_id] = role
+
+
+async def db_remove_staff(tg_id: int) -> bool:
+    if tg_id == MODERATOR_CHAT_ID:
+        return False
+    pool = await get_pool()
+    deleted = await pool.fetchval(
+        "DELETE FROM staff_members WHERE tg_id = $1 RETURNING tg_id", tg_id
+    )
+    _STAFF_ROLES.pop(tg_id, None)
+    return deleted is not None
+
+
+async def db_get_order_staff_recipients() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, role, username, first_name FROM staff_members "
+        "WHERE role IN ($1, $2) ORDER BY CASE role WHEN $1 THEN 1 ELSE 2 END, tg_id",
+        ROLE_FOUNDER, ROLE_ADMINISTRATOR,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_get_can_moderate_recipients() -> list[dict]:
+    """Возвращает Founder + Administrator + Moderator для рассылки отзывов."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, role, username, first_name FROM staff_members "
+        "WHERE role IN ($1, $2, $3) ORDER BY CASE role "
+        "WHEN $1 THEN 1 WHEN $2 THEN 2 ELSE 3 END, tg_id",
+        ROLE_FOUNDER, ROLE_ADMINISTRATOR, ROLE_MODERATOR,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_claim_order(order_id: int, staff_id: int) -> dict | None:
+    """Атомарно назначает свободный заказ одному сотруднику."""
+    pool = await get_pool()
+    now = datetime.now(timezone.utc).isoformat()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE orders SET assigned_to = $2, assigned_at = $3 "
+            "WHERE id = $1 AND assigned_to IS NULL "
+            "AND status NOT IN ('Выполнен', 'Возврат') RETURNING *",
+            order_id, staff_id, now,
+        )
+    return dict(row) if row else None
+
+
+async def db_store_staff_order_message(
+    order_id: int,
+    staff_id: int,
+    chat_id: int,
+    message_id: int,
+    message_text: str,
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO staff_order_messages "
+        "(order_id, staff_id, chat_id, message_id, message_text, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6) "
+        "ON CONFLICT (order_id, staff_id) DO UPDATE SET "
+        "chat_id = $3, message_id = $4, message_text = $5",
+        order_id, staff_id, chat_id, message_id, message_text,
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+
+async def db_get_staff_order_messages(order_id: int) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT order_id, staff_id, chat_id, message_id "
+        "FROM staff_order_messages WHERE order_id = $1",
+        order_id,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_audit_staff_action(
+    staff_id: int,
+    action: str,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+) -> None:
+    role = await db_get_staff_role(staff_id) or "unknown"
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO staff_audit_log "
+        "(staff_id, role, action, entity_type, entity_id, created_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6)",
+        staff_id, role, action, entity_type, entity_id,
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+
+JOURNAL_PAGE_SIZE = 10
+
+_ACTION_LABELS: dict[str, str] = {
+    "claim_order":      "📥 Взял заказ",
+    "complete_order":   "✅ Выполнил заказ",
+    "change_role":      "🔄 Сменил роль сотруднику",
+    "fire_staff":       "🔥 Уволил сотрудника",
+    "add_staff":        "➕ Добавил сотрудника",
+    "blacklist_user":   "🚫 Заблокировал пользователя",
+    "unblacklist_user": "🔓 Разблокировал пользователя",
+    "credit_balance":   "💰 Начислил баланс",
+    "reset_balance":    "♻️ Обнулил баланс",
+    "maintenance_on":   "🔒 Включил тех. работы",
+    "maintenance_off":  "🔓 Выключил тех. работы",
+}
+
+_ENTITY_LABELS: dict[str, str] = {
+    "order": "Заказ",
+    "user":  "Пользователь",
+    "staff": "Сотрудник",
+}
+
+
+def _action_label(action: str) -> str:
+    if action in _ACTION_LABELS:
+        return _ACTION_LABELS[action]
+    if action.startswith("callback:"):
+        return f"🖱 callback:{action[9:]}"
+    if action.startswith("message:"):
+        return f"💬 {action[8:]}"
+    return action
+
+
+_SIGNIFICANT_ACTIONS: tuple[str, ...] = tuple(_ACTION_LABELS.keys())
+
+
+async def db_get_staff_journal(
+    page: int = 0,
+    staff_filter: int | None = None,
+) -> tuple[list[dict], int]:
+    """Возвращает (записи, total_count) из staff_audit_log.
+    Показывает только значимые действия (из _ACTION_LABELS).
+    """
+    pool = await get_pool()
+    offset = page * JOURNAL_PAGE_SIZE
+    if staff_filter is not None:
+        total = await pool.fetchval(
+            "SELECT COUNT(*) FROM staff_audit_log "
+            "WHERE staff_id = $1 AND action = ANY($2::text[])",
+            staff_filter, list(_SIGNIFICANT_ACTIONS),
+        )
+        rows = await pool.fetch(
+            "SELECT sal.id, sal.staff_id, sal.role, sal.action, "
+            "sal.entity_type, sal.entity_id, sal.created_at, "
+            "sm.username, sm.first_name "
+            "FROM staff_audit_log sal "
+            "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
+            "WHERE sal.staff_id = $1 AND sal.action = ANY($2::text[]) "
+            "ORDER BY sal.id DESC LIMIT $3 OFFSET $4",
+            staff_filter, list(_SIGNIFICANT_ACTIONS), JOURNAL_PAGE_SIZE, offset,
+        )
+    else:
+        total = await pool.fetchval(
+            "SELECT COUNT(*) FROM staff_audit_log WHERE action = ANY($1::text[])",
+            list(_SIGNIFICANT_ACTIONS),
+        )
+        rows = await pool.fetch(
+            "SELECT sal.id, sal.staff_id, sal.role, sal.action, "
+            "sal.entity_type, sal.entity_id, sal.created_at, "
+            "sm.username, sm.first_name "
+            "FROM staff_audit_log sal "
+            "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
+            "WHERE sal.action = ANY($1::text[]) "
+            "ORDER BY sal.id DESC LIMIT $2 OFFSET $3",
+            list(_SIGNIFICANT_ACTIONS), JOURNAL_PAGE_SIZE, offset,
+        )
+    return [dict(r) for r in rows], int(total or 0)
+
+
+async def db_staff_order_stats(staff_id: int) -> dict:
+    """Статистика сотрудника: взятые/выполненные заказы (всего, сегодня, неделя)."""
+    pool = await get_pool()
+    now_msk = datetime.now(MSK_TZ)
+    today_prefix = now_msk.strftime("%Y-%m-%d")
+    week_start = (now_msk - timedelta(days=now_msk.weekday())).strftime("%Y-%m-%d")
+
+    async def _count(action: str, since: str | None = None) -> int:
+        if since:
+            return int(await pool.fetchval(
+                "SELECT COUNT(*) FROM staff_audit_log "
+                "WHERE staff_id=$1 AND action=$2 AND created_at >= $3",
+                staff_id, action, since,
+            ) or 0)
+        return int(await pool.fetchval(
+            "SELECT COUNT(*) FROM staff_audit_log WHERE staff_id=$1 AND action=$2",
+            staff_id, action,
+        ) or 0)
+
+    return {
+        "claimed_total":     await _count("claim_order"),
+        "completed_total":   await _count("complete_order"),
+        "claimed_today":     await _count("claim_order",    today_prefix),
+        "completed_today":   await _count("complete_order", today_prefix),
+        "claimed_week":      await _count("claim_order",    week_start),
+        "completed_week":    await _count("complete_order", week_start),
+    }
+
+
+async def db_get_order_history(order_id: int) -> list[dict]:
+    """Все записи аудита по конкретному заказу."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT sal.staff_id, sal.role, sal.action, sal.created_at, "
+        "sm.username, sm.first_name "
+        "FROM staff_audit_log sal "
+        "LEFT JOIN staff_members sm ON sm.tg_id = sal.staff_id "
+        "WHERE sal.entity_type = 'order' AND sal.entity_id = $1 "
+        "ORDER BY sal.id ASC",
+        str(order_id),
+    )
+    return [dict(r) for r in rows]
+
+
+# ---- Тикеты поддержки ----
+
+async def db_create_ticket(
+    user_tg_id: int, description: str, photo_file_id: str | None = None
+) -> dict:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "INSERT INTO support_tickets (user_tg_id, description, photo_file_id, created_at) "
+        "VALUES ($1, $2, $3, $4) RETURNING *",
+        user_tg_id, description, photo_file_id,
+        datetime.now(timezone.utc).isoformat(),
+    )
+    return dict(row)
+
+
+async def db_get_ticket(ticket_id: int) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM support_tickets WHERE id = $1", ticket_id
+    )
+    return dict(row) if row else None
+
+
+async def db_get_active_ticket(user_tg_id: int) -> dict | None:
+    """Возвращает открытый или взятый тикет пользователя."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM support_tickets "
+        "WHERE user_tg_id = $1 AND status IN ('open', 'claimed') "
+        "ORDER BY id DESC LIMIT 1",
+        user_tg_id,
+    )
+    return dict(row) if row else None
+
+
+async def db_claim_ticket(ticket_id: int, staff_id: int) -> bool:
+    """Назначает тикет сотруднику. Возвращает True если успешно."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "UPDATE support_tickets SET status='claimed', assigned_to=$1 "
+        "WHERE id=$2 AND status='open'",
+        staff_id, ticket_id,
+    )
+    return result.endswith("1")
+
+
+async def db_close_ticket(ticket_id: int) -> bool:
+    """Закрывает тикет."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "UPDATE support_tickets SET status='closed', closed_at=$1 "
+        "WHERE id=$2 AND status IN ('open','claimed')",
+        datetime.now(timezone.utc).isoformat(), ticket_id,
+    )
+    return result.endswith("1")
+
+
+async def db_store_ticket_notify(
+    ticket_id: int, staff_id: int, chat_id: int, message_id: int
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO support_ticket_notify (ticket_id, staff_id, chat_id, message_id) "
+        "VALUES ($1, $2, $3, $4) ON CONFLICT (ticket_id, staff_id) DO UPDATE "
+        "SET chat_id=$3, message_id=$4",
+        ticket_id, staff_id, chat_id, message_id,
+    )
+
+
+async def db_get_ticket_notify(ticket_id: int) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT staff_id, chat_id, message_id FROM support_ticket_notify WHERE ticket_id=$1",
+        ticket_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_get_direct_support_contact() -> str | None:
+    """Возвращает @username первого хелпера с username, или founder, или None."""
+    pool = await get_pool()
+    # Сначала ищем хелпера с username
+    row = await pool.fetchrow(
+        "SELECT username FROM staff_members WHERE role=$1 AND username IS NOT NULL LIMIT 1",
+        ROLE_HELPER,
+    )
+    if row:
+        return f"@{row['username']}"
+    # Затем фаундера с username
+    row = await pool.fetchrow(
+        "SELECT username FROM staff_members WHERE role=$1 AND username IS NOT NULL LIMIT 1",
+        ROLE_FOUNDER,
+    )
+    if row:
+        return f"@{row['username']}"
+    return SUPPORT_USERNAME
+
+
+async def db_set_order_contact(order_id: int, contact: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET contact = $1 WHERE id = $2",
+        contact, order_id,
+    )
+
+
+async def db_set_order_login(order_id: int, login_data: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET login_data = $1 WHERE id = $2",
+        login_data, order_id,
+    )
+
+
+async def db_set_order_login_code(order_id: int, code: str) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE orders SET login_code = $1 WHERE id = $2",
+        code, order_id,
+    )
+
+
+async def db_add_review(
+    order_id: int, tg_id: int, photo_file_id: str | None, comment: str
+) -> int:
+    pool = await get_pool()
+    review_id = await pool.fetchval(
+        """
+        INSERT INTO reviews (order_id, tg_id, photo_file_id, comment, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (order_id) DO UPDATE
+            SET photo_file_id = EXCLUDED.photo_file_id,
+                comment       = EXCLUDED.comment,
+                created_at    = EXCLUDED.created_at
+        RETURNING id
+        """,
+        order_id,
+        tg_id,
+        photo_file_id,
+        comment,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    return review_id
+
+
+async def db_has_review(order_id: int) -> bool:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT 1 FROM reviews WHERE order_id = $1", order_id
+    )
+    return val is not None
+
+
+async def db_add_transaction(
+    tg_id: int, amount: float, kind: str, reason: str | None = None
+) -> None:
+    """Записывает движение по балансу. amount: +начисление / -списание."""
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO transactions (tg_id, amount, kind, reason, created_at)"
+        " VALUES ($1, $2, $3, $4, $5)",
+        tg_id,
+        amount,
+        kind,
+        reason,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+
+
+async def db_get_transactions(tg_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM transactions WHERE tg_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3",
+        tg_id, limit, offset,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_transactions_count(tg_id: int) -> int:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT COUNT(*) FROM transactions WHERE tg_id = $1", tg_id
+    )
+    return int(val) if val else 0
+
+
+async def db_set_balance(tg_id: int, value: float) -> float:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET balance = $1 WHERE tg_id = $2",
+        value, tg_id,
+    )
+    return await db_get_balance(tg_id)
+
+
+async def db_set_blacklist(tg_id: int, value: bool) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET is_blacklisted = $1 WHERE tg_id = $2",
+        value, tg_id,
+    )
+
+
+async def db_is_blacklisted(tg_id: int) -> bool:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT is_blacklisted FROM users WHERE tg_id = $1", tg_id
+    )
+    return bool(val) if val is not None else False
+
+
+async def db_find_user(tg_id: int) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT * FROM users WHERE tg_id = $1", tg_id)
+    return dict(row) if row else None
+
+
+async def db_get_orders(tg_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM orders WHERE tg_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3",
+        tg_id, limit, offset,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_orders_count(tg_id: int) -> int:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT COUNT(*) FROM orders WHERE tg_id = $1", tg_id
+    )
+    return int(val) if val else 0
+
+
+async def db_users_count() -> int:
+    pool = await get_pool()
+    val = await pool.fetchval("SELECT COUNT(*) FROM users")
+    return int(val) if val else 0
+
+
+async def db_list_users(limit: int, offset: int) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, username, first_name, balance, is_blacklisted "
+        "FROM users ORDER BY tg_id DESC LIMIT $1 OFFSET $2",
+        limit, offset,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_create_promo(
+    code: str,
+    game: str,
+    product_title: str,
+    promo_price: int,
+    starts_at: str | None = None,
+    expires_at: str | None = None,
+    discount_pct: int = 0,
+    max_uses: int | None = None,
+) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    pool = await get_pool()
+    promo_id = await pool.fetchval(
+        "INSERT INTO promo_codes (code, game, product_title, promo_price, discount_pct,"
+        " starts_at, expires_at, is_active, created_at, max_uses)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9) RETURNING id",
+        code.upper(), game, product_title, promo_price, discount_pct,
+        starts_at, expires_at, now, max_uses,
+    )
+    return promo_id
+
+
+async def db_get_promo_by_code(code: str) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM promo_codes WHERE UPPER(code) = UPPER($1)",
+        code.strip(),
+    )
+    return dict(row) if row else None
+
+
+async def db_get_promo_by_id(promo_id: int) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM promo_codes WHERE id = $1", promo_id
+    )
+    return dict(row) if row else None
+
+
+async def db_list_promos() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch("SELECT * FROM promo_codes ORDER BY id DESC")
+    return [dict(r) for r in rows]
+
+
+async def db_delete_promo(promo_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM user_promos WHERE promo_id = $1", promo_id)
+            await conn.execute("DELETE FROM promo_codes WHERE id = $1", promo_id)
+
+
+async def db_toggle_promo(promo_id: int, is_active: bool) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE promo_codes SET is_active = $1 WHERE id = $2",
+        is_active, promo_id,
+    )
+
+
+async def db_claim_promo(tg_id: int, promo_id: int) -> bool:
+    """Добавляет промокод в список пользователя. False — уже есть."""
+    now = datetime.now(timezone.utc).isoformat()
+    pool = await get_pool()
+    try:
+        await pool.execute(
+            "INSERT INTO user_promos (tg_id, promo_id, claimed_at) VALUES ($1, $2, $3)",
+            tg_id, promo_id, now,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def db_use_promo(tg_id: int, promo_id: int) -> bool:
+    """Помечает промокод как использованный.
+    Если достигнут лимит max_uses — автоматически деактивирует промокод.
+    Возвращает False, если уже использован или лимит исчерпан."""
+    now = datetime.now(timezone.utc).isoformat()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Проверяем, не использован ли уже промокод этим пользователем
+            row = await conn.fetchrow(
+                "SELECT used_at FROM user_promos WHERE tg_id = $1 AND promo_id = $2",
+                tg_id, promo_id,
+            )
+            if not row or row["used_at"] is not None:
+                return False
+            # Получаем лимит активаций (с блокировкой строки)
+            promo_row = await conn.fetchrow(
+                "SELECT max_uses FROM promo_codes WHERE id = $1 FOR UPDATE",
+                promo_id,
+            )
+            max_uses = promo_row["max_uses"] if promo_row else None
+            # Проверяем лимит до записи
+            if max_uses is not None:
+                used_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM user_promos "
+                    "WHERE promo_id = $1 AND used_at IS NOT NULL",
+                    promo_id,
+                )
+                if int(used_count) >= max_uses:
+                    # Лимит исчерпан — деактивируем и отказываем
+                    await conn.execute(
+                        "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
+                        promo_id,
+                    )
+                    return False
+            # Помечаем как использованный
+            await conn.execute(
+                "UPDATE user_promos SET used_at = $1 WHERE tg_id = $2 AND promo_id = $3",
+                now, tg_id, promo_id,
+            )
+            # Проверяем, исчерпан ли лимит теперь — деактивируем автоматически
+            if max_uses is not None:
+                new_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM user_promos "
+                    "WHERE promo_id = $1 AND used_at IS NOT NULL",
+                    promo_id,
+                )
+                if int(new_count) >= max_uses:
+                    await conn.execute(
+                        "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
+                        promo_id,
+                    )
+            return True
+
+
+async def db_get_user_promos(tg_id: int) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT up.id, up.tg_id, up.promo_id, up.claimed_at, up.used_at, "
+        "pc.code, pc.game, pc.product_title, pc.promo_price, pc.discount_pct, "
+        "pc.expires_at, pc.starts_at, pc.is_active "
+        "FROM user_promos up "
+        "JOIN promo_codes pc ON pc.id = up.promo_id "
+        "WHERE up.tg_id = $1 ORDER BY up.id DESC",
+        tg_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_promo_usage_count(promo_id: int) -> int:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT COUNT(*) FROM user_promos WHERE promo_id = $1 AND used_at IS NOT NULL",
+        promo_id,
+    )
+    return int(val) if val else 0
+
+
+async def db_get_all_user_ids() -> list[int]:
+    """Возвращает tg_id всех не заблокированных пользователей (для рассылки)."""
+    pool = await get_pool()
+    rows = await pool.fetch("SELECT tg_id FROM users WHERE is_blacklisted = FALSE")
+    return [r["tg_id"] for r in rows]
+
+
+# =====================================================================
+# Реферальная система — вспомогательные функции
+# =====================================================================
+
+def _ref_level_name(level: int) -> str:
+    return REFERRAL_LEVELS.get(level, ("Новичок", 0))[0]
+
+
+def _ref_discount_pct(level: int) -> int:
+    return level * REFERRAL_DISCOUNT_PER_LEVEL
+
+
+def _fmt_price(p: float | int) -> str:
+    """Форматирует цену: без копеек если целое, с копейками если дробное."""
+    v = float(p)
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.2f}"
+
+
+async def db_get_user_by_ref_code(ref_code: str) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM users WHERE referral_code = $1", ref_code
+    )
+    return dict(row) if row else None
+
+
+async def db_set_referred_by(tg_id: int, referrer_id: int) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET referred_by = $1 WHERE tg_id = $2 AND referred_by IS NULL",
+        referrer_id, tg_id,
+    )
+
+
+async def db_set_active_ref_promo(tg_id: int, promo_id: int | None) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE users SET active_ref_promo = $1 WHERE tg_id = $2",
+        promo_id, tg_id,
+    )
+
+
+async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int, bool]:
+    """
+    Вызывается когда заказ покупателя выполнен модератором.
+    Если покупатель был приглашён — засчитывает реферал пригласившему.
+    Возвращает: (referrer_id | None, level_up: bool, new_level: int, is_first_purchase: bool)
+    is_first_purchase: True если первая покупка приглашённого (нужно выдать ему промокоды)
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            buyer = await conn.fetchrow(
+                "SELECT referred_by FROM users WHERE tg_id = $1", buyer_id
+            )
+            if not buyer or not buyer["referred_by"]:
+                return None, False, 0, False
+
+            referrer_id = buyer["referred_by"]
+
+            exists = await conn.fetchval(
+                "SELECT 1 FROM referral_purchases WHERE buyer_id = $1", buyer_id
+            )
+            if exists:
+                return None, False, 0, False
+
+            await conn.execute(
+                "INSERT INTO referral_purchases (buyer_id, referrer_id, created_at) "
+                "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                buyer_id, referrer_id,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+
+            new_row = await conn.fetchrow(
+                "UPDATE users SET referral_count = referral_count + 1 "
+                "WHERE tg_id = $1 RETURNING referral_level, referral_count",
+                referrer_id,
+            )
+            if not new_row:
+                return referrer_id, False, 0, True
+
+            new_count = new_row["referral_count"]
+            old_level = new_row["referral_level"]
+            new_level = min(5, new_count // REFERRAL_REFS_PER_LEVEL)
+
+            level_up = new_level > old_level
+            if level_up:
+                await conn.execute(
+                    "UPDATE users SET referral_level = $1 WHERE tg_id = $2",
+                    new_level, referrer_id,
+                )
+
+            return referrer_id, level_up, new_level, True
+
+
+async def db_admin_set_ref_level(tg_id: int, new_level: int) -> int:
+    """Принудительно устанавливает реферальный уровень пользователю.
+    Возвращает старый уровень."""
+    pool = await get_pool()
+    old = await pool.fetchval(
+        "SELECT referral_level FROM users WHERE tg_id = $1", tg_id
+    )
+    await pool.execute(
+        "UPDATE users SET referral_level = $1 WHERE tg_id = $2",
+        new_level, tg_id,
+    )
+    return int(old) if old is not None else 0
+
+
+async def db_admin_get_user_ref_promos(tg_id: int) -> list[dict]:
+    """Возвращает все реферальные промокоды пользователя (выданные и использованные)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT up.id AS up_id, up.promo_id, up.used_at,
+               pc.code, pc.discount_pct, pc.is_active
+        FROM user_promos up
+        JOIN promo_codes pc ON pc.id = up.promo_id
+        WHERE up.tg_id = $1 AND pc.game = 'ref_discount'
+        ORDER BY up.id DESC
+        """,
+        tg_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_admin_remove_user_promo(tg_id: int, promo_id: int) -> bool:
+    """Удаляет реферальный промокод из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos WHERE tg_id = $1 AND promo_id = $2",
+        tg_id, promo_id,
+    )
+    deleted = int(result.split()[-1])
+    return deleted > 0
+
+
+async def db_delete_all_user_ref_promos(tg_id: int) -> int:
+    """Удаляет все НЕИСПОЛЬЗОВАННЫЕ реферальные промокоды из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos "
+        "WHERE tg_id = $1 AND used_at IS NULL AND promo_id IN "
+        "(SELECT id FROM promo_codes WHERE game = 'ref_discount')",
+        tg_id,
+    )
+    return int(result.split()[-1])
+
+
+async def db_delete_all_user_regular_promos(tg_id: int) -> int:
+    """Удаляет все обычные (не реферальные) промокоды из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos "
+        "WHERE tg_id = $1 AND promo_id IN "
+        "(SELECT id FROM promo_codes WHERE game != 'ref_discount')",
+        tg_id,
+    )
+    return int(result.split()[-1])
+
+
+async def db_delete_all_used_user_promos(tg_id: int) -> int:
+    """Удаляет только ИСПОЛЬЗОВАННЫЕ обычные промокоды из инвентаря пользователя."""
+    pool = await get_pool()
+    result = await pool.execute(
+        "DELETE FROM user_promos "
+        "WHERE tg_id = $1 AND used_at IS NOT NULL AND promo_id IN "
+        "(SELECT id FROM promo_codes WHERE game != 'ref_discount')",
+        tg_id,
+    )
+    return int(result.split()[-1])
+
+
+async def db_list_regular_promos() -> list[dict]:
+    """Возвращает только обычные промокоды (без реферальных ref_discount)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM promo_codes WHERE game NOT IN ('ref_discount') ORDER BY id DESC"
+    )
+    return [dict(r) for r in rows]
+
+
+async def db_delete_all_regular_promos() -> int:
+    """Удаляет все обычные промокоды (не реферальные) вместе с записями использования."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            ids = await conn.fetch(
+                "SELECT id FROM promo_codes WHERE game NOT IN ('ref_discount')"
+            )
+            if not ids:
+                return 0
+            id_list = [r["id"] for r in ids]
+            await conn.execute(
+                "DELETE FROM user_promos WHERE promo_id = ANY($1::int[])", id_list
+            )
+            result = await conn.execute(
+                "DELETE FROM promo_codes WHERE game NOT IN ('ref_discount')"
+            )
+            return int(result.split()[-1])
+
+
+async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
+    """Создаёт 3 промокода на скидку при повышении уровня."""
+    discount = level * REFERRAL_DISCOUNT_PER_LEVEL
+    pool = await get_pool()
+    codes = []
+    now = datetime.now(timezone.utc).isoformat()
+    for _ in range(REFERRAL_PROMOS_PER_LEVELUP):
+        code = "REF-" + secrets.token_urlsafe(6).upper()[:8]
+        try:
+            promo_id = await pool.fetchval(
+                "INSERT INTO promo_codes (code, game, product_title, promo_price, "
+                "discount_pct, is_active, created_at) "
+                "VALUES ($1, $2, $3, 0, $4, TRUE, $5) RETURNING id",
+                code,
+                "ref_discount",
+                f"Скидка {discount}% на любой товар (не Telegram Stars)",
+                discount,
+                now,
+            )
+            await pool.execute(
+                "INSERT INTO user_promos (tg_id, promo_id, claimed_at) "
+                "VALUES ($1, $2, $3)",
+                referrer_id, promo_id, now,
+            )
+            codes.append(code)
+        except Exception as e:
+            logging.warning(f"Ошибка создания реферального промокода: {e}")
+    return codes
+
+
+async def db_create_invite_promo_codes(buyer_id: int, count: int = 3) -> list[str]:
+    """Создаёт count промокодов на 5% скидку (по умолчанию 3 — для приглашённого пользователя)."""
+    INVITE_DISCOUNT = 5
+    pool = await get_pool()
+    codes: list[str] = []
+    now = datetime.now(timezone.utc).isoformat()
+    for _ in range(count):
+        code = "INV-" + secrets.token_urlsafe(6).upper()[:8]
+        try:
+            promo_id = await pool.fetchval(
+                "INSERT INTO promo_codes (code, game, product_title, promo_price, "
+                "discount_pct, is_active, created_at) "
+                "VALUES ($1, $2, $3, 0, $4, TRUE, $5) RETURNING id",
+                code,
+                "ref_discount",
+                "Скидка 5% на любой товар (не Telegram Stars)",
+                INVITE_DISCOUNT,
+                now,
+            )
+            await pool.execute(
+                "INSERT INTO user_promos (tg_id, promo_id, claimed_at) VALUES ($1, $2, $3)",
+                buyer_id, promo_id, now,
+            )
+            codes.append(code)
+        except Exception as e:
+            logging.warning(f"Ошибка создания инвайт промокода: {e}")
+    return codes
+
+
+# =====================================================================
+# Состояния FSM (для ввода чисел и почты)
+# =====================================================================
+
+
+class ShopStates(StatesGroup):
+    waiting_topup_amount = State()
+    waiting_topup_confirm = State()
+    waiting_robux_amount = State()
+    waiting_stars_amount = State()
+    waiting_login_data = State()
+    waiting_login_code = State()
+    waiting_promo_input = State()
+    waiting_review_photo = State()
+    waiting_review_text = State()
+    waiting_reject_screenshot = State()
+    waiting_email_code = State()
+    waiting_pre_purchase_login = State()  # ввод данных для входа ДО оплаты
+    waiting_buyer_msg = State()           # покупатель пишет администратору
+    waiting_ticket_desc = State()         # покупатель описывает проблему в тикете
+    waiting_ticket_chat = State()         # покупатель в активном чате тикета
+
+
+class AdminStates(StatesGroup):
+    waiting_user_id = State()
+    waiting_credit_amount = State()
+    waiting_credit_reason = State()
+    waiting_reset_reason = State()
+    waiting_block_reason = State()
+    waiting_unblock_reason = State()
+    waiting_gp_price = State()
+    waiting_mod_reply = State()        # ответ покупателю из чата модератора
+    waiting_ord_buyer_reply = State() # ответ покупателю из управления заказом
+    waiting_refund_reason = State()    # причина возврата (модератор вводит текст)
+    waiting_broadcast = State()        # рассылка всем пользователям
+    waiting_edit_product_price = State()   # изменение цены товара
+    waiting_edit_setting_value = State()   # изменение настройки (курс/лимит)
+    waiting_new_product_key = State()      # ключ нового товара
+    waiting_new_product_name = State()     # название нового товара
+    waiting_new_product_price = State()    # цена нового товара
+    waiting_new_product_delivery = State() # способ выдачи нового товара
+    # Управление категориями
+    waiting_new_cat_key = State()          # ключ новой категории
+    waiting_new_cat_name = State()         # название новой категории
+    waiting_new_cat_emoji = State()        # эмодзи новой категории
+    waiting_cat_disabled_reason = State()  # причина отключения категории
+    waiting_cat_login_hint = State()       # текст после оплаты для категории
+    waiting_rename_product = State()       # новое название товара
+    waiting_rename_cat_name = State()      # новое название категории
+    waiting_rename_cat_emoji = State()     # новый эмодзи категории
+    waiting_cat_delete_confirm = State()   # подтверждение удаления категории (текст)
+    waiting_image_photo = State()          # ожидание фото для картинки категории/товара
+    waiting_staff_add_id = State()         # добавление сотрудника — ввод TG ID
+    waiting_staff_fire_confirm = State()   # увольнение — подтверждение
+    waiting_ticket_reply = State()         # сотрудник отвечает на тикет
+    waiting_maintenance_reason = State()   # Founder вводит причину тех. работ
+    waiting_maintenance_confirm = State()  # подтверждение включения тех. работ
+
+
+class PromoStates(StatesGroup):
+    waiting_code_input = State()
+    waiting_discount_type = State()
+    waiting_product = State()
+    waiting_price = State()
+    waiting_discount_pct = State()
+    waiting_dates = State()
+    waiting_max_uses = State()
+
+
+# =====================================================================
+# Клавиатуры
+# =====================================================================
+
+
+def kb_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Купить донат", callback_data="shop")],
+            [
+                InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+                InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders"),
+            ],
+            [
+                InlineKeyboardButton(text="🛡️ Гарантия", callback_data="guarantee"),
+                InlineKeyboardButton(text="📖 О магазине", callback_data="info"),
+            ],
+            [
+                InlineKeyboardButton(text="⭐ Отзывы", url=REVIEWS_URL),
+                InlineKeyboardButton(text="🆘 Поддержка", callback_data="support"),
+            ],
+        ]
+    )
+
+
+async def kb_shop_dynamic() -> InlineKeyboardMarkup:
+    """Динамическая клавиатура магазина из таблицы categories + хардкод-категории."""
+    cats = await db_all_categories()
+    rows: list[list[InlineKeyboardButton]] = []
+    for cat in cats:
+        icon = "⚠️ " if cat["disabled"] else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{icon}{cat['emoji']} {cat['name']}",
+            callback_data=f"cat:{cat['key']}",
+        )])
+    rows.append([InlineKeyboardButton(text="📱 Другие приложения", callback_data="cat:other")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_back_main(back_cb: str = "shop") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb),
+                InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+            ],
+        ]
+    )
+
+
+def kb_product_list(
+    items: list[tuple], prefix: str, back_cb: str = "shop"
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{name} — {price}₽",
+                callback_data=f"{prefix}:{key}",
+            )
+        ]
+        for key, name, price, _ in items
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_product_card(buy_cb: str, back_cb: str, needs_login: bool = False) -> InlineKeyboardMarkup:
+    buy_label = "✏️ Ввести данные и оплатить" if needs_login else "✅ Оплатить с баланса"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=buy_label, callback_data=buy_cb)],
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb),
+                InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+            ],
+        ]
+    )
+
+
+def kb_after_purchase(
+    order_id: int,
+    needs_login: bool = False,
+    needs_code: bool = False,
+    login_label: str = "🔐 Отправить данные для входа",
+) -> InlineKeyboardMarkup:
+    rows = []
+    if needs_login:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=login_label,
+                    callback_data=f"send_login:{order_id}:{1 if needs_code else 0}",
+                )
+            ]
+        )
+    if needs_code:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="📨 Отправить код для входа",
+                    callback_data=f"send_code:{order_id}",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="✍️ Написать администратору",
+                    callback_data=f"buyer_write_admin:{order_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🆘 Поддержка",
+                    callback_data="support",
+                )
+            ],
+            [InlineKeyboardButton(text="📦 Мои заказы", callback_data="orders")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_guarantee() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Посмотреть отзывы", url=REVIEWS_URL)],
+            [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+
+
+def kb_username_link(username: str, back_cb: str = "shop") -> InlineKeyboardMarkup:
+    handle = username.lstrip("@")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="↗️ Перейти по юзернейму",
+                    url=f"https://t.me/{handle}",
+                )
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb),
+                InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+            ],
+        ]
+    )
+
+
+def kb_support() -> InlineKeyboardMarkup:
+    handle = SUPPORT_USERNAME.lstrip("@")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Перейти в поддержку",
+                    url=f"https://t.me/{handle}",
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+
+
+def kb_info() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Поддержка", callback_data="support")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+
+
+def kb_profile() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="📦 История заказов", callback_data="orders")],
+            [
+                InlineKeyboardButton(
+                    text="📜 История транзакций", callback_data="transactions"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎟️ Мои промокоды", callback_data="my_promos"
+                ),
+                InlineKeyboardButton(
+                    text="✏️ Ввести промокод", callback_data="enter_promo"
+                ),
+            ],
+            [InlineKeyboardButton(text="👥 Реферальная программа", callback_data="referral_info")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+
+
+def kb_topup_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data="topup_go")],
+            [InlineKeyboardButton(text="✏️ Изменить сумму", callback_data="topup")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ]
+    )
+
+
+def kb_topup_pay(amount: int, code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{amount}:{code}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ]
+    )
+
+
+def kb_calc_actions(buy_cb: str, change_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Оплатить с баланса", callback_data=buy_cb)],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить количество", callback_data=change_cb
+                )
+            ],
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="shop"),
+                InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+            ],
+        ]
+    )
+
+
+async def kb_order_actions(order: dict) -> InlineKeyboardMarkup:
+    order_id = int(order["id"])
+    category = order.get("category")
+    rows = []
+
+    needs_login = await order_needs_login(category)
+    needs_code  = await order_needs_code(category)
+
+    if needs_login:
+        login_label = (
+            "🔗 Отправить ссылку на геймпасс"
+            if category == "roblox_gamepass"
+            else "✏️ Изменить данные для входа"
+        )
+        rows.append([InlineKeyboardButton(
+            text=login_label,
+            callback_data=f"send_login:{order_id}:{1 if needs_code else 0}",
+        )])
+
+    if needs_code:
+        rows.append([InlineKeyboardButton(
+            text="📨 Отправить код для входа",
+            callback_data=f"send_code:{order_id}",
+        )])
+
+    rows.extend([
+        [InlineKeyboardButton(
+            text="💬 Связаться с модератором через бота",
+            callback_data=f"contact_mod:{order_id}",
+        )],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="orders"),
+            InlineKeyboardButton(text="🏠 В меню", callback_data="main"),
+        ],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# =====================================================================
+# Утилиты
+# =====================================================================
+
+
+async def order_needs_login(category: str | None) -> bool:
+    """Нужно ли запрашивать данные для входа (общая проверка)."""
+    if not category:
+        return False
+    if category in LOGIN_HINTS:
+        return True
+    cat = await db_get_category(category)
+    return bool(cat and cat.get("login_hint"))
+
+
+async def _needs_pre_purchase_login(category: str | None) -> bool:
+    """Нужно ли запрашивать данные для входа ДО оплаты.
+
+    Для Roblox-геймпаса данные нужны до оплаты, потому что ссылка
+    на созданный геймпасс будет отправлена после создания.
+    """
+    if not category:
+        return False
+    if category == "roblox_gamepass":
+        return True
+    return await order_needs_login(category)
+
+
 async def order_needs_code(category: str | None) -> bool:
     """Нужно ли показывать кнопку «Отправить код для входа»."""
     if not category:
