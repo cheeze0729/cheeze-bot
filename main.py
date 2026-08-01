@@ -74,7 +74,7 @@ PRICE_CHECK_ENABLED = True
 PRICE_CHECK_SCHEDULE_HOUR = 10
 PRICE_CHECK_SCHEDULE_MINUTE = 0
 PRICE_CHECK_TIMEZONE = "Europe/Moscow"
-PRICE_CHECK_MARKUP_PCT = 7.0
+PRICE_CHECK_MARKUP_PCT = 12.0
 PRICE_CHECK_URL = "https://starvell.com/roblox/packages"
 PRICE_CHECK_OFFER_URL = "https://starvell.com/offers/ffb5571f-4031-4df8-8a0c-c52da41c0c19"
 PRICE_CHECK_PRODUCTS = {
@@ -1170,11 +1170,25 @@ async def db_remove_staff(tg_id: int) -> bool:
 
 
 async def db_get_order_staff_recipients() -> list[dict]:
+    """Получатели уведомлений о новых заказах: только Founder + Administrator."""
     pool = await get_pool()
     rows = await pool.fetch(
         "SELECT tg_id, role, username, first_name FROM staff_members "
-        "WHERE role IN ($1, $2) ORDER BY CASE role WHEN $1 THEN 1 ELSE 2 END, tg_id",
+        "WHERE role IN ($1, $2) ORDER BY CASE role "
+        "WHEN $1 THEN 1 ELSE 2 END, tg_id",
         ROLE_FOUNDER, ROLE_ADMINISTRATOR,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_get_support_staff_recipients() -> list[dict]:
+    """Получатели тикетов поддержки: Founder + Administrator + Moderator + Helper."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT tg_id, role, username, first_name FROM staff_members "
+        "WHERE role IN ($1, $2, $3, $4) ORDER BY CASE role "
+        "WHEN $1 THEN 1 WHEN $2 THEN 2 WHEN $3 THEN 3 ELSE 4 END, tg_id",
+        ROLE_FOUNDER, ROLE_ADMINISTRATOR, ROLE_MODERATOR, ROLE_HELPER,
     )
     return [dict(row) for row in rows]
 
@@ -2774,7 +2788,7 @@ async def notify_moderator_order(
 
 @dp.callback_query(F.data.startswith("ordclaim:"))
 async def cb_order_claim(call: CallbackQuery) -> None:
-    if not _senior_staff(call.from_user.id):
+    if not _is_moderator(call.from_user.id):
         await call.answer("Заказы доступны только Founder и Administrator.", show_alert=True)
         return
     try:
@@ -3085,7 +3099,7 @@ async def msg_ticket_desc(message: Message, state: FSMContext) -> None:
     claim_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🎫 Взять тикет", callback_data=f"tkt:claim:{tid}")
     ]])
-    recipients = await db_get_can_moderate_recipients()
+    recipients = await db_get_support_staff_recipients()
     for staff in recipients:
         sid = int(staff["tg_id"])
         try:
@@ -8415,16 +8429,17 @@ async def msg_promo_dates(message: Message, state: FSMContext) -> None:
     await state.update_data(promo_starts_at=starts_at, promo_expires_at=expires_at)
     await state.set_state(PromoStates.waiting_max_uses)
     code = data.get("promo_code", "?")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
+    ])
     await _state_edit(
-        message, state,
+        message,
+        state,
         f"Код: <code>{escape(code)}</code>  |  Срок установлен.\n\n"
         "🔢 Введите <b>лимит активаций</b> (сколько раз можно использовать этот промокод).\n\n"
         "Или нажмите кнопку, если промокод без ограничений:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="♾️ Без ограничений", callback_data="adm:promo_maxuses:unlimited")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")],
-        ]),
+        kb,
     )
 
 
