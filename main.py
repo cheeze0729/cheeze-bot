@@ -118,9 +118,9 @@ STAFF_ROLE_LABELS = {
 _STAFF_ROLES: dict[int, str] = {}
 
 # Юзернеймы (везде, где упоминается @username)
-SUPPORT_USERNAME = "@cheeze0729"  # Поддержка
-OTHER_APPS_USERNAME = "@cheeze0729"  # Донат в других приложениях
-BRAWL_PROMO_USERNAME = "@cheeze0729"  # Акции по Brawl Stars
+SUPPORT_USERNAME = "@cheezestoremanager"  # Поддержка
+OTHER_APPS_USERNAME = "@cheezestoremanager"  # Донат в других приложениях
+BRAWL_PROMO_USERNAME = "@cheezestoremanager"  # Акции по Brawl Stars
 
 # Стартовое изображение (URL или file_id Telegram).
 # Можно заменить на свою картинку.
