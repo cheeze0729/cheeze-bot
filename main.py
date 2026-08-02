@@ -7420,7 +7420,7 @@ async def msg_adm_edit_setting(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("adm:users:"))
 async def cb_adm_users(call: CallbackQuery, state: FSMContext) -> None:
-    if not _is_moderator(call.from_user.id):
+    if not _can_moderate(call.from_user.id):
         await call.answer()
         return
     await state.clear()
@@ -7453,7 +7453,7 @@ async def cb_adm_users(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("adm:user:"))
 async def cb_adm_user_open(call: CallbackQuery, state: FSMContext) -> None:
-    if not _is_moderator(call.from_user.id):
+    if not _can_moderate(call.from_user.id):
         await call.answer()
         return
     try:
@@ -7471,7 +7471,7 @@ async def cb_adm_user_open(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "adm:find")
 async def cb_adm_find(call: CallbackQuery, state: FSMContext) -> None:
-    if not _is_moderator(call.from_user.id):
+    if not _can_moderate(call.from_user.id):
         await call.answer()
         return
     await state.clear()
