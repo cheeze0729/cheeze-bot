@@ -706,6 +706,13 @@ async def db_init() -> None:
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS needs_code BOOLEAN NOT NULL DEFAULT FALSE",
         ]:
             await conn.execute(col_sql)
+        # Миграция: добавляем недостающие колонки в products для старых баз
+        for col_sql in [
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS delivery TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
+        ]:
+            await conn.execute(col_sql)
         # Заполняем каталог начальными товарами (не перезаписываем существующие)
         await conn.execute("""
             INSERT INTO products (category, key, name, price, delivery, sort_order) VALUES
@@ -6354,7 +6361,7 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "adm:close")
 async def cb_adm_close(call: CallbackQuery, state: FSMContext) -> None:
-    if not _is_moderator(call.from_user.id):
+    if not _is_staff(call.from_user.id):
         await call.answer()
         return
     await state.clear()
