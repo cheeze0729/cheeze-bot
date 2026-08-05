@@ -118,9 +118,9 @@ STAFF_ROLE_LABELS = {
 _STAFF_ROLES: dict[int, str] = {}
 
 # Юзернеймы (везде, где упоминается @username)
-SUPPORT_USERNAME = "@cheeze0729"  # Поддержка
-OTHER_APPS_USERNAME = "@cheeze0729"  # Донат в других приложениях
-BRAWL_PROMO_USERNAME = "@cheeze0729"  # Акции по Brawl Stars
+SUPPORT_USERNAME = "@cheezestoremanager"  # Поддержка
+OTHER_APPS_USERNAME = "@cheezestoremanager"  # Донат в других приложениях
+BRAWL_PROMO_USERNAME = "@cheezestoremanager"  # Акции по Brawl Stars
 
 # Стартовое изображение (URL или file_id Telegram).
 # Можно заменить на свою картинку.
@@ -555,6 +555,19 @@ async def db_init() -> None:
                 photo_file_id TEXT,
                 comment       TEXT,
                 created_at    TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            ALTER TABLE reviews ADD COLUMN IF NOT EXISTS published_at TEXT
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_staff_messages (
+                id             SERIAL PRIMARY KEY,
+                order_id       INTEGER NOT NULL,
+                staff_id       BIGINT NOT NULL,
+                chat_id        BIGINT NOT NULL,
+                control_msg_id INTEGER NOT NULL,
+                UNIQUE(order_id, staff_id)
             )
         """)
         await conn.execute("""
@@ -1546,6 +1559,47 @@ async def db_has_review(order_id: int) -> bool:
         "SELECT 1 FROM reviews WHERE order_id = $1", order_id
     )
     return val is not None
+
+
+async def db_is_review_published(order_id: int) -> bool:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT published_at FROM reviews WHERE order_id = $1", order_id
+    )
+    return val is not None
+
+
+async def db_mark_review_published(order_id: int) -> bool:
+    """Помечает отзыв как опубликованный. Возвращает True если был первым."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE reviews SET published_at = $1 "
+            "WHERE order_id = $2 AND published_at IS NULL RETURNING id",
+            datetime.utcnow().isoformat(timespec="seconds"), order_id,
+        )
+    return row is not None
+
+
+async def db_store_review_staff_message(
+    order_id: int, staff_id: int, chat_id: int, control_msg_id: int
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "INSERT INTO review_staff_messages (order_id, staff_id, chat_id, control_msg_id) "
+        "VALUES ($1, $2, $3, $4) ON CONFLICT (order_id, staff_id) DO UPDATE "
+        "SET control_msg_id = EXCLUDED.control_msg_id",
+        order_id, staff_id, chat_id, control_msg_id,
+    )
+
+
+async def db_get_review_staff_messages(order_id: int) -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT staff_id, chat_id, control_msg_id FROM review_staff_messages WHERE order_id = $1",
+        order_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def db_add_transaction(
@@ -5076,16 +5130,22 @@ async def cb_paid(call: CallbackQuery) -> None:
             ],
         ]
     )
-    await notify_moderator(
-        f"💰 <b>Новая заявка на пополнение</b>\n\n"
-        f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
-        f"Telegram ID: <code>{user.id}</code>\n"
-        f"Сумма: <b>{amount}₽</b>\n"
-        + (f"Код в комментарии: <code>{code}</code>\n\n" if code else "\n")
-        + "Проверьте поступление средств (сумма + код в комментарии) "
-        "и нажмите соответствующую кнопку.",
-        reply_markup=admin_kb,
-    )
+    # Уведомление о пополнении — только фаундеру
+    try:
+        await bot.send_message(
+            MODERATOR_CHAT_ID,
+            f"💰 <b>Новая заявка на пополнение</b>\n\n"
+            f"Покупатель: {escape(user.first_name or '')} ({escape(username)})\n"
+            f"Telegram ID: <code>{user.id}</code>\n"
+            f"Сумма: <b>{amount}₽</b>\n"
+            + (f"Код в комментарии: <code>{code}</code>\n\n" if code else "\n")
+            + "Проверьте поступление средств (сумма + код в комментарии) "
+            "и нажмите соответствующую кнопку.",
+            parse_mode="HTML",
+            reply_markup=admin_kb,
+        )
+    except Exception as exc:
+        logging.warning(f"Не удалось уведомить фаундера о пополнении: {exc}")
 
 
 @dp.callback_query(F.data.startswith("tpconf:"))
@@ -5188,15 +5248,21 @@ async def _auto_confirm_receipt(
 
     await db_set_confirm_pending(order_id, False)
 
-    # Уведомляем модератора
+    # Уведомляем только того, кто взял заказ
+    auto_order = await db_get_order(order_id)
+    auto_recipient = MODERATOR_CHAT_ID
+    if auto_order and auto_order.get("assigned_to"):
+        auto_recipient = int(auto_order["assigned_to"])
     try:
-        await notify_moderator(
+        await bot.send_message(
+            auto_recipient,
             f"⏱ <b>Заказ #{order_id} подтверждён автоматически</b>\n\n"
             f"Покупатель (ID <code>{tg_id}</code>) не ответил в течение 30 минут — "
-            "заказ засчитан выполненным."
+            "заказ засчитан выполненным.",
+            parse_mode="HTML",
         )
     except Exception as e:
-        logging.warning(f"Не удалось уведомить модератора об авто-подтверждении: {e}")
+        logging.warning(f"Не удалось уведомить сотрудника об авто-подтверждении: {e}")
 
     # Редактируем исходное сообщение с кнопками — убираем кнопки, ставим статус авто-подтверждения
     has_review = await db_has_review(order_id)
@@ -5440,16 +5506,21 @@ async def cb_confirm_receipt(call: CallbackQuery) -> None:
 
     user = call.from_user
     username = f"@{user.username}" if user.username else "—"
-    # Уведомляем модератора
+    # Уведомляем только того, кто взял заказ
+    confirm_recipient = MODERATOR_CHAT_ID
+    if order and order.get("assigned_to"):
+        confirm_recipient = int(order["assigned_to"])
     try:
-        await notify_moderator(
+        await bot.send_message(
+            confirm_recipient,
             f"✅ <b>Покупатель подтвердил получение заказа #{order_id}</b>\n\n"
             f"Имя: {escape(user.first_name or '—')}\n"
             f"Username: {escape(username)}\n"
-            f"Telegram ID: <code>{user.id}</code>"
+            f"Telegram ID: <code>{user.id}</code>",
+            parse_mode="HTML",
         )
     except Exception as e:
-        logging.warning(f"Не удалось уведомить модератора о подтверждении: {e}")
+        logging.warning(f"Не удалось уведомить сотрудника о подтверждении: {e}")
 
     has_review = await db_has_review(order_id)
     review_btn = [] if has_review else [
@@ -5776,7 +5847,8 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
     buyer_id = message.from_user.id
     header = (
         f"⭐ <b>Новый отзыв</b>\n"
-        f"🎁 Товар: <b>{escape(str(title))}</b>"
+        f"🎁 Товар: <b>{escape(str(title))}</b>\n\n"
+        f"💬 {escape(comment)}"
     )
     orig_chat = message.chat.id
     orig_msg_id = message.message_id
@@ -5803,7 +5875,7 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
                         pass
                     await _try_delete(message)
                     deleted_orig = True
-                await bot.send_message(
+                ctrl_msg = await bot.send_message(
                     rid, "⬆️ Управление отзывом:",
                     reply_markup=kb_review_mod(
                         order_id, buyer_id,
@@ -5818,13 +5890,15 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
                 if not deleted_orig:
                     await _try_delete(message)
                     deleted_orig = True
-                await bot.send_message(
+                ctrl_msg = await bot.send_message(
                     rid, "⬆️ Управление отзывом:",
                     reply_markup=kb_review_mod(
                         order_id, buyer_id,
                         hdr_msg.message_id, tfwd.message_id,
                     ),
                 )
+            # Сохраняем ID управляющего сообщения для синхронизации кнопки публикации
+            await db_store_review_staff_message(order_id, rid, rid, ctrl_msg.message_id)
         except Exception as e:
             logging.warning(f"Не удалось переслать отзыв сотруднику {rid}: {e}")
 
@@ -5851,8 +5925,14 @@ async def cb_publish_review(call: CallbackQuery) -> None:
         return
     # callback_data: pub_review:{order_id}:{msg_id1}[:{msg_id2}]
     parts = call.data.split(":")
-    # parts[0]="pub_review", parts[1]=order_id, parts[2+]=msg_ids
+    order_id = int(parts[1]) if len(parts) > 1 else 0
     mod_msg_ids = [int(p) for p in parts[2:] if p]
+
+    # Проверяем, не был ли отзыв уже опубликован
+    if await db_is_review_published(order_id):
+        await call.answer("Этот отзыв уже был опубликован в канале.", show_alert=True)
+        return
+
     try:
         for mid in mod_msg_ids:
             await bot.forward_message(
@@ -5860,16 +5940,40 @@ async def cb_publish_review(call: CallbackQuery) -> None:
                 from_chat_id=call.message.chat.id,
                 message_id=mid,
             )
-        published_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="✅ Опубликовано в канале",
-                    url=REVIEWS_URL,
-                )]
-            ]
+
+        # Атомарно помечаем как опубликованный
+        was_first = await db_mark_review_published(order_id)
+        if not was_first:
+            # Параллельная гонка — кто-то успел быстрее
+            await call.answer("Этот отзыв уже был опубликован другим сотрудником.", show_alert=True)
+            return
+
+        already_kb = InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Уже опубликован", url=REVIEWS_URL)
+            ]]
         )
-        await call.message.edit_reply_markup(reply_markup=published_kb)
+
+        # Обновляем текущее сообщение
+        await call.message.edit_reply_markup(reply_markup=already_kb)
         await call.answer("✅ Отзыв опубликован в канале!", show_alert=True)
+
+        # Обновляем кнопки у всех остальных сотрудников
+        staff_msgs = await db_get_review_staff_messages(order_id)
+        for row in staff_msgs:
+            if (int(row["chat_id"]) == call.message.chat.id
+                    and int(row["control_msg_id"]) == call.message.message_id):
+                continue  # уже обновили выше
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=row["chat_id"],
+                    message_id=row["control_msg_id"],
+                    reply_markup=already_kb,
+                )
+            except Exception as exc:
+                logging.warning(
+                    f"Не удалось обновить кнопку отзыва у сотрудника {row['staff_id']}: {exc}"
+                )
     except Exception as e:
         logging.warning(f"Ошибка публикации отзыва: {e}")
         await call.answer(f"Ошибка: {e}", show_alert=True)
@@ -9168,10 +9272,21 @@ async def msg_email_code(message: Message, state: FSMContext) -> None:
     order_id = data.get("email_code_order_id", "?")
     await state.clear()
 
-    await notify_moderator(
-        f"📧 <b>Код из почты по заказу #{order_id}</b>\n\n"
-        f"<code>{escape(message.text or '(нет текста)')}</code>"
-    )
+    # Отправляем код только тому, кто взял заказ
+    recipient = MODERATOR_CHAT_ID
+    if isinstance(order_id, int):
+        order_row = await db_get_order(order_id)
+        if order_row and order_row.get("assigned_to"):
+            recipient = int(order_row["assigned_to"])
+    try:
+        await bot.send_message(
+            recipient,
+            f"📧 <b>Код из почты по заказу #{order_id}</b>\n\n"
+            f"<code>{escape(message.text or '(нет текста)')}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logging.warning(f"Не удалось отправить код из почты сотруднику {recipient}: {exc}")
     await message.answer(
         "✅ Код отправлен модератору. Ожидайте выполнения заказа.",
     )
