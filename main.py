@@ -455,6 +455,8 @@ class MaintenanceMiddleware(BaseMiddleware):
             from aiogram.types import CallbackQuery as _CQ, Message as _MSG
             if isinstance(event, _CQ):
                 await event.answer("🔧 Тех. работы. Попробуйте позже.", show_alert=True)
+                if event.message:
+                    await event.message.answer(text, parse_mode="HTML")
             elif isinstance(event, _MSG):
                 await event.answer(text, parse_mode="HTML")
         except Exception as exc:
@@ -976,6 +978,16 @@ async def db_get_product_by_key(key: str) -> tuple | None:
         "SELECT key, name, price, delivery FROM products WHERE key = $1", key
     )
     return (row["key"], row["name"], float(row["price"]), row["delivery"]) if row else None
+
+
+async def db_is_product_active(key: str) -> bool:
+    """Проверяет актуальную доступность товара перед показом и оплатой."""
+    pool = await get_pool()
+    active = await pool.fetchval(
+        "SELECT active FROM products WHERE key = $1",
+        key,
+    )
+    return bool(active) if active is not None else False
 
 
 async def db_all_products() -> list[dict]:
@@ -3806,6 +3818,9 @@ async def cb_roblox_instant_card(call: CallbackQuery) -> None:
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
+    if not await db_is_product_active(key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
+        return
     _, name, price, delivery = product
     text = (
         f"<b>{escape(name)}</b>\n\n"
@@ -3944,6 +3959,9 @@ async def cb_brawl_card(call: CallbackQuery) -> None:
     product = await db_get_product_by_key(key)
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
+        return
+    if not await db_is_product_active(key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
         return
     _, name, price, delivery = product
     text = (
@@ -4086,6 +4104,9 @@ async def cb_cat_prod_card(call: CallbackQuery) -> None:
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
+    if not await db_is_product_active(prod_key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
+        return
     _, name, price, delivery = product
     cat = await db_get_category(cat_key)
     cat_name = f"{cat['emoji']} {cat['name']}" if cat else cat_key
@@ -4116,11 +4137,17 @@ async def cb_buy_cat_prod(call: CallbackQuery, state: FSMContext) -> None:
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
+    if not await db_is_product_active(prod_key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
+        return
     cat = await db_get_category(cat_key)
     _, name, price, _ = product
     cat_name = cat["name"] if cat else cat_key
     title = f"{cat_name} — {name}"
-    await perform_purchase(call, title, float(price), category=cat_key, state=state)
+    await perform_purchase(
+        call, title, float(price), category=cat_key,
+        product_key=prod_key, state=state,
+    )
 
 
 # =====================================================================
@@ -4205,13 +4232,17 @@ async def perform_purchase(
     price: float,
     category: str | None = None,
     extra: dict | None = None,
+    product_key: str | None = None,
     state: FSMContext | None = None,
 ) -> None:
     """Показывает экран подтверждения с итоговой ценой (с учётом реф. скидки).
     Если категория требует данные для входа — сначала запрашивает их.
     Фактическое списание происходит в confirm_purchase."""
-    await call.answer()
     user = call.from_user
+    if product_key and not await db_is_product_active(product_key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
+        return
+    await call.answer()
 
     # Если нужны данные для входа — запрашиваем ДО оплаты
     if state is not None and await _needs_pre_purchase_login(category):
@@ -4224,6 +4255,7 @@ async def perform_purchase(
                 _pre_price=price,
                 _pre_cat=category,
                 _pre_extra=extra,
+                _pre_product_key=product_key,
             )
             await state.set_state(ShopStates.waiting_pre_purchase_login)
             # Определяем подсказку для пользователя (редактируется в админ-панели)
@@ -4299,6 +4331,7 @@ async def perform_purchase(
             _pnd_orig=original_price,
             _pnd_cat=category,
             _pnd_extra=extra,
+            _pnd_product_key=product_key,
             _pnd_ldsc=level_disc,
             _pnd_pdsc=promo_disc,
             _pnd_pid=applied_ref_promo_id,
@@ -4394,12 +4427,24 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     original_price: float = data.get("_pnd_orig") or 0.0
     category: str | None = data.get("_pnd_cat")
     extra: dict | None = data.get("_pnd_extra")
+    product_key: str | None = data.get("_pnd_product_key")
     level_disc: int = data.get("_pnd_ldsc") or 0
     promo_disc: int = data.get("_pnd_pdsc") or 0
     applied_ref_promo_id = data.get("_pnd_pid")
 
     if not title or final_price is None:
         await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+
+    if product_key and not await db_is_product_active(product_key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
+        await state.clear()
+        await send_or_edit(
+            call,
+            "⚠️ <b>Товар больше недоступен.</b>\n\n"
+            "Он был скрыт администратором до завершения оплаты.",
+            kb_back_main("shop"),
+        )
         return
 
     user = call.from_user
@@ -4456,6 +4501,7 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
             _pnd_title=None, _pnd_final=None, _pnd_orig=None,
             _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
             _pnd_pdsc=None, _pnd_pid=None, _pnd_pre_login=None,
+            _pnd_product_key=None, _pre_product_key=None,
             _pre_title=None, _pre_price=None, _pre_cat=None, _pre_extra=None,
         )
     finally:
@@ -4687,6 +4733,17 @@ async def msg_pre_purchase_login(message: Message, state: FSMContext) -> None:
     price = float(data.get("_pre_price") or 0)
     category = data.get("_pre_cat")
     extra = data.get("_pre_extra")
+    product_key = data.get("_pre_product_key")
+
+    if product_key and not await db_is_product_active(product_key):
+        await _state_edit(
+            message, state,
+            "⚠️ <b>Этот товар сейчас недоступен.</b>\n\n"
+            "Он был скрыт администратором. Выберите другой товар.",
+            kb_back_main("shop"),
+        )
+        await state.clear()
+        return
 
     # Сохраняем данные в FSM — perform_purchase подхватит их
     await state.update_data(_pnd_pre_login=payload)
@@ -4728,6 +4785,7 @@ async def msg_pre_purchase_login(message: Message, state: FSMContext) -> None:
         _pnd_orig=original_price,
         _pnd_cat=category,
         _pnd_extra=extra,
+        _pnd_product_key=product_key,
         _pnd_ldsc=level_disc,
         _pnd_pdsc=promo_disc,
         _pnd_pid=applied_ref_promo_id,
@@ -4909,10 +4967,13 @@ async def cb_buy_rbi(call: CallbackQuery, state: FSMContext) -> None:
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
+    if not await db_is_product_active(key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
+        return
     _, name, price, _ = product
     await perform_purchase(
         call, f"Roblox — {name} (моментально)", price,
-        category="roblox_instant", state=state,
+        category="roblox_instant", product_key=key, state=state,
     )
 
 
@@ -4923,9 +4984,13 @@ async def cb_buy_bs(call: CallbackQuery, state: FSMContext) -> None:
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
         return
+    if not await db_is_product_active(key):
+        await call.answer("⚠️ Этот товар сейчас недоступен.", show_alert=True)
+        return
     _, name, price, _ = product
     await perform_purchase(
-        call, f"Brawl Stars — {name}", price, category="brawl", state=state,
+        call, f"Brawl Stars — {name}", price, category="brawl",
+        product_key=key, state=state,
     )
 
 
