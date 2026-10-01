@@ -1,13 +1,13 @@
 """
 Telegram-бот для онлайн-магазина цифровых товаров и доната
 ----------------------------------------------------------
-Стек: Python 3.11+, aiogram 3, aiosqlite (SQLite-хранилище)
+Стек: Python 3.11+, aiogram 3, asyncpg (PostgreSQL), openpyxl (Excel-отчёты)
 
 УСТАНОВКА:
-    pip install aiogram==3.13.1 aiosqlite
+    pip install -r requirements.txt
 
 ЗАПУСК:
-    python bot.py
+    python telegram_shop_bot/bot.py
 
 Все настройки и тексты находятся в блоке CONFIG ниже —
 смело редактируйте их под себя.
@@ -20,6 +20,7 @@ import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
@@ -1567,16 +1568,13 @@ async def db_set_order_login_code(order_id: int, code: str) -> None:
 
 async def db_add_review(
     order_id: int, tg_id: int, photo_file_id: str | None, comment: str
-) -> int:
+) -> int | None:
     pool = await get_pool()
     review_id = await pool.fetchval(
         """
         INSERT INTO reviews (order_id, tg_id, photo_file_id, comment, created_at)
         VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (order_id) DO UPDATE
-            SET photo_file_id = EXCLUDED.photo_file_id,
-                comment       = EXCLUDED.comment,
-                created_at    = EXCLUDED.created_at
+        ON CONFLICT (order_id) DO NOTHING
         RETURNING id
         """,
         order_id,
@@ -1585,7 +1583,7 @@ async def db_add_review(
         comment,
         datetime.utcnow().isoformat(timespec="seconds"),
     )
-    return review_id
+    return int(review_id) if review_id is not None else None
 
 
 async def db_has_review(order_id: int) -> bool:
@@ -1594,26 +1592,6 @@ async def db_has_review(order_id: int) -> bool:
         "SELECT 1 FROM reviews WHERE order_id = $1", order_id
     )
     return val is not None
-
-
-async def db_is_review_published(order_id: int) -> bool:
-    pool = await get_pool()
-    val = await pool.fetchval(
-        "SELECT published_at FROM reviews WHERE order_id = $1", order_id
-    )
-    return val is not None
-
-
-async def db_mark_review_published(order_id: int) -> bool:
-    """Помечает отзыв как опубликованный. Возвращает True если был первым."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "UPDATE reviews SET published_at = $1 "
-            "WHERE order_id = $2 AND published_at IS NULL RETURNING id",
-            datetime.utcnow().isoformat(timespec="seconds"), order_id,
-        )
-    return row is not None
 
 
 async def db_store_review_staff_message(
@@ -1635,6 +1613,36 @@ async def db_get_review_staff_messages(order_id: int) -> list[dict]:
         order_id,
     )
     return [dict(r) for r in rows]
+
+
+async def _sync_review_published_buttons(
+    order_id: int, current_message: Message | None = None
+) -> None:
+    published_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Уже опубликован", url=REVIEWS_URL)
+    ]])
+    if current_message is not None:
+        try:
+            await current_message.edit_reply_markup(reply_markup=published_kb)
+        except Exception as exc:
+            logging.warning(f"Не удалось обновить кнопку отзыва: {exc}")
+
+    for row in await db_get_review_staff_messages(order_id):
+        if current_message is not None and (
+            int(row["chat_id"]) == current_message.chat.id
+            and int(row["control_msg_id"]) == current_message.message_id
+        ):
+            continue
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=row["chat_id"],
+                message_id=row["control_msg_id"],
+                reply_markup=published_kb,
+            )
+        except Exception as exc:
+            logging.warning(
+                f"Не удалось обновить кнопку отзыва у сотрудника {row['staff_id']}: {exc}"
+            )
 
 
 async def db_add_transaction(
@@ -3123,6 +3131,37 @@ def parse_positive_int(text: str) -> int | None:
     return value
 
 
+def calculate_roblox_gamepass_amounts(
+    robux_quantity: int, ruble_rate: str, payout_rate: str
+) -> tuple[int, int]:
+    """Return whole-ruble charge and pass price required to net requested Robux."""
+    try:
+        ruble_rate_value = Decimal(ruble_rate)
+        payout_rate_value = Decimal(payout_rate)
+        if (
+            robux_quantity <= 0
+            or not ruble_rate_value.is_finite()
+            or not payout_rate_value.is_finite()
+            or ruble_rate_value <= 0
+            or payout_rate_value <= 0
+            or payout_rate_value > 1
+        ):
+            raise ValueError("Некорректные настройки курса геймпасса.")
+        ruble_price = int(
+            (Decimal(robux_quantity) * ruble_rate_value).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        pass_price = int(
+            (Decimal(robux_quantity) / payout_rate_value).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+    except InvalidOperation as exc:
+        raise ValueError("Некорректные настройки курса геймпасса.") from exc
+    return max(1, ruble_price), max(1, pass_price)
+
+
 
 # =====================================================================
 # /start и главное меню
@@ -3399,6 +3438,9 @@ async def cb_tkt_claim(call: CallbackQuery, state: FSMContext) -> None:
             await call.answer("Тикет не найден.", show_alert=True)
         return
     ticket = await db_get_ticket(tid)
+    if not ticket:
+        await call.answer("Тикет больше не найден.", show_alert=True)
+        return
     buyer_id = int(ticket["user_tg_id"])
     staff = call.from_user
     staff_name = staff.first_name or str(staff.id)
@@ -3881,10 +3923,20 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
         )
         return
 
-    gp_rate = float(await db_get_setting("robux_gamepass_rate", "0.65"))
-    gp_pass_rate = float(await db_get_setting("robux_gamepass_pass_price_rate", "0.7"))
-    price = max(1, round(qty * gp_rate))
-    gamepass_price = max(1, round(qty / gp_pass_rate))
+    gp_rate = await db_get_setting("robux_gamepass_rate", "0.65")
+    gp_pass_rate = await db_get_setting("robux_gamepass_pass_price_rate", "0.7")
+    try:
+        price, gamepass_price = calculate_roblox_gamepass_amounts(
+            qty, gp_rate, gp_pass_rate
+        )
+    except ValueError:
+        logging.error("Некорректно настроен курс Roblox геймпасса.")
+        await _edit_prompt(
+            state,
+            "⚠️ Сейчас невозможно рассчитать заказ. Попробуйте позже или обратитесь в поддержку.",
+            kb_back_main("shop"),
+        )
+        return
 
     await state.update_data(
         robux_qty=qty,
@@ -3897,7 +3949,6 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
         f"Количество: <b>{qty}</b> робуксов\n"
         f"Курс оплаты: 1 робукс = {gp_rate}₽\n"
         f"Итого к оплате: <b>{price}₽</b>\n"
-        f"Цена для создания геймпасса: <b>{gamepass_price} R$</b>\n"
         "Срок: до 5 дней\n"
         "Способ оплаты: Оплата с внутреннего баланса бота"
     )
@@ -4545,28 +4596,12 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     )
 
     if category == "roblox_gamepass":
-        if extra:
-            gp_price = extra.get("gamepass_price")
-            if gp_price:
-                text += f"🎮 <b>Цена для создания геймпасса:</b> <b>{gp_price} R$</b>\n\n"
-                text += (
-                    f"🔗 Создайте геймпасс в Roblox на сумму <b>{gp_price} R$</b> "
-                    "и нажмите «Отправить ссылку на геймпасс». "
-                    "Пришлите ссылку одним сообщением. "
-                    "Никакие данные от аккаунта и коды отправлять не нужно."
-                )
-            else:
-                text += (
-                    "🔗 Создайте геймпасс в Roblox на нужную сумму и нажмите "
-                    "«Отправить ссылку на геймпасс». Пришлите ссылку одним "
-                    "сообщением. Никакие данные от аккаунта и коды отправлять не нужно."
-                )
-        else:
-            text += (
-                "🔗 Создайте геймпасс в Roblox на нужную сумму и нажмите "
-                "«Отправить ссылку на геймпасс». Пришлите ссылку одним "
-                "сообщением. Никакие данные от аккаунта и коды отправлять не нужно."
-            )
+        text += (
+            "🔗 Создайте геймпасс в Roblox и нажмите "
+            "«Отправить ссылку на геймпасс». Сумму для геймпасса сообщит "
+            "сотрудник, который обрабатывает заказ. Пришлите ссылку одним "
+            "сообщением. Никакие данные от аккаунта и коды отправлять не нужно."
+        )
     elif pre_login and login_hint:
         # Данные уже получены до оплаты
         text += (
@@ -4645,9 +4680,11 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
         f"Статус: {ORDER_STATUS_CREATED}"
     )
     if category == "roblox_gamepass" and extra:
-        gp_price = extra.get("gamepass_price")
-        if gp_price:
-            admin_text += f"\nЦена геймпасса: <b>{gp_price} R$</b> (допуск ±5 R$)"
+        requested_robux = int(extra.get("qty", 0))
+        if requested_robux > 0:
+            admin_text += (
+                f"\nКоличество к получению: <b>{requested_robux} Robux</b>"
+            )
     # Данные для входа, введённые ДО оплаты — включаем прямо в уведомление о заказе
     if pre_login:
         admin_text += f"\n\n🔐 <b>Данные для входа:</b>\n<pre>{escape(pre_login)}</pre>"
@@ -5479,19 +5516,20 @@ async def _auto_confirm_receipt(
 
     # Уведомляем только того, кто взял заказ
     auto_order = await db_get_order(order_id)
-    auto_recipient = MODERATOR_CHAT_ID
-    if auto_order and auto_order.get("assigned_to"):
-        auto_recipient = int(auto_order["assigned_to"])
-    try:
-        await bot.send_message(
-            auto_recipient,
-            f"⏱ <b>Заказ #{order_id} подтверждён автоматически</b>\n\n"
-            f"Покупатель (ID <code>{tg_id}</code>) не ответил в течение 30 минут — "
-            "заказ засчитан выполненным.",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logging.warning(f"Не удалось уведомить сотрудника об авто-подтверждении: {e}")
+    auto_recipient = int(auto_order["assigned_to"]) if (
+        auto_order and auto_order.get("assigned_to")
+    ) else None
+    if auto_recipient is not None:
+        try:
+            await bot.send_message(
+                auto_recipient,
+                f"⏱ <b>Заказ #{order_id} подтверждён автоматически</b>\n\n"
+                f"Покупатель (ID <code>{tg_id}</code>) не ответил в течение 30 минут — "
+                "заказ засчитан выполненным.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить сотрудника об авто-подтверждении: {e}")
 
     # Редактируем исходное сообщение с кнопками — убираем кнопки, ставим статус авто-подтверждения
     has_review = await db_has_review(order_id)
@@ -5738,20 +5776,19 @@ async def cb_confirm_receipt(call: CallbackQuery) -> None:
     user = call.from_user
     username = f"@{user.username}" if user.username else "—"
     # Уведомляем только того, кто взял заказ
-    confirm_recipient = MODERATOR_CHAT_ID
-    if order and order.get("assigned_to"):
-        confirm_recipient = int(order["assigned_to"])
-    try:
-        await bot.send_message(
-            confirm_recipient,
-            f"✅ <b>Покупатель подтвердил получение заказа #{order_id}</b>\n\n"
-            f"Имя: {escape(user.first_name or '—')}\n"
-            f"Username: {escape(username)}\n"
-            f"Telegram ID: <code>{user.id}</code>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logging.warning(f"Не удалось уведомить сотрудника о подтверждении: {e}")
+    confirm_recipient = int(order["assigned_to"]) if order.get("assigned_to") else None
+    if confirm_recipient is not None:
+        try:
+            await bot.send_message(
+                confirm_recipient,
+                f"✅ <b>Покупатель подтвердил получение заказа #{order_id}</b>\n\n"
+                f"Имя: {escape(user.first_name or '—')}\n"
+                f"Username: {escape(username)}\n"
+                f"Telegram ID: <code>{user.id}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось уведомить сотрудника о подтверждении: {e}")
 
     has_review = await db_has_review(order_id)
     review_btn = [] if has_review else [
@@ -6053,8 +6090,7 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     order_id = int(data.get("review_order_id", 0))
     photo_id = data.get("review_photo_id")
-    photo_msg_id = data.get("review_photo_msg_id")
-    photo_chat_id = data.get("review_photo_chat_id")
+    photo_is_document = bool(data.get("review_photo_is_document"))
     if not order_id:
         await _state_edit(
             message, state,
@@ -6064,18 +6100,21 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    await db_add_review(order_id, message.from_user.id, photo_id, comment)
+    review_id = await db_add_review(order_id, message.from_user.id, photo_id, comment)
+    if review_id is None:
+        await _state_edit(
+            message, state,
+            "Отзыв по этому заказу уже отправлен. Повторно отправить его нельзя.",
+            kb_back_main("orders"),
+        )
+        await state.clear()
+        return
 
     order = await db_get_order(order_id)
     title = order["title"] if order else "—"
 
-    # ----------------------------------------------------------------
-    # Пересылаем отзыв модератору через forward_message ("Forwarded from").
-    # forward_message не поддерживает reply_markup, поэтому кнопки
-    # публикации отправляем отдельным управляющим сообщением после форварда.
-    # ID пересланных сообщений сохраняем в callback_data для последующего
-    # форварда в канал при нажатии «Опубликовать».
-    # ----------------------------------------------------------------
+    # Текст показываем в заголовке, фото отдельно. Так комментарий виден
+    # каждому сотруднику, а при публикации не дублируется вторым сообщением.
     # Рассылаем отзыв всем Founder + Administrator + Moderator
     review_recipients = await db_get_can_moderate_recipients()
     buyer_id = message.from_user.id
@@ -6084,57 +6123,48 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
         f"🎁 Товар: <b>{escape(str(title))}</b>\n\n"
         f"💬 {escape(comment)}"
     )
-    orig_chat = message.chat.id
-    orig_msg_id = message.message_id
-    orig_photo_chat = photo_chat_id
-    orig_photo_msg = photo_msg_id
-    deleted_orig = False
+    delivered_any = False
     for staff in review_recipients:
         rid = int(staff["tg_id"])
         try:
             hdr_msg = await bot.send_message(rid, header, parse_mode="HTML")
-            if photo_id and orig_photo_chat and orig_photo_msg:
-                pfwd = await bot.forward_message(
-                    chat_id=rid, from_chat_id=orig_photo_chat,
-                    message_id=orig_photo_msg,
-                )
-                tfwd = await bot.forward_message(
-                    chat_id=rid, from_chat_id=orig_chat,
-                    message_id=orig_msg_id,
-                )
-                if not deleted_orig:
-                    try:
-                        await bot.delete_message(orig_photo_chat, orig_photo_msg)
-                    except Exception:
-                        pass
-                    await _try_delete(message)
-                    deleted_orig = True
+            if photo_id:
+                if photo_is_document:
+                    review_image = await bot.send_document(
+                        rid, photo_id, caption="Фото к отзыву"
+                    )
+                else:
+                    review_image = await bot.send_photo(
+                        rid, photo_id, caption="Фото к отзыву"
+                    )
                 ctrl_msg = await bot.send_message(
                     rid, "⬆️ Управление отзывом:",
                     reply_markup=kb_review_mod(
-                        order_id, buyer_id,
-                        hdr_msg.message_id, pfwd.message_id, tfwd.message_id,
+                        order_id, buyer_id, hdr_msg.message_id, review_image.message_id,
                     ),
                 )
             else:
-                tfwd = await bot.forward_message(
-                    chat_id=rid, from_chat_id=orig_chat,
-                    message_id=orig_msg_id,
-                )
-                if not deleted_orig:
-                    await _try_delete(message)
-                    deleted_orig = True
                 ctrl_msg = await bot.send_message(
                     rid, "⬆️ Управление отзывом:",
                     reply_markup=kb_review_mod(
-                        order_id, buyer_id,
-                        hdr_msg.message_id, tfwd.message_id,
+                        order_id, buyer_id, hdr_msg.message_id,
                     ),
                 )
             # Сохраняем ID управляющего сообщения для синхронизации кнопки публикации
             await db_store_review_staff_message(order_id, rid, rid, ctrl_msg.message_id)
+            delivered_any = True
         except Exception as e:
             logging.warning(f"Не удалось переслать отзыв сотруднику {rid}: {e}")
+
+    if delivered_any:
+        if data.get("review_photo_chat_id") and data.get("review_photo_msg_id"):
+            try:
+                await bot.delete_message(
+                    data["review_photo_chat_id"], data["review_photo_msg_id"]
+                )
+            except Exception:
+                pass
+        await _try_delete(message)
 
     thanks_kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -6160,55 +6190,52 @@ async def cb_publish_review(call: CallbackQuery) -> None:
         return
     # callback_data: pub_review:{order_id}:{msg_id1}[:{msg_id2}]
     parts = call.data.split(":")
-    order_id = int(parts[1]) if len(parts) > 1 else 0
-    mod_msg_ids = [int(p) for p in parts[2:] if p]
-
-    # Проверяем, не был ли отзыв уже опубликован
-    if await db_is_review_published(order_id):
-        await call.answer("Этот отзыв уже был опубликован в канале.", show_alert=True)
+    try:
+        order_id = int(parts[1])
+        mod_msg_ids = [int(p) for p in parts[2:] if p]
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+    if not mod_msg_ids:
+        await call.answer("Не удалось найти сообщения с отзывом.", show_alert=True)
         return
 
     try:
-        for mid in mod_msg_ids:
-            await bot.forward_message(
-                chat_id=REVIEWS_CHANNEL,
-                from_chat_id=call.message.chat.id,
-                message_id=mid,
-            )
+        # Блокировка строки не даёт двум сотрудникам одновременно опубликовать
+        # один отзыв. published_at записывается только после успешной пересылки.
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                review_row = await conn.fetchrow(
+                    "SELECT published_at FROM reviews WHERE order_id = $1 FOR UPDATE",
+                    order_id,
+                )
+                if not review_row:
+                    await call.answer("Отзыв не найден.", show_alert=True)
+                    return
+                if review_row["published_at"] is not None:
+                    already_published = True
+                else:
+                    already_published = False
+                    for mid in mod_msg_ids:
+                        await bot.forward_message(
+                            chat_id=REVIEWS_CHANNEL,
+                            from_chat_id=call.message.chat.id,
+                            message_id=mid,
+                        )
+                    await conn.execute(
+                        "UPDATE reviews SET published_at = $1 WHERE order_id = $2",
+                        datetime.utcnow().isoformat(timespec="seconds"),
+                        order_id,
+                    )
 
-        # Атомарно помечаем как опубликованный
-        was_first = await db_mark_review_published(order_id)
-        if not was_first:
-            # Параллельная гонка — кто-то успел быстрее
-            await call.answer("Этот отзыв уже был опубликован другим сотрудником.", show_alert=True)
+        if already_published:
+            await _sync_review_published_buttons(order_id, call.message)
+            await call.answer("Этот отзыв уже был опубликован.", show_alert=True)
             return
 
-        already_kb = InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Уже опубликован", url=REVIEWS_URL)
-            ]]
-        )
-
-        # Обновляем текущее сообщение
-        await call.message.edit_reply_markup(reply_markup=already_kb)
+        await _sync_review_published_buttons(order_id, call.message)
         await call.answer("✅ Отзыв опубликован в канале!", show_alert=True)
-
-        # Обновляем кнопки у всех остальных сотрудников
-        staff_msgs = await db_get_review_staff_messages(order_id)
-        for row in staff_msgs:
-            if (int(row["chat_id"]) == call.message.chat.id
-                    and int(row["control_msg_id"]) == call.message.message_id):
-                continue  # уже обновили выше
-            try:
-                await bot.edit_message_reply_markup(
-                    chat_id=row["chat_id"],
-                    message_id=row["control_msg_id"],
-                    reply_markup=already_kb,
-                )
-            except Exception as exc:
-                logging.warning(
-                    f"Не удалось обновить кнопку отзыва у сотрудника {row['staff_id']}: {exc}"
-                )
     except Exception as e:
         logging.warning(f"Ошибка публикации отзыва: {e}")
         await call.answer(f"Ошибка: {e}", show_alert=True)
@@ -6308,8 +6335,8 @@ async def msg_gp_price_input(message: Message, state: FSMContext) -> None:
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⚙️ Действия по заказу",
-                        callback_data=f"order_actions:{order_id}",
+                        text="✏️ Я изменил",
+                        callback_data=f"gp_price_changed:{order_id}",
                     )
                 ],
                 [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
@@ -6319,8 +6346,8 @@ async def msg_gp_price_input(message: Message, state: FSMContext) -> None:
             target_id,
             f"⚠️ <b>Просьба по заказу #{order_id}</b>\n\n"
             f"Пожалуйста, измените цену вашего геймпасса в Roblox на "
-            f"<b>{gp_price} R$</b> и пришлите обновлённую ссылку через кнопку "
-            "«🔗 Отправить ссылку на геймпасс».",
+            f"<b>{gp_price} R$</b>. Когда закончите, нажмите "
+            "«✏️ Я изменил».",
             parse_mode="HTML",
             reply_markup=user_kb,
         )
@@ -6334,24 +6361,18 @@ async def msg_gp_price_input(message: Message, state: FSMContext) -> None:
         return
 
     if admin_chat_id and admin_msg_id:
-        keep_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="✅ Завершить заказ",
-                        callback_data=f"ordone:{order_id}:{target_id}",
-                    )
-                ]
-            ]
-        )
-        try:
-            await bot.edit_message_reply_markup(
-                chat_id=admin_chat_id,
-                message_id=admin_msg_id,
-                reply_markup=keep_kb,
-            )
-        except Exception:
-            pass
+        order = await db_get_order(order_id)
+        if order:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=admin_chat_id,
+                    message_id=admin_msg_id,
+                    reply_markup=_staff_order_keyboard(order),
+                )
+            except Exception as exc:
+                logging.warning(
+                    f"Не удалось восстановить кнопки заказа #{order_id}: {exc}"
+                )
 
     if prompt_msg_id:
         try:
@@ -6369,6 +6390,74 @@ async def msg_gp_price_input(message: Message, state: FSMContext) -> None:
         f"отправлен покупателю: <b>{gp_price} R$</b>.",
         parse_mode="HTML",
     )
+
+
+@dp.callback_query(F.data.startswith("gp_price_changed:"))
+async def cb_gp_price_changed(call: CallbackQuery) -> None:
+    """Notifies the assigned staff member when the buyer confirms the price change."""
+    try:
+        order_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректный заказ.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if (
+        not order
+        or int(order.get("tg_id", 0)) != call.from_user.id
+        or order.get("category") != "roblox_gamepass"
+    ):
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if _is_order_completed(order.get("status")) or order.get("status") == ORDER_STATUS_REFUNDED:
+        await call.answer("Этот заказ уже закрыт.", show_alert=True)
+        return
+
+    username = f"@{call.from_user.username}" if call.from_user.username else "—"
+    notified = await notify_assigned_staff(
+        order_id,
+        f"✅ Покупатель сообщил, что изменил цену геймпасса "
+        f"по заказу <b>#{order_id}</b>.\n"
+        f"Покупатель: {escape(call.from_user.first_name or '')} "
+        f"({escape(username)}).\n"
+        "Можно продолжать обработку заказа.",
+        include_markup=True,
+    )
+    if not notified:
+        await call.answer(
+            "Не удалось уведомить сотрудника. Попробуйте ещё раз или напишите в поддержку.",
+            show_alert=True,
+        )
+        return
+
+    acknowledged_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Сотруднику сообщено",
+                    callback_data="gp_price_changed_done",
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ]
+    )
+    try:
+        await call.message.edit_text(
+            f"✅ <b>Вы изменили цену геймпасса по заказу #{order_id}.</b>\n\n"
+            "Сотрудник уведомлён и продолжит обработку заказа.",
+            parse_mode="HTML",
+            reply_markup=acknowledged_kb,
+        )
+    except Exception as exc:
+        logging.warning(
+            f"Не удалось обновить сообщение подтверждения по заказу #{order_id}: {exc}"
+        )
+    await call.answer("Сотрудник уведомлён.")
+
+
+@dp.callback_query(F.data == "gp_price_changed_done")
+async def cb_gp_price_changed_done(call: CallbackQuery) -> None:
+    await call.answer("Сотрудник уже уведомлён.")
 
 
 # =====================================================================
@@ -6407,7 +6496,7 @@ def kb_admin_main(user_id: int = 0) -> InlineKeyboardMarkup:
 
 _SETTING_LABELS: dict[str, str] = {
     "robux_gamepass_rate":            "💎 Курс геймпасс (₽/робукс)",
-    "robux_gamepass_pass_price_rate": "🎮 Делитель цены геймпасса",
+    "robux_gamepass_pass_price_rate": "🎮 Доля выплаты с геймпасса (0–1)",
     "tg_stars_rate":                  "⭐ Курс Telegram Stars (₽/звезда)",
     "min_topup":                      "💳 Минимум пополнения (₽)",
     "min_tg_stars":                   "⭐ Минимум Telegram Stars",
@@ -7782,6 +7871,14 @@ async def msg_adm_edit_setting(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     key = data.get("edit_setting_key", "")
     label = data.get("edit_setting_label", key)
+    if key == "robux_gamepass_pass_price_rate" and val > 1:
+        await _state_edit(
+            message, state,
+            "⚠️ Коэффициент выплаты должен быть больше 0 и не больше 1 "
+            "(например, 0.7). Попробуйте ещё раз:",
+            InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+        return
     await state.clear()
     # Для целочисленных настроек сохраняем без дробной части
     save_val = str(int(val)) if val == int(val) else str(val)
@@ -8821,6 +8918,46 @@ async def msg_promo_dates(message: Message, state: FSMContext) -> None:
     )
 
 
+def _normalize_promo_payload(data: dict) -> tuple[str, str, str, int, int] | None:
+    """Return validated promo fields or None when saved FSM data is incomplete."""
+    code = data.get("promo_code")
+    game = data.get("promo_game")
+    product = data.get("promo_product")
+    if not isinstance(code, str) or not code.strip():
+        return None
+    if not isinstance(game, str) or not game.strip():
+        return None
+    if not isinstance(product, str) or not product.strip():
+        return None
+
+    code = code.strip()
+    game = game.strip()
+    product = product.strip()
+    if game == "pct_discount":
+        raw_discount = data.get("promo_discount_pct", 0)
+        if isinstance(raw_discount, bool) or not isinstance(raw_discount, (str, int)):
+            return None
+        try:
+            discount_pct = int(raw_discount)
+        except ValueError:
+            return None
+        if not 1 <= discount_pct <= 99:
+            return None
+        price = 0
+    else:
+        raw_price = data.get("promo_price")
+        if isinstance(raw_price, bool) or not isinstance(raw_price, (str, int)):
+            return None
+        try:
+            price = int(raw_price)
+        except ValueError:
+            return None
+        if price <= 0:
+            return None
+        discount_pct = 0
+    return code, game, product, price, discount_pct
+
+
 async def _save_promo_and_confirm(
     call: CallbackQuery,
     data: dict,
@@ -8828,20 +8965,17 @@ async def _save_promo_and_confirm(
     expires_at: str | None,
     max_uses: int | None = None,
 ) -> None:
-    code = data.get("promo_code")
-    game = data.get("promo_game")
-    product = data.get("promo_product")
-    price = data.get("promo_price")
-    discount_pct = data.get("promo_discount_pct", 0)
-    is_pct = game == "pct_discount"
-    if not all([code, game, product]) or (not is_pct and not price):
-        await send_or_edit(call, "❌ Ошибка: данные утеряны. Начните заново.", kb_admin_promos([]))
+    promo = _normalize_promo_payload(data)
+    if promo is None:
+        await send_or_edit(call, "❌ Ошибка: данные утеряны или некорректны. Начните заново.", kb_admin_promos([]))
         return
+    code, game, product, price, discount_pct = promo
+    is_pct = game == "pct_discount"
     promo_id = await db_create_promo(
         code, game, product,
-        0 if is_pct else int(price),
+        price,
         starts_at, expires_at,
-        discount_pct=int(discount_pct) if is_pct else 0,
+        discount_pct=discount_pct,
         max_uses=max_uses,
     )
     dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
@@ -8875,26 +9009,24 @@ async def _save_promo_and_confirm_msg(
     max_uses: int | None = None,
     state: FSMContext | None = None,
 ) -> None:
-    code = data.get("promo_code")
-    game = data.get("promo_game")
-    product = data.get("promo_product")
-    price = data.get("promo_price")
-    discount_pct = data.get("promo_discount_pct", 0)
-    is_pct = game == "pct_discount"
+    promo = _normalize_promo_payload(data)
     _kb_err = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Начать заново", callback_data="adm:promo_create")]
     ])
-    if not all([code, game, product]) or (not is_pct and not price):
+    if promo is None:
+        error_text = "❌ Ошибка: данные утеряны или некорректны. Начните заново."
         if state:
-            await _state_edit(message, state, "❌ Ошибка: данные утеряны. Начните заново.", _kb_err)
+            await _state_edit(message, state, error_text, _kb_err)
         else:
-            await message.answer("❌ Ошибка: данные утеряны. Начните заново.", reply_markup=_kb_err)
+            await message.answer(error_text, reply_markup=_kb_err)
         return
+    code, game, product, price, discount_pct = promo
+    is_pct = game == "pct_discount"
     promo_id = await db_create_promo(
         code, game, product,
-        0 if is_pct else int(price),
+        price,
         starts_at, expires_at,
-        discount_pct=int(discount_pct) if is_pct else 0,
+        discount_pct=discount_pct,
         max_uses=max_uses,
     )
     dates_str = _fmt_promo_dates({"starts_at": starts_at, "expires_at": expires_at})
@@ -9508,14 +9640,26 @@ async def cb_mod_done(call: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("mod:req_email:"))
 async def cb_mod_req_email_code(call: CallbackQuery) -> None:
     """Модератор запрашивает у покупателя код из письма на почте."""
-    await call.answer()
     if not _is_moderator(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
         return
     try:
         parts = call.data.split(":")
         order_id = int(parts[2])
         tg_id = int(parts[3])
     except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    order = await db_get_order(order_id)
+    if not order or int(order["tg_id"]) != tg_id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if not order.get("assigned_to") or int(order["assigned_to"]) != call.from_user.id:
+        await call.answer(
+            "Код может запросить только сотрудник, который взял заказ.",
+            show_alert=True,
+        )
         return
 
     try:
@@ -9533,23 +9677,36 @@ async def cb_mod_req_email_code(call: CallbackQuery) -> None:
         await buyer_fsm.set_state(ShopStates.waiting_email_code)
         await buyer_fsm.update_data(email_code_order_id=order_id)
         await call.answer("Запрос отправлен покупателю.", show_alert=True)
-    except Exception:
+    except Exception as exc:
+        logging.warning(f"Не удалось запросить email-код по заказу #{order_id}: {exc}")
         await call.answer("Не удалось отправить уведомление покупателю.", show_alert=True)
 
 
 @dp.message(ShopStates.waiting_email_code)
 async def msg_email_code(message: Message, state: FSMContext) -> None:
     """Покупатель прислал код из почты — пересылаем модератору."""
-    await _try_delete(message)
     data = await state.get_data()
     order_id = data.get("email_code_order_id", "?")
 
     # Отправляем код только тому, кто взял заказ
-    recipient = MODERATOR_CHAT_ID
-    if isinstance(order_id, int):
-        order_row = await db_get_order(order_id)
-        if order_row and order_row.get("assigned_to"):
-            recipient = int(order_row["assigned_to"])
+    order_row = await db_get_order(order_id) if isinstance(order_id, int) else None
+    recipient = (
+        int(order_row["assigned_to"])
+        if order_row and order_row.get("assigned_to")
+        and int(order_row["tg_id"]) == message.from_user.id
+        else None
+    )
+    if recipient is None:
+        await _try_delete(message)
+        await _state_edit(
+            message, state,
+            "Не удалось определить сотрудника, который ведёт заказ. "
+            "Пожалуйста, запросите код ещё раз через бота.",
+            kb_back_main("orders"),
+        )
+        await state.clear()
+        return
+
     try:
         await bot.send_message(
             recipient,
@@ -9559,9 +9716,17 @@ async def msg_email_code(message: Message, state: FSMContext) -> None:
         )
     except Exception as exc:
         logging.warning(f"Не удалось отправить код из почты сотруднику {recipient}: {exc}")
+        await _state_edit(
+            message, state,
+            "Не удалось передать код исполнителю. Пожалуйста, отправьте код ещё раз.",
+            kb_back_main(f"order_actions:{order_id}"),
+        )
+        return
+    await _try_delete(message)
     await _state_edit(
         message, state,
         "✅ Код отправлен модератору. Ожидайте выполнения заказа.",
+        kb_back_main(f"order_actions:{order_id}"),
     )
     await state.clear()
 
@@ -10633,7 +10798,7 @@ async def _health_server() -> None:
         server.server_close()
 
 
-async def _fetch_url_text(url: str) -> str:
+def _fetch_url_text(url: str) -> str:
     """Получает HTML страницы через стандартную библиотеку."""
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
