@@ -721,7 +721,11 @@ async def db_init() -> None:
                 disabled        BOOLEAN NOT NULL DEFAULT FALSE,
                 disabled_reason TEXT DEFAULT NULL,
                 login_hint      TEXT DEFAULT NULL,
-                needs_code      BOOLEAN NOT NULL DEFAULT FALSE
+                needs_code      BOOLEAN NOT NULL DEFAULT FALSE,
+                amount_based    BOOLEAN NOT NULL DEFAULT FALSE,
+                amount_unit     TEXT NOT NULL DEFAULT '',
+                amount_rate     NUMERIC(12,4) NOT NULL DEFAULT 1,
+                amount_minimum  INTEGER NOT NULL DEFAULT 1
             )
         """)
         await conn.execute("""
@@ -753,6 +757,10 @@ async def db_init() -> None:
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS disabled_reason TEXT DEFAULT NULL",
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS login_hint TEXT DEFAULT NULL",
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS needs_code BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS amount_based BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS amount_unit TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS amount_rate NUMERIC(12,4) NOT NULL DEFAULT 1",
+            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS amount_minimum INTEGER NOT NULL DEFAULT 1",
         ]:
             await conn.execute(col_sql)
         # Миграция: добавляем недостающие колонки в products для старых баз
@@ -1172,7 +1180,8 @@ async def db_delete_image(key: str) -> None:
 async def db_all_categories() -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch(
-        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code "
+        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code, "
+        "amount_based, amount_unit, amount_rate, amount_minimum "
         "FROM categories ORDER BY sort_order, key"
     )
     return [dict(r) for r in rows]
@@ -1181,19 +1190,49 @@ async def db_all_categories() -> list[dict]:
 async def db_get_category(key: str) -> dict | None:
     pool = await get_pool()
     row = await pool.fetchrow(
-        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code "
+        "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code, "
+        "amount_based, amount_unit, amount_rate, amount_minimum "
         "FROM categories WHERE key = $1", key
     )
     return dict(row) if row else None
 
 
-async def db_create_category(key: str, name: str, emoji: str) -> None:
+async def db_create_category(
+    key: str,
+    name: str,
+    emoji: str,
+    amount_based: bool = False,
+    amount_unit: str = "",
+    amount_rate: float = 1,
+    amount_minimum: int = 1,
+) -> None:
     pool = await get_pool()
     sort_max = await pool.fetchval("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM categories")
     await pool.execute(
-        "INSERT INTO categories (key, name, emoji, sort_order) VALUES ($1, $2, $3, $4) "
+        "INSERT INTO categories "
+        "(key, name, emoji, sort_order, amount_based, amount_unit, amount_rate, amount_minimum) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
         "ON CONFLICT (key) DO NOTHING",
         key, name, emoji, int(sort_max or 0),
+        amount_based, amount_unit, amount_rate, amount_minimum,
+    )
+
+
+async def db_update_category_amount_config(
+    key: str,
+    *,
+    amount_unit: str | None = None,
+    amount_rate: float | None = None,
+    amount_minimum: int | None = None,
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        "UPDATE categories SET "
+        "amount_unit = COALESCE($1, amount_unit), "
+        "amount_rate = COALESCE($2, amount_rate), "
+        "amount_minimum = COALESCE($3, amount_minimum) "
+        "WHERE key = $4",
+        amount_unit, amount_rate, amount_minimum, key,
     )
 
 
@@ -1982,6 +2021,18 @@ def _ref_discount_pct(level: int) -> int:
     return level * REFERRAL_DISCOUNT_PER_LEVEL
 
 
+def _promo_product_label(promo: dict, detailed: bool = True) -> str:
+    """Возвращает область применения процентного промокода с исключениями."""
+    if promo.get("game") in ("ref_discount", "pct_discount"):
+        if detailed:
+            return (
+                "Подходящие покупки (кроме Telegram Stars, Roblox-геймпасса "
+                "и категорий с вводом количества)"
+            )
+        return "подходящие покупки"
+    return str(promo.get("product_title") or "—")
+
+
 def _fmt_price(p: float | int) -> str:
     """Форматирует цену: без копеек если целое, с копейками если дробное."""
     v = float(p)
@@ -2189,7 +2240,7 @@ async def db_create_ref_promo_codes(referrer_id: int, level: int) -> list[str]:
                 "VALUES ($1, $2, $3, 0, $4, TRUE, $5) RETURNING id",
                 code,
                 "ref_discount",
-                f"Скидка {discount}% на любой товар (не Telegram Stars)",
+                f"Скидка {discount}% на подходящие покупки",
                 discount,
                 now,
             )
@@ -2219,7 +2270,7 @@ async def db_create_invite_promo_codes(buyer_id: int, count: int = 3) -> list[st
                 "VALUES ($1, $2, $3, 0, $4, TRUE, $5) RETURNING id",
                 code,
                 "ref_discount",
-                "Скидка 5% на любой товар (не Telegram Stars)",
+                "Скидка 5% на подходящие покупки",
                 INVITE_DISCOUNT,
                 now,
             )
@@ -2243,6 +2294,7 @@ class ShopStates(StatesGroup):
     waiting_topup_confirm = State()
     waiting_robux_amount = State()
     waiting_stars_amount = State()
+    waiting_category_amount = State()
     waiting_login_data = State()
     waiting_login_code = State()
     waiting_promo_input = State()
@@ -2279,8 +2331,12 @@ class AdminStates(StatesGroup):
     waiting_new_cat_key = State()          # ключ новой категории
     waiting_new_cat_name = State()         # название новой категории
     waiting_new_cat_emoji = State()        # эмодзи новой категории
+    waiting_new_cat_amount_unit = State()  # единица зависимой категории
+    waiting_new_cat_amount_rate = State()  # цена единицы зависимой категории
+    waiting_new_cat_amount_minimum = State()  # минимум единиц зависимой категории
     waiting_cat_disabled_reason = State()  # причина отключения категории
     waiting_cat_login_hint = State()       # текст после оплаты для категории
+    waiting_cat_amount_setting = State()   # редактирование параметров зависимой категории
     waiting_rename_product = State()       # новое название товара
     waiting_rename_cat_name = State()      # новое название категории
     waiting_rename_cat_emoji = State()     # новый эмодзи категории
@@ -2636,6 +2692,26 @@ async def order_needs_login(category: str | None) -> bool:
         return True
     cat = await db_get_category(category)
     return bool(cat and cat.get("login_hint"))
+
+
+async def _category_uses_amount_input(category: str | None) -> bool:
+    if not category:
+        return False
+    cat = await db_get_category(category)
+    return bool(cat and cat.get("amount_based"))
+
+
+async def _category_disables_discounts(
+    category: str | None,
+    extra: dict | None = None,
+) -> bool:
+    if category in ("tgstars", "roblox_gamepass"):
+        return True
+    # The order payload marker also protects pending orders if the category
+    # is renamed/deleted after checkout starts.
+    if extra and extra.get("requested_amount") is not None:
+        return True
+    return await _category_uses_amount_input(category)
 
 
 async def _needs_pre_purchase_login(category: str | None) -> bool:
@@ -3261,11 +3337,12 @@ async def handle_start(message: Message, state: FSMContext) -> None:
                         await message.answer(
                             f"🎁 <b>Добро пожаловать! Вам начислены промокоды.</b>\n\n"
                             f"Вы перешли по реферальной ссылке и получили "
-                            f"<b>3 промокода</b> на скидку <b>5%</b> на любой заказ:\n\n"
+                            f"<b>3 промокода</b> на скидку <b>5%</b> на подходящие заказы:\n\n"
                             f"{codes_text}\n\n"
                             f"Активируйте промокод в разделе "
                             f"<b>«Мои реф. промокоды»</b> перед покупкой.\n"
-                            f"<i>Не действует на Telegram Stars.</i>",
+                            "<i>Не действует на Telegram Stars, Roblox-геймпасс "
+                            "и категории с вводом количества.</i>",
                             parse_mode="HTML",
                         )
                     except Exception as e:
@@ -3281,11 +3358,12 @@ async def handle_start(message: Message, state: FSMContext) -> None:
             try:
                 await message.answer(
                     f"🎁 <b>Добро пожаловать! Вам начислен промокод.</b>\n\n"
-                    f"Вы получили промокод на скидку <b>5%</b> на любой заказ:\n\n"
+                    f"Вы получили промокод на скидку <b>5%</b> на подходящие заказы:\n\n"
                     f"<code>{welcome_codes[0]}</code>\n\n"
                     f"Активируйте промокод в разделе "
                     f"<b>«Мои реф. промокоды»</b> перед покупкой.\n"
-                    f"<i>Не действует на Telegram Stars.</i>",
+                    "<i>Не действует на Telegram Stars, Roblox-геймпасс "
+                    "и категории с вводом количества.</i>",
                     parse_mode="HTML",
                 )
             except Exception as e:
@@ -4181,10 +4259,12 @@ async def cb_other(call: CallbackQuery) -> None:
 
 # Набор ключей с собственными хендлерами — generic-хендлер их игнорирует
 _BUILTIN_CAT_KEYS = frozenset({"roblox_instant", "roblox_gamepass", "brawl", "tgstars", "other"})
+MAX_CATEGORY_AMOUNT = 1_000_000_000
+MAX_CATEGORY_PRICE = 2_000_000_000
 
 
 @dp.callback_query(F.data.startswith("cat:"))
-async def cb_cat_generic(call: CallbackQuery) -> None:
+async def cb_cat_generic(call: CallbackQuery, state: FSMContext) -> None:
     key = call.data.split(":", 1)[1]
     if key in _BUILTIN_CAT_KEYS:
         return  # обрабатывается отдельными хендлерами выше
@@ -4200,6 +4280,33 @@ async def cb_cat_generic(call: CallbackQuery) -> None:
             f"⚠️ <b>{escape(name)}</b>\n\n<b>Категория временно недоступна.</b>\n\n{escape(reason)}",
             kb_back_main("shop"))
         return
+    if cat.get("amount_based"):
+        unit = cat.get("amount_unit") or "единиц"
+        minimum = int(cat.get("amount_minimum") or 1)
+        rate = float(cat.get("amount_rate") or 1)
+        image = await db_get_image(f"cat:{key}")
+        sent = await show_section(
+            call,
+            key,
+            f"<b>{escape(name)}</b>\n\n"
+            f"Цена за 1 {escape(unit)}: <b>{_fmt_price(rate)}₽</b>\n"
+            f"Минимум: <b>{minimum} {escape(unit)}</b>\n\n"
+            f"Введите нужное количество {escape(unit)} одним сообщением:",
+            kb_back_main("shop"),
+            photo=image,
+        )
+        await state.set_state(ShopStates.waiting_category_amount)
+        await state.update_data(
+            amount_category_key=key,
+            amount_quantity=None,
+            amount_price=None,
+            amount_rate=rate,
+            amount_unit=unit,
+            _pnd_pre_login=None,
+            _prompt_chat_id=sent.chat.id,
+            _prompt_msg_id=sent.message_id,
+        )
+        return
     products = await db_get_products(key)
     if not products:
         await show_section(call, key,
@@ -4210,6 +4317,71 @@ async def cb_cat_generic(call: CallbackQuery) -> None:
         f"<b>{escape(name)}</b>\n\nВыберите товар:",
         kb_product_list(products, f"cp:{key}", "shop"),
         photo=cat_image)
+
+
+@dp.message(ShopStates.waiting_category_amount)
+async def msg_category_amount(message: Message, state: FSMContext) -> None:
+    await _try_delete(message)
+    data = await state.get_data()
+    key = data.get("amount_category_key")
+    cat = await db_get_category(key) if key else None
+    if not cat or not cat.get("amount_based") or cat.get("disabled"):
+        await state.clear()
+        await _state_edit(
+            message, state,
+            "⚠️ Эта категория больше недоступна. Откройте каталог и попробуйте снова.",
+            kb_back_main("shop"),
+        )
+        return
+
+    quantity = parse_positive_int(message.text)
+    minimum = int(cat.get("amount_minimum") or 1)
+    unit = cat.get("amount_unit") or "единиц"
+    rate = float(cat.get("amount_rate") or 1)
+    if quantity is None or quantity > MAX_CATEGORY_AMOUNT:
+        await _state_edit(
+            message, state,
+            f"⚠️ Введите целое количество {escape(unit)} от 1 до "
+            f"{MAX_CATEGORY_AMOUNT:,}.",
+            kb_back_main(f"cat:{key}"),
+        )
+        return
+    if quantity < minimum:
+        await _state_edit(
+            message, state,
+            f"⚠️ Минимальное количество — <b>{minimum} {escape(unit)}</b>.\n"
+            "Попробуйте ещё раз:",
+            kb_back_main(f"cat:{key}"),
+        )
+        return
+
+    price = max(1, round(quantity * rate))
+    if price > MAX_CATEGORY_PRICE:
+        await _state_edit(
+            message, state,
+            "⚠️ Стоимость превышает допустимый лимит заказа. "
+            "Введите меньшее количество:",
+            kb_back_main(f"cat:{key}"),
+        )
+        return
+    category_name = f"{cat['emoji']} {cat['name']}"
+    await state.update_data(
+        amount_quantity=quantity,
+        amount_price=price,
+        amount_rate=rate,
+        amount_unit=unit,
+        amount_category_key=key,
+    )
+    await state.set_state(None)
+    await _state_edit(
+        message, state,
+        f"<b>{escape(category_name)}</b>\n\n"
+        f"Количество: <b>{quantity} {escape(unit)}</b>\n"
+        f"Цена за единицу: <b>{_fmt_price(rate)}₽</b>\n"
+        f"Итого: <b>{_fmt_price(price)}₽</b>\n"
+        "Способ оплаты: внутренний баланс бота",
+        kb_calc_actions(f"buy_amount:{key}", f"cat:{key}"),
+    )
 
 
 @dp.callback_query(F.data.startswith("cp:"))
@@ -4244,6 +4416,55 @@ async def cb_cat_prod_card(call: CallbackQuery) -> None:
         kb_product_card(f"buy_cp:{cat_key}:{prod_key}", f"cat:{cat_key}",
                         needs_login=cat_needs_login),
         photo=prod_image or cat_image)
+
+
+@dp.callback_query(F.data.startswith("buy_amount:"))
+async def cb_buy_category_amount(call: CallbackQuery, state: FSMContext) -> None:
+    key = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    if data.get("amount_category_key") != key:
+        await call.answer("Сумма устарела. Выберите количество заново.", show_alert=True)
+        return
+    cat = await db_get_category(key)
+    quantity = data.get("amount_quantity")
+    if (
+        not cat
+        or not cat.get("amount_based")
+        or cat.get("disabled")
+        or not isinstance(quantity, int)
+        or quantity > MAX_CATEGORY_AMOUNT
+    ):
+        await call.answer("Категория или введённое количество больше недоступны.", show_alert=True)
+        return
+    minimum = int(cat.get("amount_minimum") or 1)
+    if quantity < minimum:
+        await call.answer(
+            f"Минимальное количество изменилось: {minimum}. Введите сумму заново.",
+            show_alert=True,
+        )
+        return
+    unit = cat.get("amount_unit") or "единиц"
+    rate = float(cat.get("amount_rate") or 1)
+    price = max(1, round(quantity * rate))
+    if price > MAX_CATEGORY_PRICE:
+        await call.answer(
+            "Стоимость превышает допустимый лимит. Введите меньшее количество.",
+            show_alert=True,
+        )
+        return
+    title = f"{cat['name']} — {quantity} {unit}"
+    await perform_purchase(
+        call,
+        title,
+        price,
+        category=key,
+        extra={
+            "requested_amount": quantity,
+            "amount_unit": unit,
+            "amount_rate": rate,
+        },
+        state=state,
+    )
 
 
 @dp.callback_query(F.data.startswith("buy_cp:"))
@@ -4301,6 +4522,7 @@ async def _find_reminder_promo(tg_id: int, already_applied_id) -> dict | None:
 async def _show_purchase_confirm(call: CallbackQuery, state: FSMContext) -> None:
     """Рендерит экран подтверждения оплаты по данным из FSM (_pnd_*)."""
     data = await state.get_data()
+    data = await _normalize_pending_purchase_discounts(state, data)
     title: str = data.get("_pnd_title") or ""
     final_price: float = data.get("_pnd_final") or 0.0
     original_price: float = data.get("_pnd_orig") or 0.0
@@ -4346,6 +4568,33 @@ async def _show_purchase_confirm(call: CallbackQuery, state: FSMContext) -> None
     await send_or_edit(call, text, kb)
 
 
+async def _normalize_pending_purchase_discounts(
+    state: FSMContext,
+    data: dict,
+) -> dict:
+    """Удаляет скидки из незавершённой покупки категории без скидок."""
+    if not await _category_disables_discounts(
+        data.get("_pnd_cat"),
+        data.get("_pnd_extra"),
+    ):
+        return data
+    original_price = float(data.get("_pnd_orig") or 0.0)
+    data = {
+        **data,
+        "_pnd_final": original_price,
+        "_pnd_ldsc": 0,
+        "_pnd_pdsc": 0,
+        "_pnd_pid": None,
+    }
+    await state.update_data(
+        _pnd_final=original_price,
+        _pnd_ldsc=0,
+        _pnd_pdsc=0,
+        _pnd_pid=None,
+    )
+    return data
+
+
 async def perform_purchase(
     call: CallbackQuery,
     title: str,
@@ -4355,7 +4604,7 @@ async def perform_purchase(
     product_key: str | None = None,
     state: FSMContext | None = None,
 ) -> None:
-    """Показывает экран подтверждения с итоговой ценой (с учётом реф. скидки).
+    """Показывает экран подтверждения с итоговой ценой, учитывая доступные скидки.
     Если категория требует данные для входа — сначала запрашивает их.
     Фактическое списание происходит в confirm_purchase."""
     user = call.from_user
@@ -4409,7 +4658,7 @@ async def perform_purchase(
 
     # Скидка по активному реф./pct промокоду (для приглашённых пользователей)
     # Проверяем тип заранее, чтобы не применять level_disc вместе с pct_discount
-    _no_discount_cat = category in ("tgstars", "roblox_gamepass")
+    _no_discount_cat = await _category_disables_discounts(category, extra)
     _active_promo_id_check = user_row.get("active_ref_promo") if not _no_discount_cat else None
     _active_promo_for_check = (
         await db_get_promo_by_id(_active_promo_id_check)
@@ -4421,7 +4670,7 @@ async def perform_purchase(
         and _active_promo_for_check.get("discount_pct", 0) > 0
     )
 
-    # Автоматическая скидка по реферальному уровню (не для TG Stars / геймпасса, не если активен pct_discount)
+    # Автоматическая скидка по реферальному уровню, если категория допускает скидки
     level = (user_row.get("referral_level") or 0) if (not _no_discount_cat and not _has_active_pct) else 0
     level_disc = level * REFERRAL_DISCOUNT_PER_LEVEL
 
@@ -4460,7 +4709,7 @@ async def perform_purchase(
     # Напоминание о неиспользованном промокоде на скидку.
     # Показываем только если прomo-скидка ВЫГОДНЕЕ текущей реф.-уровневой.
     # Скидки не суммируются: промо заменяет реф. уровень.
-    if state is not None and promo_disc == 0 and category not in ("tgstars", "roblox_gamepass"):
+    if state is not None and promo_disc == 0 and not _no_discount_cat:
         reminder = await _find_reminder_promo(user.id, applied_ref_promo_id)
         if reminder:
             disc = reminder["discount_pct"]
@@ -4539,8 +4788,18 @@ async def perform_purchase(
 @dp.callback_query(F.data == "confirm_purchase")
 async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     """Выполняет покупку, данные которой сохранены в FSM perform_purchase."""
-    await call.answer()
     data = await state.get_data()
+    if not data.get("_pnd_title") or data.get("_pnd_final") is None:
+        await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+    pending_final = data.get("_pnd_final")
+    data = await _normalize_pending_purchase_discounts(state, data)
+    if data.get("_pnd_final") != pending_final:
+        # A stale promo/confirmation button must not charge a different amount
+        # from the one currently stored for the user.
+        await call.answer()
+        await _show_purchase_confirm(call, state)
+        return
 
     title: str | None = data.get("_pnd_title")
     final_price: float | None = data.get("_pnd_final")
@@ -4572,6 +4831,7 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
     if user.id in _processing_payments:
         await call.answer("Платёж уже обрабатывается, подождите...", show_alert=True)
         return
+    await call.answer()
     _processing_payments.add(user.id)
     try:
         ok = await db_try_charge(user.id, final_price)
@@ -4717,7 +4977,6 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
             login_label=login_label,
         ),
     )
-    await call.answer("Заказ создан")
 
     username = f"@{user.username}" if user.username else "—"
     admin_rows: list[list[InlineKeyboardButton]] = [
@@ -4754,6 +5013,14 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
             admin_text += (
                 f"\nКоличество к получению: <b>{requested_robux} Robux</b>"
             )
+    if extra and extra.get("requested_amount") is not None:
+        requested_amount = int(extra["requested_amount"])
+        amount_unit = escape(str(extra.get("amount_unit") or "единиц"))
+        amount_rate = float(extra.get("amount_rate") or 0)
+        admin_text += (
+            f"\nКоличество: <b>{requested_amount} {amount_unit}</b>"
+            f"\nЦена за единицу: <b>{_fmt_price(amount_rate)}₽</b>"
+        )
     # Данные для входа, введённые ДО оплаты — включаем прямо в уведомление о заказе
     if pre_login:
         admin_text += f"\n\n🔐 <b>Данные для входа:</b>\n<pre>{escape(pre_login)}</pre>"
@@ -4764,7 +5031,6 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("promo_reminder:apply:"))
 async def cb_promo_reminder_apply(call: CallbackQuery, state: FSMContext) -> None:
     """Пользователь выбрал применить найденный промокод на скидку."""
-    await call.answer()
     parts = call.data.split(":")
     if len(parts) < 3 or not parts[2].isdigit():
         await call.answer("Некорректные данные.", show_alert=True)
@@ -4775,6 +5041,16 @@ async def cb_promo_reminder_apply(call: CallbackQuery, state: FSMContext) -> Non
 
     if not data.get("_pnd_title"):
         await call.answer("Данные заказа устарели. Начните заново.", show_alert=True)
+        return
+    if await _category_disables_discounts(
+        data.get("_pnd_cat"),
+        data.get("_pnd_extra"),
+    ):
+        await call.answer(
+            "Скидки не действуют на эту категорию.",
+            show_alert=True,
+        )
+        await _show_purchase_confirm(call, state)
         return
 
     # Проверяем промокод ещё раз (вдруг использовали в другой вкладке)
@@ -4791,6 +5067,7 @@ async def cb_promo_reminder_apply(call: CallbackQuery, state: FSMContext) -> Non
         await _show_purchase_confirm(call, state)
         return
 
+    await call.answer()
     disc = up["discount_pct"]
     original_price: float = data.get("_pnd_orig") or 0.0
     # Скидки не суммируются: промокод заменяет реф. уровень
@@ -4858,7 +5135,7 @@ async def msg_pre_purchase_login(message: Message, state: FSMContext) -> None:
     user_row, _ = await db_get_or_create_user(message.from_user)
     original_price = price
 
-    _no_disc = category in ("tgstars", "roblox_gamepass")
+    _no_disc = await _category_disables_discounts(category, extra)
     _active_promo_id = user_row.get("active_ref_promo") if not _no_disc else None
     _active_promo = await db_get_promo_by_id(_active_promo_id) if _active_promo_id else None
     _has_active_pct = (
@@ -5707,9 +5984,10 @@ async def cb_order_done(call: CallbackQuery) -> None:
                     referrer_id,
                     f"🎉 <b>Поздравляем! Вы достигли нового уровня!</b>\n\n"
                     f"🏆 Ваш новый статус: <b>{level_name}</b>\n"
-                    f"💰 Скидка на все заказы: <b>{discount}%</b>\n\n"
-                    f"Скидка применяется автоматически при каждой покупке.\n"
-                    f"<i>Не действует на Telegram Stars.</i>",
+                    f"💰 Скидка на подходящие заказы: <b>{discount}%</b>\n\n"
+                    "Скидка применяется автоматически при покупке.\n"
+                    "<i>Не действует на Telegram Stars, Roblox-геймпасс "
+                    "и категории с вводом количества.</i>",
                     parse_mode="HTML",
                 )
             except Exception as e:
@@ -6579,8 +6857,8 @@ async def kb_catalog_categories() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for cat in cats:
         status = "⚠️ " if cat["disabled"] else ""
-        if cat["key"] in _SPECIAL_CAT_KEYS:
-            # Нет товаров — ведём сразу в настройки
+        if cat["key"] in _SPECIAL_CAT_KEYS or cat.get("amount_based"):
+            # Категории без списка товаров ведём сразу в настройки.
             rows.append([InlineKeyboardButton(
                 text=f"{status}{cat['emoji']} {cat['name']} ⚙️",
                 callback_data=f"adm:catcfg:{cat['key']}",
@@ -6642,12 +6920,29 @@ def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="📝 Изменить текст после оплаты", callback_data=f"adm:catlogin:{key}")])
     nc_label = "🔔 Выключить запрос кода" if needs_code else "🔔 Включить запрос кода"
     rows.append([InlineKeyboardButton(text=nc_label, callback_data=f"adm:catnc:{key}")])
+    if cat.get("amount_based"):
+        rows.extend([
+            [InlineKeyboardButton(
+                text="🔢 Изменить единицу измерения",
+                callback_data=f"adm:catamount:unit:{key}",
+            )],
+            [InlineKeyboardButton(
+                text="💱 Изменить цену за единицу",
+                callback_data=f"adm:catamount:rate:{key}",
+            )],
+            [InlineKeyboardButton(
+                text="📉 Изменить минимальное количество",
+                callback_data=f"adm:catamount:minimum:{key}",
+            )],
+        ])
     rows.append([
         InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:catname:{key}"),
         InlineKeyboardButton(text="🖼 Эмодзи",        callback_data=f"adm:catemoji:{key}"),
     ])
     rows.append([InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"adm:catdel:ask:{key}")])
-    rows.append([InlineKeyboardButton(text="⬅️ К товарам", callback_data=f"adm:catalog:cat:{key}")])
+    back_label = "⬅️ К каталогу" if cat.get("amount_based") else "⬅️ К товарам"
+    back_callback = "adm:catalog" if cat.get("amount_based") else f"adm:catalog:cat:{key}"
+    rows.append([InlineKeyboardButton(text=back_label, callback_data=back_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -7448,6 +7743,36 @@ async def cb_adm_catalog_new_cat(call: CallbackQuery, state: FSMContext) -> None
     await call.answer()
     if not _is_moderator(call.from_user.id):
         return
+    await state.clear()
+    sent = await send_or_edit(
+        call,
+        "➕ <b>Создание категории</b>\n\nВыберите тип категории:",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📦 Обычная — товары с фиксированной ценой",
+                callback_data="adm:newcat:type:standard",
+            )],
+            [InlineKeyboardButton(
+                text="🔢 Зависимая — покупатель вводит количество",
+                callback_data="adm:newcat:type:amount",
+            )],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+
+
+@dp.callback_query(F.data.startswith("adm:newcat:type:"))
+async def cb_adm_newcat_type(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    category_type = call.data.rsplit(":", 1)[-1]
+    if category_type not in {"standard", "amount"}:
+        await call.answer("Неизвестный тип категории.", show_alert=True)
+        return
+    await call.answer()
+    await state.update_data(new_cat_type=category_type)
     await state.set_state(AdminStates.waiting_new_cat_key)
     sent = await send_or_edit(
         call,
@@ -7539,7 +7864,29 @@ async def cb_adm_newcat_emoji_default(call: CallbackQuery, state: FSMContext) ->
     await call.answer()
     if not _is_moderator(call.from_user.id):
         return
+    data = await state.get_data()
+    if data.get("new_cat_type") == "amount":
+        await _prompt_new_cat_amount_unit(call, state, "🎮")
+        return
     await _finish_create_category(call, state, emoji="🎮")
+
+
+async def _prompt_new_cat_amount_unit(target, state: FSMContext, emoji: str) -> None:
+    await state.update_data(new_cat_emoji=emoji)
+    await state.set_state(AdminStates.waiting_new_cat_amount_unit)
+    prompt = (
+        "🔢 <b>Настройка зависимой категории — единица измерения</b>\n\n"
+        "Введите, что будет указывать покупатель: например, <code>звёзд</code>, "
+        "<code>кристаллов</code> или <code>монет</code>."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+    ])
+    if hasattr(target, "message"):
+        sent = await send_or_edit(target, prompt, kb)
+        await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+    else:
+        await _state_edit(target, state, prompt, kb)
 
 
 @dp.message(AdminStates.waiting_new_cat_emoji)
@@ -7550,25 +7897,132 @@ async def msg_adm_new_cat_emoji(message: Message, state: FSMContext) -> None:
     emoji = (message.text or "").strip()
     if not emoji:
         emoji = "🎮"
+    data = await state.get_data()
+    if data.get("new_cat_type") == "amount":
+        await _prompt_new_cat_amount_unit(message, state, emoji)
+        return
     await _finish_create_category(message, state, emoji=emoji)
+
+
+@dp.message(AdminStates.waiting_new_cat_amount_unit)
+async def msg_adm_new_cat_amount_unit(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    unit = (message.text or "").strip()
+    if not unit or len(unit) > 40:
+        await _state_edit(
+            message, state,
+            "⚠️ Введите единицу измерения длиной от 1 до 40 символов.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+            ]),
+        )
+        return
+    await state.update_data(new_cat_amount_unit=unit)
+    await state.set_state(AdminStates.waiting_new_cat_amount_rate)
+    await _state_edit(
+        message, state,
+        f"Единица: <b>{escape(unit)}</b>\n\n"
+        "Введите цену за одну единицу в рублях (можно дробное число, например <code>1,5</code>):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_new_cat_amount_rate)
+async def msg_adm_new_cat_amount_rate(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        rate = Decimal(raw)
+        if not rate.is_finite() or rate <= 0 or rate > Decimal("1000000"):
+            raise InvalidOperation
+        rate = rate.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        if rate <= 0:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        await _state_edit(
+            message, state,
+            "⚠️ Введите цену от 0,0001₽ до 1 000 000₽ (например: <code>1,5</code>).",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+            ]),
+        )
+        return
+    await state.update_data(new_cat_amount_rate=float(rate))
+    await state.set_state(AdminStates.waiting_new_cat_amount_minimum)
+    await _state_edit(
+        message, state,
+        "Введите минимальное количество единиц для заказа (целое число от 1):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+        ]),
+    )
+
+
+@dp.message(AdminStates.waiting_new_cat_amount_minimum)
+async def msg_adm_new_cat_amount_minimum(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    minimum = parse_positive_int(message.text)
+    if minimum is None or minimum > MAX_CATEGORY_AMOUNT:
+        await _state_edit(
+            message, state,
+            f"⚠️ Введите минимум от 1 до {MAX_CATEGORY_AMOUNT:,}.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:catalog")],
+            ]),
+        )
+        return
+    await state.update_data(new_cat_amount_minimum=minimum)
+    data = await state.get_data()
+    await _finish_create_category(
+        message,
+        state,
+        emoji=data.get("new_cat_emoji", "🎮"),
+    )
 
 
 async def _finish_create_category(target, state: FSMContext, emoji: str) -> None:
     data = await state.get_data()
     key = data.get("new_cat_key", "")
     name = data.get("new_cat_name", "")
+    amount_based = data.get("new_cat_type") == "amount"
+    amount_unit = data.get("new_cat_amount_unit", "")
+    amount_rate = float(data.get("new_cat_amount_rate") or 1)
+    amount_minimum = int(data.get("new_cat_amount_minimum") or 1)
     await state.clear()
-    await db_create_category(key, name, emoji)
+    await db_create_category(
+        key, name, emoji,
+        amount_based=amount_based,
+        amount_unit=amount_unit,
+        amount_rate=amount_rate,
+        amount_minimum=amount_minimum,
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 В каталог", callback_data="adm:catalog")],
         [InlineKeyboardButton(text="⚙️ Настроить категорию", callback_data=f"adm:catcfg:{key}")],
     ])
+    kind_text = (
+        f"Тип: зависимая категория\n"
+        f"Единица: <b>{escape(amount_unit)}</b>\n"
+        f"Цена за единицу: <b>{_fmt_price(amount_rate)}₽</b>\n"
+        f"Минимум: <b>{amount_minimum}</b>\n\n"
+        "Покупатель введёт количество, а бот рассчитает стоимость."
+        if amount_based
+        else "Тип: обычная категория\n\nТеперь добавьте товары и настройте текст после оплаты."
+    )
     msg_text = (
         f"✅ <b>Категория создана!</b>\n\n"
         f"Ключ: <code>{key}</code>\n"
         f"Название: <b>{escape(name)}</b>\n"
-        f"Эмодзи: {emoji}\n\n"
-        "Теперь добавьте товары и настройте текст после оплаты."
+        f"Эмодзи: {emoji}\n"
+        f"{kind_text}"
     )
     if hasattr(target, "message"):  # CallbackQuery
         await send_or_edit(target, msg_text, kb)
@@ -7582,6 +8036,7 @@ async def cb_adm_catcfg(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     if not _is_moderator(call.from_user.id):
         return
+    await state.set_state(None)
     key = call.data.split(":", 2)[2]
     cat = await db_get_category(key)
     if not cat:
@@ -7598,6 +8053,17 @@ async def cb_adm_catcfg(call: CallbackQuery, state: FSMContext) -> None:
             f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
             f"Текст после оплаты: <i>{escape(hint_preview)}</i>"
         )
+    elif cat.get("amount_based"):
+        text = (
+            f"⚙️ <b>Настройки: {cat['emoji']} {escape(cat['name'])}</b>\n\n"
+            f"Статус: {dis_icon}{'отключена' if cat['disabled'] else 'активна'}\n"
+            f"Тип: зависимая категория\n"
+            f"Единица: <b>{escape(cat.get('amount_unit') or '—')}</b>\n"
+            f"Ставка: <b>{_fmt_price(float(cat.get('amount_rate') or 1))}₽</b> за единицу\n"
+            f"Минимум: <b>{int(cat.get('amount_minimum') or 1)}</b>\n"
+            f"Текст после оплаты: <i>{escape(hint_preview)}</i>\n"
+            f"Кнопка кода: {'🔔✅ включена' if cat['needs_code'] else '🔔❌ выключена'}"
+        )
     else:
         nc_icon = "🔔✅" if cat["needs_code"] else "🔔❌"
         text = (
@@ -7609,6 +8075,128 @@ async def cb_adm_catcfg(call: CallbackQuery, state: FSMContext) -> None:
     if cat["disabled"] and cat.get("disabled_reason"):
         text += f"\nПричина отключения: <i>{escape(cat['disabled_reason'])}</i>"
     await send_or_edit(call, text, _cat_config_kb(cat))
+
+
+@dp.callback_query(F.data.startswith("adm:catamount:"))
+async def cb_adm_cat_amount_setting(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    _, _, setting, key = call.data.split(":", 3)
+    cat = await db_get_category(key)
+    if not cat or not cat.get("amount_based") or setting not in {
+        "unit", "rate", "minimum",
+    }:
+        await call.answer("Параметры зависимой категории не найдены.", show_alert=True)
+        return
+    await call.answer()
+
+    prompts = {
+        "unit": (
+            "🔢 <b>Единица измерения</b>\n\n"
+            f"Сейчас: <b>{escape(cat.get('amount_unit') or '—')}</b>\n\n"
+            "Введите новую единицу, например <code>кристаллов</code>."
+        ),
+        "rate": (
+            "💱 <b>Цена за единицу</b>\n\n"
+            f"Сейчас: <b>{_fmt_price(float(cat.get('amount_rate') or 1))}₽</b>\n\n"
+            "Введите новую цену в рублях (можно дробное число)."
+        ),
+        "minimum": (
+            "📉 <b>Минимальное количество</b>\n\n"
+            f"Сейчас: <b>{int(cat.get('amount_minimum') or 1)}</b>\n\n"
+            "Введите новое минимальное количество (целое число от 1)."
+        ),
+    }
+    await state.set_state(AdminStates.waiting_cat_amount_setting)
+    await state.update_data(cat_amount_key=key, cat_amount_setting=setting)
+    sent = await send_or_edit(
+        call,
+        prompts[setting],
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+        ]),
+    )
+    await state.update_data(_prompt_chat_id=sent.chat.id, _prompt_msg_id=sent.message_id)
+
+
+@dp.message(AdminStates.waiting_cat_amount_setting)
+async def msg_adm_cat_amount_setting(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        return
+    await _try_delete(message)
+    data = await state.get_data()
+    key = data.get("cat_amount_key", "")
+    setting = data.get("cat_amount_setting", "")
+    changes: dict[str, str | float | int] = {}
+
+    if setting == "unit":
+        unit = (message.text or "").strip()
+        if not unit or len(unit) > 40:
+            await _state_edit(
+                message, state,
+                "⚠️ Введите единицу измерения длиной от 1 до 40 символов.",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+                ]),
+            )
+            return
+        changes["amount_unit"] = unit
+    elif setting == "rate":
+        raw = (message.text or "").strip().replace(",", ".")
+        try:
+            rate = Decimal(raw)
+            if not rate.is_finite() or rate <= 0 or rate > Decimal("1000000"):
+                raise InvalidOperation
+            rate = rate.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            if rate <= 0:
+                raise InvalidOperation
+        except (InvalidOperation, ValueError):
+            await _state_edit(
+                message, state,
+                "⚠️ Введите цену от 0,0001₽ до 1 000 000₽.",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+                ]),
+            )
+            return
+        changes["amount_rate"] = float(rate)
+    elif setting == "minimum":
+        minimum = parse_positive_int(message.text)
+        if minimum is None or minimum > MAX_CATEGORY_AMOUNT:
+            await _state_edit(
+                message, state,
+                f"⚠️ Введите минимум от 1 до {MAX_CATEGORY_AMOUNT:,}.",
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"adm:catcfg:{key}")],
+                ]),
+            )
+            return
+        changes["amount_minimum"] = minimum
+    else:
+        await state.clear()
+        return
+
+    await db_update_category_amount_config(key, **changes)
+    await state.set_state(None)
+    cat = await db_get_category(key)
+    if not cat:
+        await _state_edit(
+            message, state,
+            "⚠️ Категория не найдена.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ К каталогу", callback_data="adm:catalog")],
+            ]),
+        )
+        return
+    await _state_edit(
+        message, state,
+        f"✅ Параметр зависимой категории «{escape(cat['name'])}» обновлён.\n\n"
+        f"Единица: <b>{escape(cat.get('amount_unit') or '—')}</b>\n"
+        f"Ставка: <b>{_fmt_price(float(cat.get('amount_rate') or 1))}₽</b>\n"
+        f"Минимум: <b>{int(cat.get('amount_minimum') or 1)}</b>",
+        _cat_config_kb(cat),
+    )
 
 
 @dp.callback_query(F.data.startswith("adm:catdis:enable:"))
@@ -8630,9 +9218,10 @@ async def cb_adm_set_ref_level(call: CallbackQuery, state: FSMContext) -> None:
                 target_id,
                 f"🎉 <b>Вам выдан новый реферальный статус!</b>\n\n"
                 f"🏆 Ваш статус: <b>{level_name}</b>\n"
-                f"💰 Скидка на все заказы: <b>{discount}%</b>\n\n"
-                f"Скидка применяется автоматически при каждой покупке.\n"
-                f"<i>Не действует на Telegram Stars.</i>",
+                f"💰 Скидка на подходящие заказы: <b>{discount}%</b>\n\n"
+                "Скидка применяется автоматически при покупке.\n"
+                "<i>Не действует на Telegram Stars, Roblox-геймпасс "
+                "и категории с вводом количества.</i>",
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -8643,7 +9232,7 @@ async def cb_adm_set_ref_level(call: CallbackQuery, state: FSMContext) -> None:
                 target_id,
                 f"ℹ️ Ваш реферальный статус изменён.\n\n"
                 f"Новый статус: <b>{level_name}</b>\n"
-                f"💰 Скидка на все заказы: <b>{discount}%</b>",
+                f"💰 Скидка на подходящие заказы: <b>{discount}%</b>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -8865,9 +9454,12 @@ def kb_admin_promos(promos: list[dict]) -> InlineKeyboardMarkup:
     for p in promos:
         icon = "✅" if p["is_active"] else "🔴"
         if p.get("discount_pct", 0) > 0 and p.get("promo_price", 0) == 0:
-            label = f"{icon} {p['code']} — скидка {p['discount_pct']}% ({p['product_title']})"
+            label = (
+                f"{icon} {p['code']} — скидка {p['discount_pct']}% "
+                f"({_promo_product_label(p, detailed=False)})"
+            )
         else:
-            label = f"{icon} {p['code']} — {p['product_title']} ({p['promo_price']}₽)"
+            label = f"{icon} {p['code']} — {_promo_product_label(p, detailed=False)} ({p['promo_price']}₽)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"adm:promo:{p['id']}")])
     rows.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="adm:promo_create")])
     if promos:
@@ -9017,7 +9609,7 @@ async def cb_adm_promo_type(call: CallbackQuery, state: FSMContext) -> None:
             call,
             f"Код: <code>{escape(code)}</code>  |  Тип: <b>Скидка %</b>\n\n"
             "📦 Введите <b>описание промокода</b>\n"
-            "Например: <code>Скидка на любой товар</code>",
+            "Например: <code>Скидка на подходящие покупки</code>",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:promos")]
             ])
@@ -9421,7 +10013,7 @@ async def cb_adm_promo_detail(call: CallbackQuery) -> None:
     text = (
         f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
-        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"📦 Товар: {escape(_promo_product_label(promo))}\n"
         f"{price_line}\n"
         f"📅 Срок: {dates_str}\n"
         f"📊 Статус: {status_text}  |  Сейчас: {'🟢 работает' if valid_now else '🔴 не работает'}\n"
@@ -9461,7 +10053,7 @@ async def cb_adm_promo_toggle(call: CallbackQuery) -> None:
     text = (
         f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
-        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"📦 Товар: {escape(_promo_product_label(promo))}\n"
         f"💰 Цена: <b>{promo['promo_price']}₽</b>\n"
         f"📅 Срок: {dates_str}\n"
         f"📊 Статус: {status_text}  |  Сейчас: {'🟢 работает' if valid_now else '🔴 не работает'}\n"
@@ -9583,7 +10175,7 @@ async def msg_promo_input(message: Message, state: FSMContext) -> None:
         message, state,
         f"✅ Промокод <code>{escape(promo['code'])}</code> добавлен!\n\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
-        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"📦 Товар: {escape(_promo_product_label(promo))}\n"
         f"💰 Цена по промокоду: <b>{promo['promo_price']}₽</b>\n"
         f"📅 Срок: {_fmt_promo_dates(promo)}\n\n"
         "Найдите его в разделе <b>«Мои промокоды»</b> и воспользуйтесь предложением!",
@@ -9626,9 +10218,12 @@ async def cb_my_promos(call: CallbackQuery) -> None:
         else:
             icon = "🔴"
         if up.get("game") == "pct_discount" and up.get("discount_pct", 0) > 0:
-            label = f"{icon} {up['code']} — скидка {up['discount_pct']}% ({up['product_title']})"
+            label = (
+                f"{icon} {up['code']} — скидка {up['discount_pct']}% "
+                f"({_promo_product_label(up, detailed=False)})"
+            )
         else:
-            label = f"{icon} {up['code']} — {up['product_title']} ({up['promo_price']}₽)"
+            label = f"{icon} {up['code']} — {_promo_product_label(up, detailed=False)} ({up['promo_price']}₽)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"promo_detail:{up['promo_id']}")])
 
     rows.append([InlineKeyboardButton(text="🗑️ Удалить использованные", callback_data="del_all_my_promos")])
@@ -9677,7 +10272,7 @@ async def cb_promo_detail(call: CallbackQuery) -> None:
     text = (
         f"<b>🎟️ Промокод: <code>{escape(promo['code'])}</code></b>\n\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
-        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"📦 Товар: {escape(_promo_product_label(promo))}\n"
         f"{price_line}"
         f"📅 Срок: {dates_str}\n\n"
     )
@@ -9742,7 +10337,7 @@ async def cb_use_promo_confirm(call: CallbackQuery) -> None:
         "<b>🛒 Подтверждение покупки по промокоду</b>\n\n"
         f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
-        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"📦 Товар: {escape(_promo_product_label(promo))}\n"
         f"💰 Сумма: <b>{_fmt_price(price)}₽</b>\n"
         f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
         "Оплата спишется с внутреннего баланса бота.\n"
@@ -9781,7 +10376,7 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
 
     user = call.from_user
     price = float(promo["promo_price"])
-    title = f"[Промокод {promo['code']}] {promo['game']} — {promo['product_title']}"
+    title = f"[Промокод {promo['code']}] {promo['game']} — {_promo_product_label(promo)}"
 
     if user.id in _processing_payments:
         await call.answer("Платёж уже обрабатывается, подождите...", show_alert=True)
@@ -9819,7 +10414,7 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         f"🧾 Номер заказа: <code>#{order_id}</code>\n"
         f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
-        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"📦 Товар: {escape(_promo_product_label(promo))}\n"
         f"💰 Сумма: <b>{_fmt_price(price)}₽</b>\n"
         f"💼 Остаток на балансе: <b>{_fmt_price(new_balance)}₽</b>\n\n"
         "С вами свяжется модератор. Вы также можете написать первым."
@@ -9838,7 +10433,7 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         f"🧾 Заказ: <code>#{order_id}</code>\n"
         f"🎟️ Промокод: <code>{escape(promo['code'])}</code>\n"
         f"🎮 Игра: {escape(promo['game'])}\n"
-        f"📦 Товар: {escape(promo['product_title'])}\n"
+        f"📦 Товар: {escape(_promo_product_label(promo))}\n"
         f"💰 Сумма: <b>{_fmt_price(price)}₽</b>"
     )
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -10540,11 +11135,17 @@ async def cb_referral_info(call: CallbackQuery) -> None:
     else:
         progress_text = "\n🏆 Максимальный уровень достигнут!"
 
+    discount_scope_note = (
+        "<i>Не действует на Telegram Stars, Roblox-геймпасс "
+        "и категории с вводом количества.</i>\n"
+        if discount else ""
+    )
     text = (
         "<b>👥 Реферальная программа</b>\n\n"
         f"Ваш статус: <b>{level_name}</b>\n"
         f"Рефералов засчитано: <b>{ref_count}</b>\n"
-        f"Ваша скидка на заказы: <b>{discount}%</b>{' (не действует на Telegram Stars)' if discount else ''}\n"
+        f"Ваша скидка на подходящие заказы: <b>{discount}%</b>\n"
+        f"{discount_scope_note}"
         f"{progress_text}\n\n"
         f"🔗 Ваша реферальная ссылка:\n<code>{ref_link}</code>\n\n"
         "<b>Как это работает:</b>\n"
@@ -10679,7 +11280,8 @@ async def cb_activate_ref_promo(call: CallbackQuery) -> None:
     discount = promo.get("discount_pct", 0)
     text = (
         f"✅ <b>Скидка {discount}% активирована!</b>\n\n"
-        f"При следующей покупке (кроме Telegram Stars) скидка применится автоматически.\n\n"
+        "Скидка применится автоматически к следующей подходящей покупке. "
+        "Она не действует на Telegram Stars, Roblox-геймпасс и категории с вводом количества.\n\n"
         f"Промокод: <code>{promo['code']}</code>\n"
         f"Скидка действует на один заказ.\n\n"
         f"Перейдите в меню и выберите товар."
