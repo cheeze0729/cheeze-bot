@@ -16,6 +16,7 @@ Telegram-бот для онлайн-магазина цифровых товар
 import asyncio
 import base64
 import io
+import json
 import logging
 import re
 import secrets
@@ -78,20 +79,30 @@ PRICE_CHECK_SCHEDULE_MINUTE = 0
 PRICE_CHECK_TIMEZONE = "Europe/Moscow"
 PRICE_CHECK_MARKUP_PCT = 12.0
 PRICE_CHECK_URL = "https://starvell.com/roblox/packages"
-PRICE_CHECK_OFFER_URL = "https://starvell.com/offers/ffb5571f-4031-4df8-8a0c-c52da41c0c19"
+PRICE_CHECK_API_URL = "https://starvell.com/api/catalog/list-category-offers"
+PRICE_CHECK_PAGE_SIZE = 100
+PRICE_CHECK_MAX_API_PAGES = 20
 PRICE_CHECK_PRODUCTS = {
-    "rb_40": "40 робуксов",
     "rb_80": "80 робуксов",
     "rb_200": "200 робуксов",
     "rb_400": "400 робуксов",
     "rb_500": "500 робуксов",
+    "rb_800": "800 робуксов",
     "rb_1000": "1000 робуксов",
+    "rb_1200": "1200 робуксов",
     "rb_1700": "1700 робуксов",
     "rb_2000": "2000 робуксов",
+    "rb_2100": "2100 робуксов",
+    "rb_2500": "2500 робуксов",
     "rb_3600": "3600 робуксов",
 }
-PRICE_CHECK_GAMEPASS_KEY = "robux_gamepass"
-PRICE_CHECK_GAMEPASS_LABEL = "Роблокс геймпассом (за 1 шт)"
+PRICE_CHECK_PRODUCTS_SETTING_KEY = "starvell_price_products"
+PRICE_CHECK_MARKUP_SETTING_KEY = "starvell_price_markup_pct"
+PRICE_CHECK_MARKUP_MIN_PCT = 0
+PRICE_CHECK_MARKUP_MAX_PCT = 500
+_STARVELL_PRICE_SETTING_KEYS = frozenset(
+    {PRICE_CHECK_PRODUCTS_SETTING_KEY, PRICE_CHECK_MARKUP_SETTING_KEY}
+)
 
 # Telegram ID модератора (узнайте у @userinfobot).
 # Сюда будут приходить уведомления о новых заказах и сообщения от клиентов.
@@ -1076,6 +1087,63 @@ async def db_set_setting(key: str, value: str) -> None:
         "INSERT INTO settings (key, value) VALUES ($1, $2) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         key, value,
+    )
+
+
+async def db_get_starvell_price_preferences() -> tuple[set[str], float]:
+    """Загружает выбранные товары и наценку, используя безопасные значения по умолчанию."""
+    default_products = json.dumps(list(PRICE_CHECK_PRODUCTS), ensure_ascii=False)
+    raw_products = await db_get_setting(
+        PRICE_CHECK_PRODUCTS_SETTING_KEY,
+        default_products,
+    )
+    try:
+        configured_products = json.loads(raw_products)
+        if not isinstance(configured_products, list):
+            raise ValueError("список товаров должен быть массивом")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        logging.warning("Некорректный список цен Starvell в настройках: %s", exc)
+        configured_products = list(PRICE_CHECK_PRODUCTS)
+
+    selected_products = {
+        key
+        for key in configured_products
+        if isinstance(key, str) and key in PRICE_CHECK_PRODUCTS
+    }
+    if not selected_products:
+        logging.warning("В настройках цен Starvell не выбрано ни одного товара; включены все.")
+        selected_products = set(PRICE_CHECK_PRODUCTS)
+
+    raw_markup = await db_get_setting(
+        PRICE_CHECK_MARKUP_SETTING_KEY,
+        str(PRICE_CHECK_MARKUP_PCT),
+    )
+    try:
+        markup = Decimal(str(raw_markup).replace(",", "."))
+    except (InvalidOperation, TypeError, ValueError):
+        markup = Decimal(str(PRICE_CHECK_MARKUP_PCT))
+        logging.warning("Некорректная наценка Starvell; используется значение по умолчанию.")
+    if (
+        not markup.is_finite()
+        or markup < PRICE_CHECK_MARKUP_MIN_PCT
+        or markup > PRICE_CHECK_MARKUP_MAX_PCT
+    ):
+        markup = Decimal(str(PRICE_CHECK_MARKUP_PCT))
+        logging.warning("Наценка Starvell вне допустимого диапазона; используется значение по умолчанию.")
+
+    return selected_products, float(markup)
+
+
+async def db_set_starvell_price_products(selected_products: set[str]) -> None:
+    """Сохраняет только известные товары в постоянных настройках."""
+    ordered_keys = [
+        key for key in PRICE_CHECK_PRODUCTS if key in selected_products
+    ]
+    if not ordered_keys:
+        raise ValueError("Нужно оставить выбранным хотя бы один товар.")
+    await db_set_setting(
+        PRICE_CHECK_PRODUCTS_SETTING_KEY,
+        json.dumps(ordered_keys, ensure_ascii=False),
     )
 
 
@@ -2202,6 +2270,7 @@ class AdminStates(StatesGroup):
     waiting_broadcast = State()        # рассылка всем пользователям
     waiting_edit_product_price = State()   # изменение цены товара
     waiting_edit_setting_value = State()   # изменение настройки (курс/лимит)
+    waiting_starvell_markup = State()      # новая наценка в отчёте Starvell
     waiting_new_product_key = State()      # ключ нового товара
     waiting_new_product_name = State()     # название нового товара
     waiting_new_product_price = State()    # цена нового товара
@@ -6476,6 +6545,8 @@ def kb_admin_main(user_id: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🛒 Каталог и курсы", callback_data="adm:catalog")],
         [InlineKeyboardButton(text="🖼️ Картинки", callback_data="adm:images")],
     ]
+    if _is_moderator(user_id):
+        rows.insert(4, [InlineKeyboardButton(text="💹 Цены Starvell", callback_data="adm:starvell")])
     if _is_founder(user_id):
         rows.append([InlineKeyboardButton(text="👥 Персонал", callback_data="adm:staff")])
         if _maintenance["active"]:
@@ -6613,6 +6684,63 @@ def kb_settings_list(settings: list[dict]) -> InlineKeyboardMarkup:
             )
         ])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:catalog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _starvell_price_preferences_text(
+    selected_products: set[str],
+    markup_pct: float,
+) -> str:
+    selected_labels = [
+        label
+        for key, label in PRICE_CHECK_PRODUCTS.items()
+        if key in selected_products
+    ]
+    products_text = ", ".join(selected_labels) if selected_labels else "не выбраны"
+    return (
+        "<b>💹 Цены Starvell</b>\n\n"
+        f"Товары в рассылке: <b>{len(selected_labels)} из {len(PRICE_CHECK_PRODUCTS)}</b>\n"
+        f"Наценка: <b>{markup_pct:g}%</b>\n"
+        f"Выбрано: {products_text}\n\n"
+        "Ежедневная сводка отправляется в 10:00 МСК. "
+        "Запрос вручную покажет результат здесь."
+    )
+
+
+def kb_admin_starvell(
+    selected_products: set[str],
+    markup_pct: float,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запросить цены сейчас", callback_data="adm:starvell:request")],
+        [InlineKeyboardButton(
+            text=f"📦 Товары в рассылке ({len(selected_products)}/{len(PRICE_CHECK_PRODUCTS)})",
+            callback_data="adm:starvell:products",
+        )],
+        [InlineKeyboardButton(
+            text=f"📈 Изменить наценку ({markup_pct:g}%)",
+            callback_data="adm:starvell:markup",
+        )],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:main")],
+    ])
+
+
+def kb_admin_starvell_products(selected_products: set[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, label in PRICE_CHECK_PRODUCTS.items():
+        status = "✅" if key in selected_products else "⬜️"
+        rows.append([InlineKeyboardButton(
+            text=f"{status} {label}",
+            callback_data=f"adm:starvell:toggle:{key}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="☑️ Включить все товары",
+        callback_data="adm:starvell:products:all",
+    )])
+    rows.append([InlineKeyboardButton(
+        text="⬅️ К настройкам цен",
+        callback_data="adm:starvell",
+    )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -6912,6 +7040,164 @@ async def cb_adm_main(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await send_or_edit(call, "<b>🛠️ Админ-панель</b>\n\nВыберите действие:", kb_admin_main(call.from_user.id))
     await call.answer()
+
+
+@dp.callback_query(F.data == "adm:starvell")
+async def cb_adm_starvell(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    await state.clear()
+    selected_products, markup_pct = await db_get_starvell_price_preferences()
+    await send_or_edit(
+        call,
+        _starvell_price_preferences_text(selected_products, markup_pct),
+        kb_admin_starvell(selected_products, markup_pct),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:starvell:request")
+async def cb_adm_starvell_request(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    await call.answer("Запрашиваю цены у Starvell…")
+    selected_products, markup_pct = await db_get_starvell_price_preferences()
+    keyboard = kb_admin_starvell(selected_products, markup_pct)
+    await send_or_edit(
+        call,
+        "⏳ Получаю актуальные цены Starvell. Это может занять несколько секунд.",
+        keyboard,
+    )
+    try:
+        report = await _build_price_report()
+    except Exception:
+        logging.exception("Не удалось выполнить ручной запрос цен Starvell.")
+        report = "⚠️ Не удалось получить цены Starvell. Попробуйте позже."
+    await send_or_edit(call, report, keyboard)
+
+
+@dp.callback_query(F.data == "adm:starvell:products")
+async def cb_adm_starvell_products(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    await state.clear()
+    selected_products, _ = await db_get_starvell_price_preferences()
+    await send_or_edit(
+        call,
+        "<b>📦 Товары для рассылки цен</b>\n\n"
+        "Нажимайте на товар, чтобы включить или убрать его из ежедневной и ручной сводки. "
+        "Должен оставаться выбран хотя бы один товар.",
+        kb_admin_starvell_products(selected_products),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:starvell:products:all")
+async def cb_adm_starvell_products_all(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    selected_products = set(PRICE_CHECK_PRODUCTS)
+    await db_set_starvell_price_products(selected_products)
+    await send_or_edit(
+        call,
+        "<b>📦 Товары для рассылки цен</b>\n\n"
+        "Выбраны все доступные пакеты Roblox из категории «моментально».",
+        kb_admin_starvell_products(selected_products),
+    )
+    await call.answer("Выбраны все товары.")
+
+
+@dp.callback_query(F.data.startswith("adm:starvell:toggle:"))
+async def cb_adm_starvell_toggle_product(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    key = call.data.rsplit(":", 1)[-1]
+    if key not in PRICE_CHECK_PRODUCTS:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+
+    selected_products, _ = await db_get_starvell_price_preferences()
+    if key in selected_products:
+        if len(selected_products) == 1:
+            await call.answer("Нужно оставить выбранным хотя бы один товар.", show_alert=True)
+            return
+        selected_products.remove(key)
+    else:
+        selected_products.add(key)
+    await db_set_starvell_price_products(selected_products)
+    await send_or_edit(
+        call,
+        "<b>📦 Товары для рассылки цен</b>\n\n"
+        "Нажимайте на товар, чтобы включить или убрать его из ежедневной и ручной сводки. "
+        "Должен оставаться выбран хотя бы один товар.",
+        kb_admin_starvell_products(selected_products),
+    )
+    await call.answer("Список рассылки сохранён.")
+
+
+@dp.callback_query(F.data == "adm:starvell:markup")
+async def cb_adm_starvell_markup(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    _, markup_pct = await db_get_starvell_price_preferences()
+    await state.set_state(AdminStates.waiting_starvell_markup)
+    await send_or_edit(
+        call,
+        "📈 <b>Наценка для цен Starvell</b>\n\n"
+        f"Текущая наценка: <b>{markup_pct:g}%</b>\n"
+        f"Введите новое значение от {PRICE_CHECK_MARKUP_MIN_PCT} до "
+        f"{PRICE_CHECK_MARKUP_MAX_PCT}% (например, 12 или 15,5):",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:starvell")],
+        ]),
+    )
+    await call.answer()
+
+
+@dp.message(AdminStates.waiting_starvell_markup)
+async def msg_adm_starvell_markup(message: Message, state: FSMContext) -> None:
+    if not _is_moderator(message.from_user.id):
+        await state.clear()
+        return
+    await _try_delete(message)
+    raw = (message.text or "").strip().removesuffix("%").strip().replace(",", ".")
+    try:
+        markup = Decimal(raw)
+        if (
+            not markup.is_finite()
+            or markup < PRICE_CHECK_MARKUP_MIN_PCT
+            or markup > PRICE_CHECK_MARKUP_MAX_PCT
+        ):
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        await _state_edit(
+            message,
+            state,
+            "⚠️ Введите число от "
+            f"{PRICE_CHECK_MARKUP_MIN_PCT} до {PRICE_CHECK_MARKUP_MAX_PCT}% "
+            "(например, 12 или 15,5):",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="adm:starvell")],
+            ]),
+        )
+        return
+
+    markup_text = format(markup.normalize(), "f")
+    await db_set_setting(PRICE_CHECK_MARKUP_SETTING_KEY, markup_text)
+    await state.clear()
+    selected_products, current_markup = await db_get_starvell_price_preferences()
+    await _state_edit(
+        message,
+        state,
+        f"✅ Наценка для цен Starvell обновлена: <b>{current_markup:g}%</b>",
+        kb_admin_starvell(selected_products, current_markup),
+    )
 
 
 @dp.callback_query(F.data == "adm:catalog")
@@ -7819,7 +8105,11 @@ async def cb_adm_settings(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         return
     await state.clear()
-    settings = await db_all_settings()
+    settings = [
+        setting
+        for setting in await db_all_settings()
+        if setting["key"] not in _STARVELL_PRICE_SETTING_KEYS
+    ]
     lines = [
         f"• {_SETTING_LABELS.get(s['key'], s['key'])}: <b>{s['value']}</b>"
         for s in settings
@@ -7835,6 +8125,12 @@ async def cb_adm_settings_edit(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer()
         return
     key = call.data.split(":", 3)[3]
+    if key in _STARVELL_PRICE_SETTING_KEYS:
+        await call.answer(
+            "Эти настройки изменяются в меню «Цены Starvell».",
+            show_alert=True,
+        )
+        return
     current = await db_get_setting(key, "—")
     label = _SETTING_LABELS.get(key, key)
     await state.set_state(AdminStates.waiting_edit_setting_value)
@@ -10809,55 +11105,199 @@ def _fetch_url_text(url: str) -> str:
         return ""
 
 
-async def _extract_starvell_prices() -> dict[str, float]:
-    """Извлекает цены с Starvell и возвращает словарь ключ → цена в рублях."""
-    prices: dict[str, float] = {}
+def _parse_starvell_page_props(page_text: str) -> dict:
+    """Извлекает серверные данные каталога из JSON Next.js на странице Starvell."""
+    match = re.search(
+        r'<script\b[^>]*\bid=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        page_text,
+        re.I | re.S,
+    )
+    if not match:
+        logging.warning("В ответе Starvell не найден блок данных каталога.")
+        return {}
 
-    text = await asyncio.to_thread(_fetch_url_text, PRICE_CHECK_URL)
-    if not text:
-        return prices
+    try:
+        data = json.loads(match.group(1))
+    except (TypeError, json.JSONDecodeError) as exc:
+        logging.warning("Не удалось разобрать данные каталога Starvell: %s", exc)
+        return {}
 
-    for key, label in PRICE_CHECK_PRODUCTS.items():
-        pattern = re.compile(rf"{re.escape(label)}.*?([0-9][0-9\s.,]*)\s*₽", re.I | re.S)
-        match = pattern.search(text)
-        if not match:
+    if not isinstance(data, dict):
+        logging.warning("Starvell вернул неожиданный формат данных каталога.")
+        return {}
+    page_props = data.get("props", {}).get("pageProps", {})
+    return page_props if isinstance(page_props, dict) else {}
+
+
+def _fetch_starvell_offer_batch(params: dict) -> list[dict] | None:
+    """Запрашивает одну публичную страницу предложений Starvell."""
+    request = Request(
+        PRICE_CHECK_API_URL,
+        data=json.dumps(params).encode("utf-8"),
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://starvell.com",
+            "Referer": PRICE_CHECK_URL,
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8", errors="ignore"))
+    except Exception as exc:
+        logging.warning(
+            "Не удалось получить предложения Starvell (offset %s): %s",
+            params.get("offset", 0),
+            exc,
+        )
+        return None
+
+    offers = data.get("offers") if isinstance(data, dict) else None
+    if not isinstance(offers, list):
+        logging.warning(
+            "Starvell вернул неожиданный формат списка предложений (offset %s).",
+            params.get("offset", 0),
+        )
+        return None
+    return [offer for offer in offers if isinstance(offer, dict)]
+
+
+def _prices_from_starvell_offers(offers: list[dict]) -> dict[str, float]:
+    """Выбирает минимальную отображаемую цену для каждого нужного номинала."""
+    key_by_label = {label: key for key, label in PRICE_CHECK_PRODUCTS.items()}
+    best_prices: dict[str, Decimal] = {}
+
+    for offer in offers:
+        subcategory = offer.get("subCategory")
+        if not isinstance(subcategory, dict):
             continue
-        raw = match.group(1).replace("\xa0", "").replace(" ", "").replace(",", ".")
+        key = key_by_label.get(str(subcategory.get("name", "")).strip())
+        if key is None:
+            continue
+
+        # finalPrice — цена, показанная покупателю; price может быть зачёркнутой.
+        raw_price = offer.get("finalPrice") or offer.get("price")
         try:
-            prices[key] = float(raw)
-        except ValueError:
+            price = Decimal(str(raw_price))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if not price.is_finite() or price <= 0:
             continue
 
-    offer_text = await asyncio.to_thread(_fetch_url_text, PRICE_CHECK_OFFER_URL)
-    if offer_text:
-        gamepass_match = re.search(r"([0-9][0-9\s.,]*)\s*₽", offer_text)
-        if gamepass_match:
-            raw = gamepass_match.group(1).replace("\xa0", "").replace(" ", "").replace(",", ".")
-            try:
-                prices[PRICE_CHECK_GAMEPASS_KEY] = float(raw)
-            except ValueError:
-                pass
+        if key not in best_prices or price < best_prices[key]:
+            best_prices[key] = price
 
-    return prices
+    return {key: float(price) for key, price in best_prices.items()}
+
+
+def _extract_starvell_prices_from_page_props(page_props: dict) -> dict[str, float]:
+    """Собирает все страницы категории «моментально» и вычисляет цены."""
+    category = page_props.get("category")
+    if not isinstance(category, dict):
+        logging.warning("В данных Starvell отсутствует категория Roblox.")
+        return {}
+    category_name = str(category.get("name", "")).strip().casefold()
+    if category.get("slug") != "packages" or "моментально" not in category_name:
+        logging.warning("Страница Starvell не соответствует категории «моментально».")
+        return {}
+
+    category_id = category.get("id")
+    if category_id is None:
+        logging.warning("В данных Starvell отсутствует идентификатор категории.")
+        return {}
+
+    initial_offers = page_props.get("offers")
+    offers = list(initial_offers) if isinstance(initial_offers, list) else []
+    init_params = page_props.get("initParams")
+    params = dict(init_params) if isinstance(init_params, dict) else {}
+    params.update(
+        {
+            "categoryId": category_id,
+            "limit": PRICE_CHECK_PAGE_SIZE,
+            "sortBy": "price",
+            "sortDir": "ASC",
+            "sortByPriceAndBumped": True,
+        }
+    )
+    # Запрашиваем всю категорию без пользовательских фильтров.
+    params.pop("subCategoryId", None)
+    params.pop("keyword", None)
+    params.pop("instantDelivery", None)
+    params.pop("autoDelivery", None)
+    params.pop("onlyOnlineUsers", None)
+    params["attributes"] = []
+    params["numericRangeFilters"] = []
+
+    offset = len(offers)
+    for _ in range(PRICE_CHECK_MAX_API_PAGES):
+        batch = _fetch_starvell_offer_batch({**params, "offset": offset})
+        if batch is None or not batch:
+            break
+        offers.extend(batch)
+        offset += len(batch)
+        if len(batch) < PRICE_CHECK_PAGE_SIZE:
+            break
+    else:
+        logging.warning(
+            "Достигнут предел страниц Starvell; часть предложений могла не попасть в отчёт."
+        )
+
+    return _prices_from_starvell_offers(offers)
+
+
+def _extract_starvell_prices_sync() -> dict[str, float]:
+    page_text = _fetch_url_text(PRICE_CHECK_URL)
+    if not page_text:
+        return {}
+    page_props = _parse_starvell_page_props(page_text)
+    if not page_props:
+        return {}
+    try:
+        return _extract_starvell_prices_from_page_props(page_props)
+    except Exception as exc:
+        logging.warning("Не удалось обработать цены Starvell: %s", exc)
+        return {}
+
+
+async def _extract_starvell_prices() -> dict[str, float]:
+    """Извлекает актуальные цены пакетов Roblox из категории «моментально»."""
+    return await asyncio.to_thread(_extract_starvell_prices_sync)
 
 
 async def _build_price_report() -> str:
-    """Собирает текст для утренней сводки цен с наценкой 12%."""
+    """Собирает сводку Starvell с текущими настройками товаров и наценки."""
+    selected_products, markup_pct = await db_get_starvell_price_preferences()
     prices = await _extract_starvell_prices()
     if not prices:
-        return "⚠️ Не удалось получить актуальные цены Starvell."
+        return "⚠️ Не удалось получить актуальные цены Starvell в категории «Roblox — моментально»."
 
-    lines = ["📈 <b>Актуальные цены Starvell</b>", "", f"Наценка: <b>{PRICE_CHECK_MARKUP_PCT:.0f}%</b>"]
-    for key, label in PRICE_CHECK_PRODUCTS.items():
+    selected_items = [
+        (key, label)
+        for key, label in PRICE_CHECK_PRODUCTS.items()
+        if key in selected_products
+    ]
+    lines = [
+        "📈 <b>Starvell — Roblox, моментально</b>",
+        "",
+        f"Наценка: <b>{markup_pct:g}%</b>",
+    ]
+    for key, label in selected_items:
         base_price = prices.get(key)
         if base_price is None:
             continue
-        final_price = round(base_price * (1 + PRICE_CHECK_MARKUP_PCT / 100))
+        final_price = round(base_price * (1 + markup_pct / 100))
         lines.append(f"• {label}: <b>{final_price} ₽</b> (база {base_price:.2f} ₽)")
 
-    gp_price = prices.get(PRICE_CHECK_GAMEPASS_KEY)
-    if gp_price is not None:
-        lines.append(f"• {PRICE_CHECK_GAMEPASS_LABEL}: <b>{round(gp_price)} ₽</b> (без наценки)")
+    missing = [
+        label
+        for key, label in selected_items
+        if key not in prices
+    ]
+    if missing:
+        lines.extend(["", "⚠️ Нет цены для: " + ", ".join(missing)])
+
     return "\n".join(lines)
 
 
