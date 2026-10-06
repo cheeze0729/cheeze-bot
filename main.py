@@ -10975,15 +10975,16 @@ async def cb_ord_write_buyer(call: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(AdminStates.waiting_ord_buyer_reply)
     await state.update_data(ord_reply_order_id=order_id, ord_reply_buyer_id=buyer_id)
-    await send_or_edit(
-        call,
+    prompt = await call.message.answer(
         f"✍️ <b>Написать покупателю (заказ #{order_id})</b>\n\n"
         "Отправьте текст или фото — покупатель получит его с пометкой «Сообщение от администратора».\n\n"
         "Для отмены нажмите кнопку ниже.",
-        InlineKeyboardMarkup(inline_keyboard=[[
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="❌ Отмена", callback_data="ord_write_buyer_cancel"),
         ]]),
+        parse_mode="HTML",
     )
+    await state.update_data(_prompt_chat_id=prompt.chat.id, _prompt_msg_id=prompt.message_id)
     await call.answer()
 
 
@@ -11129,79 +11130,83 @@ async def msg_buyer_write_admin(message: Message, state: FSMContext) -> None:
         )
     ]])
 
+    async def deliver_to_staff(staff_id: int) -> bool:
+        """Доставляет содержимое сотруднику; для прочих типов пересылает исходник."""
+        if message.photo:
+            await bot.send_photo(
+                chat_id=staff_id,
+                photo=message.photo[-1].file_id,
+                caption=(
+                    f"{caption_prefix}\n\n{escape(message.caption or '')}"
+                    if message.caption
+                    else caption_prefix
+                ),
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+            return True
+        if message.text:
+            await bot.send_message(
+                chat_id=staff_id,
+                text=f"{caption_prefix}\n\n{escape(message.text)}",
+                parse_mode="HTML",
+                reply_markup=reply_kb,
+            )
+            return True
+
+        await bot.send_message(staff_id, caption_prefix, parse_mode="HTML")
+        await bot.forward_message(
+            chat_id=staff_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        try:
+            await bot.send_message(
+                staff_id, "⬆️ Сообщение покупателя", reply_markup=reply_kb
+            )
+        except Exception as e:
+            # Исходное сообщение уже доставлено; не считаем это полной неудачей.
+            logging.warning(
+                f"Не удалось добавить кнопку ответа сотруднику {staff_id}: {e}"
+            )
+        return True
+
     # Отправляем назначенному сотруднику, или всем Founder/Admin если никто не взял
     order = await db_get_order(order_id) if order_id else None
-    sent_to_staff = False
+    delivered_count = 0
     if order and order.get("assigned_to"):
         staff_id = int(order["assigned_to"])
         try:
-            if message.photo:
-                await bot.send_photo(
-                    chat_id=staff_id,
-                    photo=message.photo[-1].file_id,
-                    caption=(
-                        f"{caption_prefix}\n\n{escape(message.caption or '')}"
-                        if message.caption
-                        else caption_prefix
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=reply_kb,
-                )
-            elif message.text:
-                await bot.send_message(
-                    chat_id=staff_id,
-                    text=f"{caption_prefix}\n\n{escape(message.text)}",
-                    parse_mode="HTML",
-                    reply_markup=reply_kb,
-                )
-            else:
-                await bot.send_message(staff_id, caption_prefix, parse_mode="HTML")
-                await bot.forward_message(
-                    chat_id=staff_id,
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id,
-                )
-                await bot.send_message(staff_id, "⬆️ Сообщение покупателя", reply_markup=reply_kb)
-            sent_to_staff = True
+            if await deliver_to_staff(staff_id):
+                delivered_count += 1
         except Exception as e:
             logging.warning(f"Не удалось отправить сообщение покупателя сотруднику {staff_id}: {e}")
 
-    if not sent_to_staff:
+    if delivered_count == 0:
         # Заказ не назначен — рассылаем всем Founder + Admin
-        recipients = await db_get_order_staff_recipients()
+        try:
+            recipients = await db_get_order_staff_recipients()
+        except Exception as e:
+            logging.exception(f"Не удалось получить список сотрудников для заказа #{order_id}: {e}")
+            recipients = []
         for staff in recipients:
             sid = int(staff["tg_id"])
             try:
-                if message.photo:
-                    await bot.send_photo(
-                        chat_id=sid,
-                        photo=message.photo[-1].file_id,
-                        caption=(
-                            f"{caption_prefix}\n\n{escape(message.caption or '')}"
-                            if message.caption
-                            else caption_prefix
-                        ),
-                        parse_mode="HTML",
-                        reply_markup=reply_kb,
-                    )
-                elif message.text:
-                    await bot.send_message(
-                        chat_id=sid,
-                        text=f"{caption_prefix}\n\n{escape(message.text)}",
-                        parse_mode="HTML",
-                        reply_markup=reply_kb,
-                    )
-                else:
-                    await bot.send_message(sid, caption_prefix, parse_mode="HTML")
-                    await bot.forward_message(
-                        chat_id=sid,
-                        from_chat_id=message.chat.id,
-                        message_id=message.message_id,
-                    )
-                    await bot.send_message(sid, "⬆️ Сообщение покупателя", reply_markup=reply_kb)
+                if await deliver_to_staff(sid):
+                    delivered_count += 1
             except Exception as e:
                 logging.warning(f"Не удалось отправить сообщение покупателя сотруднику {sid}: {e}")
 
+    if delivered_count:
+        result_text = (
+            f"✅ Ваше сообщение по заказу <b>#{order_id}</b> передано администратору.\n\n"
+            "Когда он ответит — вы получите уведомление прямо в боте."
+        )
+    else:
+        result_text = (
+            f"❌ Не удалось передать сообщение по заказу <b>#{order_id}</b>: "
+            "сейчас ни один сотрудник не получил его. Попробуйте отправить позже."
+        )
     kb_after = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✍️ Написать ещё",
@@ -11213,8 +11218,7 @@ async def msg_buyer_write_admin(message: Message, state: FSMContext) -> None:
     await _try_delete(message)
     await _state_edit(
         message, state,
-        f"✅ Ваше сообщение по заказу <b>#{order_id}</b> передано администратору.\n\n"
-        "Когда он ответит — вы получите уведомление прямо в боте.",
+        result_text,
         kb_after,
     )
     await state.clear()
