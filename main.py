@@ -1314,6 +1314,72 @@ async def db_get_order(order_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+_ACTIVE_ORDER_SUMMARY_SELECT = """
+    SELECT o.id, o.title, o.price, o.status, o.category, o.gamepass_price,
+           o.assigned_to, o.assigned_at, o.created_at,
+           s.first_name AS assigned_first_name,
+           s.username AS assigned_username
+    FROM orders o
+    LEFT JOIN staff_members s ON s.tg_id = o.assigned_to
+"""
+
+
+async def db_count_active_orders() -> int:
+    pool = await get_pool()
+    count = await pool.fetchval(
+        "SELECT COUNT(*) FROM orders "
+        "WHERE status NOT IN ($1, $2, $3)",
+        ORDER_STATUS_COMPLETED, "Выполнен", ORDER_STATUS_REFUNDED,
+    )
+    return int(count or 0)
+
+
+async def db_get_active_orders(limit: int, offset: int) -> list[dict]:
+    """Возвращает только безопасные поля активных заказов, без данных покупателя."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        _ACTIVE_ORDER_SUMMARY_SELECT
+        + " WHERE o.status NOT IN ($1, $2, $3)"
+        " ORDER BY o.created_at ASC, o.id ASC LIMIT $4 OFFSET $5",
+        ORDER_STATUS_COMPLETED, "Выполнен", ORDER_STATUS_REFUNDED,
+        limit, offset,
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_get_active_order_summary(order_id: int) -> dict | None:
+    """Ищет активный заказ без чтения полей, введённых покупателем."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        _ACTIVE_ORDER_SUMMARY_SELECT
+        + " WHERE o.id = $1 AND o.status NOT IN ($2, $3, $4)",
+        order_id, ORDER_STATUS_COMPLETED, "Выполнен", ORDER_STATUS_REFUNDED,
+    )
+    return dict(row) if row else None
+
+
+async def db_get_active_order_for_assignee(
+    order_id: int, staff_id: int
+) -> dict | None:
+    """Возвращает полные данные только текущему исполнителю активного заказа."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        SELECT o.*, u.first_name AS buyer_first_name, u.username AS buyer_username,
+               s.first_name AS assigned_first_name,
+               s.username AS assigned_username
+        FROM orders o
+        LEFT JOIN users u ON u.tg_id = o.tg_id
+        LEFT JOIN staff_members s ON s.tg_id = o.assigned_to
+        WHERE o.id = $1 AND o.assigned_to = $2
+          AND o.status NOT IN ($3, $4, $5)
+        """,
+        order_id, staff_id, ORDER_STATUS_COMPLETED, "Выполнен",
+        ORDER_STATUS_REFUNDED,
+    )
+    return dict(row) if row else None
+
+
 async def db_update_order_status(order_id: int, status: str) -> None:
     pool = await get_pool()
     await pool.execute("UPDATE orders SET status = $1 WHERE id = $2", status, order_id)
@@ -6862,10 +6928,12 @@ async def cb_gp_price_changed_done(call: CallbackQuery) -> None:
 
 
 USERS_PAGE_SIZE = 8
+ACTIVE_ORDERS_PAGE_SIZE = 5
 
 
 def kb_admin_main(user_id: int = 0) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="📦 Активные заказы", callback_data="adm:active_orders")],
         [InlineKeyboardButton(text="🔍 Найти пользователя", callback_data="adm:find")],
         [InlineKeyboardButton(text="👥 Список пользователей", callback_data="adm:users:0")],
         [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="adm:promos")],
@@ -7390,6 +7458,193 @@ async def cb_adm_main(call: CallbackQuery, state: FSMContext) -> None:
         return
     await state.clear()
     await send_or_edit(call, "<b>🛠️ Админ-панель</b>\n\nВыберите действие:", kb_admin_main(call.from_user.id))
+    await call.answer()
+
+
+def _active_order_assignee_label(order: dict) -> str:
+    staff_id = order.get("assigned_to")
+    name = order.get("assigned_first_name")
+    username = order.get("assigned_username")
+    label = str(name).strip() if name else f"Сотрудник {staff_id}"
+    if username:
+        label += f" (@{str(username).lstrip('@')})"
+    return escape(label)
+
+
+def _active_order_summary_text(order: dict) -> str:
+    text = (
+        f"📦 <b>Заказ #{int(order['id'])}</b>\n\n"
+        f"<b>Товар:</b> {escape(str(order.get('title') or '—'))}\n"
+        f"<b>Сумма:</b> {_fmt_price(float(order.get('price') or 0))}₽\n"
+        f"<b>Статус:</b> {escape(_display_order_status(order.get('status')))}\n"
+        f"<b>Создан:</b> {escape(str(order.get('created_at') or '—'))}"
+    )
+    if order.get("gamepass_price"):
+        text += f"\n<b>Цена геймпасса:</b> {int(order['gamepass_price'])}"
+    if order.get("assigned_to"):
+        text += f"\n\n🙋 <b>Взял:</b> {_active_order_assignee_label(order)}"
+    else:
+        text += "\n\n📥 <b>Ещё не взят сотрудником.</b>"
+    return text
+
+
+def _active_order_full_text(order: dict) -> str:
+    text = _active_order_summary_text(order)
+    buyer_name = str(order.get("buyer_first_name") or "").strip()
+    buyer_username = order.get("buyer_username")
+    buyer_label = escape(buyer_name or "Без имени")
+    if buyer_username:
+        buyer_label += f" (@{escape(str(buyer_username).lstrip('@'))})"
+    text += (
+        f"\n\n<b>Покупатель:</b> {buyer_label}"
+        f"\n<b>Telegram ID:</b> <code>{int(order['tg_id'])}</code>"
+    )
+    if order.get("contact"):
+        text += f"\n\n<b>Контакт:</b>\n<pre>{escape(str(order['contact']))}</pre>"
+    if order.get("login_data"):
+        text += (
+            f"\n\n🔐 <b>Данные для входа:</b>\n"
+            f"<pre>{escape(str(order['login_data']))}</pre>"
+        )
+    if order.get("login_code"):
+        text += (
+            f"\n\n📨 <b>Код для входа:</b>\n"
+            f"<pre>{escape(str(order['login_code']))}</pre>"
+        )
+    return text
+
+
+async def _show_active_orders_page(call: CallbackQuery, page: int) -> None:
+    total = await db_count_active_orders()
+    total_pages = max(1, (total + ACTIVE_ORDERS_PAGE_SIZE - 1) // ACTIVE_ORDERS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    orders = await db_get_active_orders(
+        ACTIVE_ORDERS_PAGE_SIZE, page * ACTIVE_ORDERS_PAGE_SIZE
+    )
+    rows: list[list[InlineKeyboardButton]] = []
+    for order in orders:
+        title = str(order.get("title") or "Заказ")
+        if len(title) > 42:
+            title = title[:39] + "…"
+        rows.append([InlineKeyboardButton(
+            text=f"#{int(order['id'])} · {title}",
+            callback_data=f"adm:active_order:view:{int(order['id'])}:{page}",
+        )])
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="⬅️", callback_data=f"adm:active_orders:page:{page - 1}"
+            ))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="adm:noop"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(
+                text="➡️", callback_data=f"adm:active_orders:page:{page + 1}"
+            ))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:main")])
+
+    if orders:
+        text = (
+            f"📦 <b>Активные заказы</b> — {total}\n\n"
+            "Выберите заказ для просмотра."
+        )
+    else:
+        text = "📦 <b>Активные заказы</b>\n\nСейчас активных заказов нет."
+    await send_or_edit(call, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data == "adm:active_orders")
+async def cb_adm_active_orders(call: CallbackQuery, state: FSMContext) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    await state.clear()
+    await _show_active_orders_page(call, 0)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:active_orders:page:"))
+async def cb_adm_active_orders_page(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    try:
+        page = int(call.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница.", show_alert=True)
+        return
+    await _show_active_orders_page(call, page)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:active_order:view:"))
+async def cb_adm_active_order_view(call: CallbackQuery) -> None:
+    if not _is_moderator(call.from_user.id):
+        await call.answer("Доступно только Founder и Administrator.", show_alert=True)
+        return
+    try:
+        _, _, _, raw_order_id, raw_page = call.data.split(":")
+        order_id = int(raw_order_id)
+        page = max(0, int(raw_page))
+    except (ValueError, IndexError):
+        await call.answer("Некорректный заказ.", show_alert=True)
+        return
+
+    order = await db_get_active_order_summary(order_id)
+    back_button = InlineKeyboardButton(
+        text="⬅️ К активным заказам",
+        callback_data=f"adm:active_orders:page:{page}",
+    )
+    if not order:
+        await send_or_edit(
+            call,
+            f"Заказ #{order_id} больше не активен.",
+            InlineKeyboardMarkup(inline_keyboard=[[back_button]]),
+        )
+        await call.answer()
+        return
+
+    assigned_to = int(order["assigned_to"]) if order.get("assigned_to") else None
+    if assigned_to == call.from_user.id:
+        full_order = await db_get_active_order_for_assignee(
+            order_id, call.from_user.id
+        )
+        if full_order:
+            action_rows = [
+                list(row) for row in _staff_order_keyboard(full_order).inline_keyboard
+            ]
+            action_rows.append([back_button])
+            await send_or_edit(
+                call,
+                _active_order_full_text(full_order),
+                InlineKeyboardMarkup(inline_keyboard=action_rows),
+            )
+            await call.answer()
+            return
+
+        # Назначение или статус могли измениться после загрузки безопасной сводки.
+        order = await db_get_active_order_summary(order_id)
+        if not order:
+            await send_or_edit(
+                call,
+                f"Заказ #{order_id} больше не активен.",
+                InlineKeyboardMarkup(inline_keyboard=[[back_button]]),
+            )
+            await call.answer()
+            return
+
+    text = _active_order_summary_text(order)
+    if order.get("assigned_to"):
+        text += "\n\n🔒 Данные покупателя видны только назначенному исполнителю."
+    else:
+        text += "\n\n🔒 Данные покупателя появятся после назначения исполнителя."
+    await send_or_edit(
+        call,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=[[back_button]]),
+    )
     await call.answer()
 
 
