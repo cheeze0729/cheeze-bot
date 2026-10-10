@@ -536,6 +536,9 @@ async def db_init() -> None:
                 gamepass_price INTEGER,
                 assigned_to BIGINT,
                 assigned_at TEXT,
+                purchase_key TEXT,
+                confirm_pending_at TEXT,
+                confirm_message_id BIGINT,
                 created_at TEXT NOT NULL
             )
         """)
@@ -588,6 +591,18 @@ async def db_init() -> None:
                 kind       TEXT NOT NULL,
                 reason     TEXT,
                 created_at TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS topup_requests (
+                id            SERIAL PRIMARY KEY,
+                tg_id         BIGINT NOT NULL,
+                amount        NUMERIC(12,2) NOT NULL,
+                payment_code  TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'awaiting_payment',
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                decided_by    BIGINT
             )
         """)
         await conn.execute("""
@@ -799,6 +814,24 @@ async def db_init() -> None:
             "ALTER TABLE orders ADD COLUMN IF NOT EXISTS "
             "confirm_pending BOOLEAN NOT NULL DEFAULT FALSE"
         )
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS purchase_key TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS confirm_pending_at TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS confirm_message_id BIGINT"
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS orders_purchase_key_unique "
+            "ON orders (purchase_key) WHERE purchase_key IS NOT NULL"
+        )
+        await conn.execute(
+            "UPDATE orders SET confirm_pending_at = $1 "
+            "WHERE confirm_pending = TRUE AND confirm_pending_at IS NULL",
+            datetime.now(timezone.utc).isoformat(),
+        )
         # Миграция: переводим денежные колонки в NUMERIC для поддержки копеек
         await conn.execute("""
             DO $$
@@ -891,30 +924,153 @@ async def db_add_balance(tg_id: int, amount: float) -> float:
     return await db_get_balance(tg_id)
 
 
+async def _db_credit_balance_in_transaction(
+    conn, tg_id: int, amount: float, kind: str, reason: str | None = None
+) -> float:
+    row = await conn.fetchrow(
+        "UPDATE users SET balance = balance + $1 WHERE tg_id = $2 RETURNING balance",
+        amount, tg_id,
+    )
+    if not row:
+        raise ValueError(f"Пользователь {tg_id} не найден при начислении баланса.")
+    await conn.execute(
+        "INSERT INTO transactions (tg_id, amount, kind, reason, created_at)"
+        " VALUES ($1, $2, $3, $4, $5)",
+        tg_id, amount, kind, reason,
+        datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    return float(row["balance"])
+
+
 async def db_credit_balance(
     tg_id: int, amount: float, kind: str, reason: str | None = None
 ) -> float:
-    """Атомарно начисляет/списывает баланс и записывает транзакцию.
-    Оба действия выполняются в одной БД-транзакции — никакого расхождения при сбое.
-    amount: положительное — начисление, отрицательное — списание.
-    Возвращает новый баланс."""
+    """Атомарно начисляет/списывает баланс и записывает транзакцию."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(
-                "UPDATE users SET balance = balance + $1 WHERE tg_id = $2",
-                amount, tg_id,
+            return await _db_credit_balance_in_transaction(
+                conn, tg_id, amount, kind, reason
+            )
+
+
+async def db_refund_order(order_id: int, reason: str) -> dict:
+    """Одной транзакцией блокирует заказ, возвращает баланс и записывает ledger."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            order = await conn.fetchrow(
+                "SELECT tg_id, price, status FROM orders WHERE id = $1 FOR UPDATE",
+                order_id,
+            )
+            if not order:
+                return {"status": "not_found"}
+            if order["status"] == ORDER_STATUS_REFUNDED:
+                return {"status": "already_refunded"}
+
+            tg_id = int(order["tg_id"])
+            amount = float(order["price"])
+            balance = await _db_credit_balance_in_transaction(
+                conn,
+                tg_id,
+                amount,
+                "refund",
+                f"Возврат по заказу #{order_id}: {reason}",
             )
             await conn.execute(
-                "INSERT INTO transactions (tg_id, amount, kind, reason, created_at)"
-                " VALUES ($1, $2, $3, $4, $5)",
-                tg_id, amount, kind, reason,
-                datetime.utcnow().isoformat(timespec="seconds"),
+                "UPDATE orders SET status = $1 WHERE id = $2",
+                ORDER_STATUS_REFUNDED, order_id,
             )
+            return {
+                "status": "refunded",
+                "tg_id": tg_id,
+                "amount": amount,
+                "balance": balance,
+            }
+
+
+async def db_create_topup_request(
+    tg_id: int, amount: int, payment_code: str
+) -> int:
+    pool = await get_pool()
+    now = datetime.now(timezone.utc).isoformat()
+    request_id = await pool.fetchval(
+        """
+        INSERT INTO topup_requests
+            (tg_id, amount, payment_code, status, created_at, updated_at)
+        VALUES ($1, $2, $3, 'awaiting_payment', $4, $4)
+        RETURNING id
+        """,
+        tg_id, amount, payment_code, now,
+    )
+    return int(request_id)
+
+
+async def db_mark_topup_request_paid(
+    request_id: int, tg_id: int
+) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
             row = await conn.fetchrow(
-                "SELECT balance FROM users WHERE tg_id = $1", tg_id
+                "SELECT * FROM topup_requests WHERE id = $1 FOR UPDATE",
+                request_id,
             )
-            return float(row["balance"]) if row else 0.0
+            if not row or int(row["tg_id"]) != tg_id:
+                return None
+            if row["status"] == "awaiting_payment":
+                row = await conn.fetchrow(
+                    "UPDATE topup_requests "
+                    "SET status = 'pending', updated_at = $2 "
+                    "WHERE id = $1 RETURNING *",
+                    request_id, datetime.now(timezone.utc).isoformat(),
+                )
+            return dict(row)
+
+
+async def db_process_topup_request(
+    request_id: int, staff_id: int, *, approve: bool
+) -> dict:
+    """Обрабатывает заявку строго один раз вместе с начислением баланса."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            request = await conn.fetchrow(
+                "SELECT * FROM topup_requests WHERE id = $1 FOR UPDATE",
+                request_id,
+            )
+            if not request:
+                return {"status": "not_found"}
+            if request["status"] != "pending":
+                return {"status": str(request["status"])}
+
+            tg_id = int(request["tg_id"])
+            amount = float(request["amount"])
+            now = datetime.now(timezone.utc).isoformat()
+            if approve:
+                balance = await _db_credit_balance_in_transaction(
+                    conn,
+                    tg_id,
+                    amount,
+                    "topup",
+                    f"Пополнение баланса (код: {request['payment_code']})",
+                )
+                status = "approved"
+            else:
+                balance = None
+                status = "rejected"
+            await conn.execute(
+                "UPDATE topup_requests SET status = $1, updated_at = $2, "
+                "decided_by = $3 WHERE id = $4",
+                status, now, staff_id, request_id,
+            )
+            return {
+                "status": status,
+                "tg_id": tg_id,
+                "amount": amount,
+                "payment_code": str(request["payment_code"]),
+                "balance": balance,
+            }
 
 
 async def db_try_charge(tg_id: int, amount: float) -> bool:
@@ -959,6 +1115,116 @@ async def db_create_order(
     return order_id
 
 
+async def db_create_paid_order(
+    tg_id: int,
+    title: str,
+    price: float,
+    *,
+    purchase_key: str,
+    status: str = ORDER_STATUS_CREATED,
+    category: str | None = None,
+    gamepass_price: int | None = None,
+    login_data: str | None = None,
+    ref_promo_id: int | None = None,
+) -> dict:
+    """Атомарно списывает баланс, помечает промо и создаёт заказ с ledger-записью.
+
+    purchase_key защищает повторную доставку callback-а от повторного списания.
+    """
+    if not purchase_key:
+        raise ValueError("Для покупки обязателен ключ идемпотентности.")
+    if price < 0:
+        raise ValueError("Стоимость заказа не может быть отрицательной.")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            user_row = await conn.fetchrow(
+                "SELECT balance FROM users WHERE tg_id = $1 FOR UPDATE",
+                tg_id,
+            )
+            if not user_row:
+                return {"status": "missing_user"}
+
+            existing = await conn.fetchrow(
+                "SELECT id, tg_id FROM orders WHERE purchase_key = $1",
+                purchase_key,
+            )
+            if existing:
+                if int(existing["tg_id"]) != tg_id:
+                    return {"status": "key_conflict"}
+                return {
+                    "status": "already_created",
+                    "order_id": int(existing["id"]),
+                    "balance": float(user_row["balance"]),
+                }
+
+            balance = float(user_row["balance"])
+            if balance < price:
+                return {"status": "insufficient_funds", "balance": balance}
+
+            order_id = await conn.fetchval(
+                """
+                INSERT INTO orders
+                    (tg_id, title, price, status, category, gamepass_price,
+                     login_data, purchase_key, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT DO NOTHING
+                RETURNING id
+                """,
+                tg_id, title, price, status, category, gamepass_price,
+                login_data, purchase_key,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+            if order_id is None:
+                existing = await conn.fetchrow(
+                    "SELECT id, tg_id FROM orders WHERE purchase_key = $1",
+                    purchase_key,
+                )
+                if existing and int(existing["tg_id"]) == tg_id:
+                    return {
+                        "status": "already_created",
+                        "order_id": int(existing["id"]),
+                        "balance": balance,
+                    }
+                return {"status": "key_conflict"}
+
+            if ref_promo_id is not None:
+                if not await _db_use_promo_in_transaction(
+                    conn, tg_id, ref_promo_id
+                ):
+                    await conn.execute("DELETE FROM orders WHERE id = $1", order_id)
+                    return {"status": "promo_unavailable"}
+
+            balance_row = await conn.fetchrow(
+                "UPDATE users SET balance = balance - $1 "
+                "WHERE tg_id = $2 RETURNING balance",
+                price, tg_id,
+            )
+            await conn.execute(
+                "INSERT INTO transactions (tg_id, amount, kind, reason, created_at) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                tg_id, -price, "purchase", f"Заказ #{order_id}: {title}",
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+            return {
+                "status": "created",
+                "order_id": int(order_id),
+                "balance": float(balance_row["balance"]),
+            }
+
+
+async def db_get_order_by_purchase_key(
+    tg_id: int, purchase_key: str
+) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT id, status FROM orders WHERE tg_id = $1 AND purchase_key = $2",
+        tg_id, purchase_key,
+    )
+    return dict(row) if row else None
+
+
 async def db_set_order_status(order_id: int, status: str) -> None:
     pool = await get_pool()
     await pool.execute(
@@ -969,10 +1235,60 @@ async def db_set_order_status(order_id: int, status: str) -> None:
 
 async def db_set_confirm_pending(order_id: int, value: bool) -> None:
     pool = await get_pool()
+    if value:
+        await pool.execute(
+            "UPDATE orders SET confirm_pending = TRUE, confirm_pending_at = $1, "
+            "confirm_message_id = NULL WHERE id = $2",
+            datetime.now(timezone.utc).isoformat(), order_id,
+        )
+    else:
+        await pool.execute(
+            "UPDATE orders SET confirm_pending = FALSE, confirm_pending_at = NULL, "
+            "confirm_message_id = NULL WHERE id = $1",
+            order_id,
+        )
+
+
+async def db_set_confirm_message_id(order_id: int, message_id: int) -> None:
+    pool = await get_pool()
     await pool.execute(
-        "UPDATE orders SET confirm_pending = $1 WHERE id = $2",
-        value, order_id,
+        "UPDATE orders SET confirm_message_id = $1 "
+        "WHERE id = $2 AND confirm_pending = TRUE",
+        message_id, order_id,
     )
+
+
+async def db_get_confirm_pending_details(order_id: int) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT tg_id, assigned_to, confirm_pending_at, confirm_message_id "
+        "FROM orders WHERE id = $1 AND confirm_pending = TRUE",
+        order_id,
+    )
+    return dict(row) if row else None
+
+
+async def db_list_confirm_pending_orders() -> list[dict]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT id, tg_id FROM orders WHERE confirm_pending = TRUE"
+    )
+    return [dict(row) for row in rows]
+
+
+async def db_claim_confirm_pending(order_id: int) -> dict | None:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        UPDATE orders
+        SET confirm_pending = FALSE,
+            confirm_pending_at = NULL
+        WHERE id = $1 AND confirm_pending = TRUE
+        RETURNING tg_id, assigned_to, confirm_message_id
+        """,
+        order_id,
+    )
+    return dict(row) if row else None
 
 
 async def db_get_confirm_pending(order_id: int) -> bool:
@@ -2038,59 +2354,64 @@ async def db_claim_promo(tg_id: int, promo_id: int) -> bool:
         return False
 
 
-async def db_use_promo(tg_id: int, promo_id: int) -> bool:
-    """Помечает промокод как использованный.
-    Если достигнут лимит max_uses — автоматически деактивирует промокод.
-    Возвращает False, если уже использован или лимит исчерпан."""
+async def _db_use_promo_in_transaction(
+    conn, tg_id: int, promo_id: int
+) -> bool:
+    """Отмечает пользовательский промокод использованным внутри текущей транзакции."""
     now = datetime.now(timezone.utc).isoformat()
+    row = await conn.fetchrow(
+        "SELECT used_at FROM user_promos "
+        "WHERE tg_id = $1 AND promo_id = $2 FOR UPDATE",
+        tg_id, promo_id,
+    )
+    if not row or row["used_at"] is not None:
+        return False
+
+    promo_row = await conn.fetchrow(
+        "SELECT max_uses FROM promo_codes WHERE id = $1 FOR UPDATE",
+        promo_id,
+    )
+    if not promo_row:
+        return False
+
+    max_uses = promo_row["max_uses"]
+    if max_uses is not None:
+        used_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_promos "
+            "WHERE promo_id = $1 AND used_at IS NOT NULL",
+            promo_id,
+        )
+        if int(used_count or 0) >= max_uses:
+            await conn.execute(
+                "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
+                promo_id,
+            )
+            return False
+
+    await conn.execute(
+        "UPDATE user_promos SET used_at = $1 WHERE tg_id = $2 AND promo_id = $3",
+        now, tg_id, promo_id,
+    )
+    if max_uses is not None:
+        new_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_promos "
+            "WHERE promo_id = $1 AND used_at IS NOT NULL",
+            promo_id,
+        )
+        if int(new_count or 0) >= max_uses:
+            await conn.execute(
+                "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
+                promo_id,
+            )
+    return True
+
+
+async def db_use_promo(tg_id: int, promo_id: int) -> bool:
+    """Помечает промокод использованным в отдельной транзакции."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Проверяем, не использован ли уже промокод этим пользователем
-            row = await conn.fetchrow(
-                "SELECT used_at FROM user_promos WHERE tg_id = $1 AND promo_id = $2",
-                tg_id, promo_id,
-            )
-            if not row or row["used_at"] is not None:
-                return False
-            # Получаем лимит активаций (с блокировкой строки)
-            promo_row = await conn.fetchrow(
-                "SELECT max_uses FROM promo_codes WHERE id = $1 FOR UPDATE",
-                promo_id,
-            )
-            max_uses = promo_row["max_uses"] if promo_row else None
-            # Проверяем лимит до записи
-            if max_uses is not None:
-                used_count = await conn.fetchval(
-                    "SELECT COUNT(*) FROM user_promos "
-                    "WHERE promo_id = $1 AND used_at IS NOT NULL",
-                    promo_id,
-                )
-                if int(used_count) >= max_uses:
-                    # Лимит исчерпан — деактивируем и отказываем
-                    await conn.execute(
-                        "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
-                        promo_id,
-                    )
-                    return False
-            # Помечаем как использованный
-            await conn.execute(
-                "UPDATE user_promos SET used_at = $1 WHERE tg_id = $2 AND promo_id = $3",
-                now, tg_id, promo_id,
-            )
-            # Проверяем, исчерпан ли лимит теперь — деактивируем автоматически
-            if max_uses is not None:
-                new_count = await conn.fetchval(
-                    "SELECT COUNT(*) FROM user_promos "
-                    "WHERE promo_id = $1 AND used_at IS NOT NULL",
-                    promo_id,
-                )
-                if int(new_count) >= max_uses:
-                    await conn.execute(
-                        "UPDATE promo_codes SET is_active = FALSE WHERE id = $1",
-                        promo_id,
-                    )
-            return True
+            return await _db_use_promo_in_transaction(conn, tg_id, promo_id)
 
 
 async def db_get_user_promos(tg_id: int) -> list[dict]:
@@ -2686,10 +3007,10 @@ def kb_topup_confirm() -> InlineKeyboardMarkup:
     )
 
 
-def kb_topup_pay(amount: int, code: str) -> InlineKeyboardMarkup:
+def kb_topup_pay(amount: int, code: str, request_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{amount}:{code}")],
+            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{request_id}")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
         ]
     )
@@ -4661,8 +4982,13 @@ async def _show_purchase_confirm(call: CallbackQuery, state: FSMContext) -> None
         price_block = f"💰 К оплате: <b>{_fmt_price(final_price)}₽</b>"
 
     enough = balance >= final_price
+    promo_note = (
+        "⚠️ Промокод больше нельзя применить. Проверьте пересчитанную цену.\n\n"
+        if data.get("_pnd_promo_unavailable") else ""
+    )
     text = (
-        "🛒 <b>Подтверждение оплаты</b>\n\n"
+        promo_note
+        + "🛒 <b>Подтверждение оплаты</b>\n\n"
         f"📦 {escape(title)}\n\n"
         f"{price_block}\n"
         f"💼 Ваш баланс: <b>{_fmt_price(balance)}₽</b>\n\n"
@@ -4681,6 +5007,8 @@ async def _show_purchase_confirm(call: CallbackQuery, state: FSMContext) -> None
             [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
         ])
     await send_or_edit(call, text, kb)
+    if promo_note:
+        await state.update_data(_pnd_promo_unavailable=False)
 
 
 async def _normalize_pending_purchase_discounts(
@@ -4819,6 +5147,7 @@ async def perform_purchase(
             _pnd_ldsc=level_disc,
             _pnd_pdsc=promo_disc,
             _pnd_pid=applied_ref_promo_id,
+            _pnd_purchase_key=secrets.token_urlsafe(18),
         )
 
     # Напоминание о неиспользованном промокоде на скидку.
@@ -4942,67 +5271,97 @@ async def cb_confirm_purchase(call: CallbackQuery, state: FSMContext) -> None:
         return
 
     user = call.from_user
+    purchase_key = data.get("_pnd_purchase_key")
+    if not purchase_key:
+        purchase_key = secrets.token_urlsafe(18)
+        await state.update_data(_pnd_purchase_key=purchase_key)
+    pre_login = data.get("_pnd_pre_login")
 
     if user.id in _processing_payments:
         await call.answer("Платёж уже обрабатывается, подождите...", show_alert=True)
         return
-    await call.answer()
+
+    gamepass_price = None
+    if category == "roblox_gamepass" and extra:
+        raw_gamepass_price = extra.get("gamepass_price")
+        if raw_gamepass_price:
+            gamepass_price = int(raw_gamepass_price)
+
     _processing_payments.add(user.id)
     try:
-        ok = await db_try_charge(user.id, final_price)
-        if not ok:
-            balance = await db_get_balance(user.id)
-            text = (
-                "❌ <b>Недостаточно средств на балансе.</b>\n\n"
-                f"Сумма заказа: {_fmt_price(final_price)}₽\n"
-                f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
-                "Пополните баланс и повторите попытку."
-            )
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
-                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-            ])
-            await send_or_edit(call, text, kb)
-            return
-
-        gamepass_price = None
-        if category == "roblox_gamepass" and extra:
-            raw_gamepass_price = extra.get("gamepass_price")
-            if raw_gamepass_price:
-                gamepass_price = int(raw_gamepass_price)
-        order_id = await db_create_order(
+        payment = await db_create_paid_order(
             user.id,
             title,
             final_price,
+            purchase_key=purchase_key,
             status=ORDER_STATUS_CREATED,
             category=category,
             gamepass_price=gamepass_price,
-        )
-        await db_add_transaction(user.id, -final_price, kind="purchase",
-                                 reason=f"Заказ #{order_id}: {title}")
-
-        if applied_ref_promo_id:
-            await db_use_promo(user.id, applied_ref_promo_id)
-            await db_set_active_ref_promo(user.id, None)
-
-        # Сохраняем данные для входа, введённые ДО оплаты
-        pre_login = data.get("_pnd_pre_login")
-        if pre_login:
-            await db_set_order_login(order_id, pre_login)
-
-        # Сбрасываем pending-данные и FSM-состояние (могло остаться waiting_pre_purchase_login)
-        await state.set_state(None)
-        await state.update_data(
-            _pnd_title=None, _pnd_final=None, _pnd_orig=None,
-            _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
-            _pnd_pdsc=None, _pnd_pid=None, _pnd_pre_login=None,
-            _pnd_product_key=None, _pre_product_key=None,
-            _pre_title=None, _pre_price=None, _pre_cat=None, _pre_extra=None,
+            login_data=pre_login,
+            ref_promo_id=applied_ref_promo_id,
         )
     finally:
         _processing_payments.discard(user.id)
 
-    new_balance = await db_get_balance(user.id)
+    if payment["status"] == "insufficient_funds":
+        balance = payment["balance"]
+        await call.answer("Недостаточно средств.", show_alert=True)
+        text = (
+            "❌ <b>Недостаточно средств на балансе.</b>\n\n"
+            f"Сумма заказа: {_fmt_price(final_price)}₽\n"
+            f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
+            "Пополните баланс и повторите попытку."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await send_or_edit(call, text, kb)
+        return
+
+    if payment["status"] == "promo_unavailable":
+        await call.answer(
+            "Промокод уже использован или больше недоступен. Цена пересчитана.",
+            show_alert=True,
+        )
+        new_final = original_price * (1 - level_disc / 100)
+        await state.update_data(
+            _pnd_final=new_final,
+            _pnd_pdsc=0,
+            _pnd_pid=None,
+            _pnd_promo_unavailable=True,
+        )
+        await _show_purchase_confirm(call, state)
+        return
+
+    if payment["status"] not in ("created", "already_created"):
+        logging.error(
+            "Не удалось создать заказ пользователя %s: %s",
+            user.id, payment["status"],
+        )
+        await call.answer(
+            "Не удалось обработать покупку. Обратитесь в поддержку.",
+            show_alert=True,
+        )
+        return
+
+    await call.answer()
+    order_id = int(payment["order_id"])
+    new_balance = payment["balance"]
+    if applied_ref_promo_id and payment["status"] == "created":
+        await db_set_active_ref_promo(user.id, None)
+
+    # Сбрасываем pending-данные и FSM-состояние (могло остаться waiting_pre_purchase_login)
+    await state.set_state(None)
+    await state.update_data(
+        _pnd_title=None, _pnd_final=None, _pnd_orig=None,
+        _pnd_cat=None, _pnd_extra=None, _pnd_ldsc=None,
+        _pnd_pdsc=None, _pnd_pid=None, _pnd_pre_login=None,
+        _pnd_product_key=None, _pnd_purchase_key=None,
+        _pnd_promo_unavailable=False,
+        _pre_product_key=None, _pre_title=None, _pre_price=None,
+        _pre_cat=None, _pre_extra=None,
+    )
     # Текст после оплаты: сначала берём текст из админки, затем встроенный дефолт
     if category in LOGIN_HINTS:
         login_hint = await _get_login_hint(category)
@@ -5800,6 +6159,7 @@ async def cb_topup_go(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Сумма не задана.", show_alert=True)
         return
     code = f"{secrets.randbelow(1_000_000):06d}"
+    request_id = await db_create_topup_request(call.from_user.id, amount, code)
     text = (
         f"💳 <b>Оплатите {amount}₽</b> по реквизитам ниже:\n\n"
         f"{CARD_DETAILS}\n\n"
@@ -5812,21 +6172,42 @@ async def cb_topup_go(call: CallbackQuery, state: FSMContext) -> None:
         "После оплаты нажмите «Я оплатил» — заявка отправится модератору "
         "на проверку, и баланс начислится после подтверждения."
     )
-    await show_section(call, "topup", text, kb_topup_pay(amount, code))
+    await show_section(
+        call, "topup", text, kb_topup_pay(amount, code, request_id)
+    )
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("paid:"))
 async def cb_paid(call: CallbackQuery) -> None:
-    await call.answer("Заявка отправлена")
     parts = call.data.split(":")
     try:
-        amount = int(parts[1])
+        if len(parts) != 2:
+            raise ValueError("устаревший формат")
+        request_id = int(parts[1])
     except (ValueError, IndexError):
+        await call.answer(
+            "Эта заявка устарела. Создайте новую заявку на пополнение.",
+            show_alert=True,
+        )
         return
-    code = parts[2] if len(parts) > 2 else ""
 
     user = call.from_user
+    request = await db_mark_topup_request_paid(request_id, user.id)
+    if not request:
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+    if request["status"] != "pending":
+        status_text = {
+            "approved": "Заявка уже подтверждена.",
+            "rejected": "Заявка отклонена. Обратитесь в поддержку, если оплата была выполнена.",
+        }.get(request["status"], "Заявка уже обработана.")
+        await call.answer(status_text, show_alert=True)
+        return
+
+    amount = int(request["amount"])
+    code = str(request["payment_code"])
+    await call.answer("Заявка отправлена")
     username = f"@{user.username}" if user.username else "—"
 
     text = (
@@ -5848,11 +6229,11 @@ async def cb_paid(call: CallbackQuery) -> None:
             [
                 InlineKeyboardButton(
                     text="✅ Подтвердить",
-                    callback_data=f"tpconf:{user.id}:{amount}:{code}",
+                    callback_data=f"tpconf:{request_id}",
                 ),
                 InlineKeyboardButton(
                     text="❌ Отклонить",
-                    callback_data=f"tprej:{user.id}:{amount}:{code}",
+                    callback_data=f"tprej:{request_id}",
                 ),
             ],
         ]
@@ -5882,15 +6263,32 @@ async def cb_topup_admin_confirm(call: CallbackQuery) -> None:
         return
     try:
         parts = call.data.split(":")
-        target_id = int(parts[1])
-        amount = int(parts[2])
-        code = parts[3] if len(parts) > 3 else ""
+        if len(parts) != 2:
+            raise ValueError("устаревший формат")
+        request_id = int(parts[1])
     except (ValueError, IndexError):
-        await call.answer("Некорректные данные.", show_alert=True)
+        await call.answer(
+            "Эта кнопка устарела. Начисление по ней не выполнено.",
+            show_alert=True,
+        )
         return
 
-    reason = f"Пополнение баланса (код: {code})" if code else "Пополнение баланса"
-    new_balance = await db_credit_balance(target_id, amount, kind="topup", reason=reason)
+    result = await db_process_topup_request(
+        request_id, call.from_user.id, approve=True
+    )
+    if result["status"] == "not_found":
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+    if "balance" not in result:
+        await call.answer(
+            "Заявка уже обработана; повторного начисления не было.",
+            show_alert=True,
+        )
+        return
+
+    target_id = result["tg_id"]
+    amount = result["amount"]
+    new_balance = result["balance"]
 
     try:
         old = call.message.text or call.message.caption or ""
@@ -5898,6 +6296,7 @@ async def cb_topup_admin_confirm(call: CallbackQuery) -> None:
             f"{old}\n\n✅ <b>Подтверждено.</b> Баланс пользователя: {_fmt_price(new_balance)}₽",
             parse_mode="HTML",
         )
+        await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
@@ -5928,18 +6327,38 @@ async def cb_topup_admin_reject(call: CallbackQuery) -> None:
         return
     try:
         parts = call.data.split(":")
-        target_id = int(parts[1])
-        amount = int(parts[2])
+        if len(parts) != 2:
+            raise ValueError("устаревший формат")
+        request_id = int(parts[1])
     except (ValueError, IndexError):
-        await call.answer("Некорректные данные.", show_alert=True)
+        await call.answer(
+            "Эта кнопка устарела. Отклонение по ней не выполнено.",
+            show_alert=True,
+        )
         return
 
+    result = await db_process_topup_request(
+        request_id, call.from_user.id, approve=False
+    )
+    if result["status"] == "not_found":
+        await call.answer("Заявка не найдена.", show_alert=True)
+        return
+    if "tg_id" not in result:
+        await call.answer(
+            "Заявка уже обработана; повторное действие не выполнено.",
+            show_alert=True,
+        )
+        return
+
+    target_id = result["tg_id"]
+    amount = result["amount"]
     try:
         old = call.message.text or call.message.caption or ""
         await call.message.edit_text(
             f"{old}\n\n❌ <b>Отклонено.</b>",
             parse_mode="HTML",
         )
+        await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
@@ -5965,21 +6384,46 @@ RECEIPT_CONFIRM_TIMEOUT = 30 * 60  # секунд
 
 
 async def _auto_confirm_receipt(
-    order_id: int, tg_id: int, confirm_msg_id: int | None = None
+    order_id: int, tg_id: int | None = None, confirm_msg_id: int | None = None
 ) -> None:
-    """Через 30 минут автоматически подтверждает заказ, если покупатель не ответил."""
-    await asyncio.sleep(RECEIPT_CONFIRM_TIMEOUT)
-    still_pending = await db_get_confirm_pending(order_id)
-    if not still_pending:
-        return  # пользователь уже нажал кнопку
+    """Восстанавливает срок ожидания из БД и атомарно забирает истёкший таймер."""
+    while True:
+        pending = await db_get_confirm_pending_details(order_id)
+        if not pending:
+            return
 
-    await db_set_confirm_pending(order_id, False)
+        started_at_raw = pending.get("confirm_pending_at")
+        try:
+            started_at = datetime.fromisoformat(started_at_raw)
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            logging.warning(
+                "Некорректное время таймера подтверждения заказа #%s; "
+                "считаю срок ожидания истёкшим.",
+                order_id,
+            )
+            started_at = datetime.now(timezone.utc) - timedelta(
+                seconds=RECEIPT_CONFIRM_TIMEOUT
+            )
+
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        remaining = RECEIPT_CONFIRM_TIMEOUT - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+            continue
+
+        claimed = await db_claim_confirm_pending(order_id)
+        if not claimed:
+            return
+        tg_id = int(claimed["tg_id"])
+        confirm_msg_id = claimed.get("confirm_message_id") or confirm_msg_id
+        auto_recipient = (
+            int(claimed["assigned_to"]) if claimed.get("assigned_to") else None
+        )
+        break
 
     # Уведомляем только того, кто взял заказ
-    auto_order = await db_get_order(order_id)
-    auto_recipient = int(auto_order["assigned_to"]) if (
-        auto_order and auto_order.get("assigned_to")
-    ) else None
     if auto_recipient is not None:
         try:
             await bot.send_message(
@@ -6037,6 +6481,15 @@ async def _auto_confirm_receipt(
         )
     except Exception:
         pass
+
+
+async def _resume_pending_receipt_timers() -> None:
+    """Запускает таймеры, сохранённые до последнего перезапуска."""
+    pending = await db_list_confirm_pending_orders()
+    for row in pending:
+        asyncio.create_task(_auto_confirm_receipt(int(row["id"])))
+    if pending:
+        logging.info("Восстановлено таймеров авто-подтверждения: %s", len(pending))
 
 
 # =====================================================================
@@ -6146,21 +6599,36 @@ async def cb_order_done(call: CallbackQuery) -> None:
                 ],
             ]
         )
-        await bot.send_message(
-            target_id,
-            f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
-            "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
-            "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
-            "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
-            "прислать скриншот из игры в качестве доказательства.\n\n"
-            "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
-            parse_mode="HTML",
-            reply_markup=user_kb,
-        )
         await db_set_confirm_pending(order_id, True)
-        asyncio.create_task(_auto_confirm_receipt(order_id, target_id))
+        try:
+            confirm_msg = await bot.send_message(
+                target_id,
+                f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+                "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
+                "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
+                "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
+                "прислать скриншот из игры в качестве доказательства.\n\n"
+                "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
+                parse_mode="HTML",
+                reply_markup=user_kb,
+            )
+        except Exception as e:
+            await db_set_confirm_pending(order_id, False)
+            logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
+        else:
+            try:
+                await db_set_confirm_message_id(order_id, confirm_msg.message_id)
+            except Exception as e:
+                logging.warning(
+                    "Не удалось сохранить id сообщения подтверждения #%s: %s",
+                    order_id, e,
+                )
+            asyncio.create_task(_auto_confirm_receipt(order_id))
     except Exception as e:
-        logging.warning(f"Не удалось уведомить пользователя {target_id}: {e}")
+        logging.warning(
+            "Не удалось подготовить подтверждение заказа #%s: %s",
+            order_id, e,
+        )
 
     try:
         await bot.unpin_chat_message(call.message.chat.id, call.message.message_id)
@@ -6232,13 +6700,17 @@ async def cb_confirm_receipt(call: CallbackQuery) -> None:
         await call.answer("Заказ не найден.", show_alert=True)
         return
 
-    # Если таймер уже сработал — флаг сброшен, просто показываем успех
-    await db_set_confirm_pending(order_id, False)
+    # Только один из ручного подтверждения и таймера забирает активное ожидание.
+    pending_claim = await db_claim_confirm_pending(order_id)
 
     user = call.from_user
     username = f"@{user.username}" if user.username else "—"
     # Уведомляем только того, кто взял заказ
-    confirm_recipient = int(order["assigned_to"]) if order.get("assigned_to") else None
+    confirm_recipient = (
+        int(pending_claim["assigned_to"])
+        if pending_claim and pending_claim.get("assigned_to")
+        else None
+    )
     if confirm_recipient is not None:
         try:
             await bot.send_message(
@@ -6285,6 +6757,8 @@ async def cb_reject_receipt(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Заказ не найден.", show_alert=True)
         return
 
+    # Пока покупатель присылает доказательство, авто-подтверждение не должно закрыть заказ.
+    await db_set_confirm_pending(order_id, False)
     await state.set_state(ShopStates.waiting_reject_screenshot)
     await state.update_data(reject_order_id=order_id)
 
@@ -6575,8 +7049,8 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
     order = await db_get_order(order_id)
     title = order["title"] if order else "—"
 
-    # Текст показываем в заголовке, фото отдельно. Так комментарий виден
-    # каждому сотруднику, а при публикации не дублируется вторым сообщением.
+    # Комментарий остаётся в сводке бота, а отдельный Telegram-forward
+    # сохраняет исходного автора и метку «Forwarded from» при публикации.
     # Рассылаем отзыв всем Founder + Administrator + Moderator
     review_recipients = await db_get_can_moderate_recipients()
     buyer_id = message.from_user.id
@@ -6590,6 +7064,11 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
         rid = int(staff["tg_id"])
         try:
             hdr_msg = await bot.send_message(rid, header, parse_mode="HTML")
+            forwarded_comment = await bot.forward_message(
+                chat_id=rid,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
             if photo_id:
                 if photo_is_document:
                     review_image = await bot.send_document(
@@ -6602,14 +7081,16 @@ async def msg_review_text(message: Message, state: FSMContext) -> None:
                 ctrl_msg = await bot.send_message(
                     rid, "⬆️ Управление отзывом:",
                     reply_markup=kb_review_mod(
-                        order_id, buyer_id, hdr_msg.message_id, review_image.message_id,
+                        order_id, buyer_id, hdr_msg.message_id,
+                        review_image.message_id, forwarded_comment.message_id,
                     ),
                 )
             else:
                 ctrl_msg = await bot.send_message(
                     rid, "⬆️ Управление отзывом:",
                     reply_markup=kb_review_mod(
-                        order_id, buyer_id, hdr_msg.message_id,
+                        order_id, buyer_id,
+                        hdr_msg.message_id, forwarded_comment.message_id,
                     ),
                 )
             # Сохраняем ID управляющего сообщения для синхронизации кнопки публикации
@@ -6650,7 +7131,7 @@ async def cb_publish_review(call: CallbackQuery) -> None:
     if not _can_moderate(call.from_user.id):
         await call.answer("Нет доступа.", show_alert=True)
         return
-    # callback_data: pub_review:{order_id}:{msg_id1}[:{msg_id2}]
+    # callback_data: pub_review:{order_id}:{msg_id1}[:{msg_id2}:...]
     parts = call.data.split(":")
     try:
         order_id = int(parts[1])
@@ -10722,10 +11203,23 @@ async def cb_use_promo_confirm(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("use_promo_go:"))
 async def cb_use_promo_go(call: CallbackQuery) -> None:
-    await call.answer()
     try:
         promo_id = int(call.data.split(":")[1])
     except (ValueError, IndexError):
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    user = call.from_user
+    purchase_key = f"promo:{user.id}:{promo_id}"
+    existing_order = await db_get_order_by_purchase_key(user.id, purchase_key)
+    if existing_order:
+        await call.answer("Эта покупка уже была обработана.", show_alert=True)
+        await send_or_edit(
+            call,
+            f"✅ Покупка уже оформлена. Номер заказа: "
+            f"<code>#{existing_order['id']}</code>.",
+            kb_back_main("orders"),
+        )
         return
 
     promo = await db_get_promo_by_id(promo_id)
@@ -10744,7 +11238,6 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         await call.answer("Промокод недействителен или истёк.", show_alert=True)
         return
 
-    user = call.from_user
     price = float(promo["promo_price"])
     title = f"[Промокод {promo['code']}] {promo['game']} — {_promo_product_label(promo)}"
 
@@ -10753,31 +11246,51 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         return
     _processing_payments.add(user.id)
     try:
-        ok = await db_try_charge(user.id, price)
-        if not ok:
-            balance = await db_get_balance(user.id)
-            text = (
-                "❌ <b>Недостаточно средств на балансе.</b>\n\n"
-                f"Сумма заказа: {_fmt_price(price)}₽\n"
-                f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
-                "Пополните баланс и повторите попытку."
-            )
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
-                [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
-            ])
-            await send_or_edit(call, text, kb)
-            return
-
-        order_id = await db_create_order(
-            user.id, title, price, status=ORDER_STATUS_CREATED, category="promo"
+        payment = await db_create_paid_order(
+            user.id,
+            title,
+            price,
+            purchase_key=purchase_key,
+            status=ORDER_STATUS_CREATED,
+            category="promo",
+            ref_promo_id=promo_id,
         )
-        await db_add_transaction(user.id, -price, kind="purchase", reason=f"Заказ #{order_id}: {title}")
-        await db_use_promo(user.id, promo_id)
     finally:
         _processing_payments.discard(user.id)
 
-    new_balance = await db_get_balance(user.id)
+    if payment["status"] == "insufficient_funds":
+        balance = payment["balance"]
+        await call.answer("Недостаточно средств.", show_alert=True)
+        text = (
+            "❌ <b>Недостаточно средств на балансе.</b>\n\n"
+            f"Сумма заказа: {_fmt_price(price)}₽\n"
+            f"Ваш баланс: {_fmt_price(balance)}₽\n\n"
+            "Пополните баланс и повторите попытку."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="main")],
+        ])
+        await send_or_edit(call, text, kb)
+        return
+    if payment["status"] == "promo_unavailable":
+        await call.answer(
+            "Промокод уже использован или больше недоступен.",
+            show_alert=True,
+        )
+        return
+    if payment["status"] not in ("created", "already_created"):
+        logging.error(
+            "Не удалось создать заказ по промокоду для пользователя %s: %s",
+            user.id, payment["status"],
+        )
+        await call.answer("Не удалось обработать покупку.", show_alert=True)
+        return
+
+    await call.answer()
+    order_id = int(payment["order_id"])
+    new_balance = payment["balance"]
+    is_new_order = payment["status"] == "created"
 
     text = (
         "✅ <b>Оплата прошла успешно. Заказ принят в обработку.</b>\n\n"
@@ -10811,9 +11324,10 @@ async def cb_use_promo_go(call: CallbackQuery) -> None:
         [InlineKeyboardButton(text="📧 Запросить код из почты", callback_data=f"mod:req_email:{order_id}:{user.id}")],
         [InlineKeyboardButton(text="💸 Возврат", callback_data=f"mod:refund:{order_id}")],
     ])
-    await notify_moderator_order(
-        admin_text, reply_markup=admin_kb, order_id=order_id
-    )
+    if is_new_order:
+        await notify_moderator_order(
+            admin_text, reply_markup=admin_kb, order_id=order_id
+        )
 
 
 @dp.callback_query(F.data.startswith("mod:done:"))
@@ -10868,23 +11382,35 @@ async def cb_mod_done(call: CallbackQuery) -> None:
                 ],
             ]
         )
-        confirm_msg = await bot.send_message(
-            tg_id,
-            f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
-            "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
-            "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
-            "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
-            "прислать скриншот из игры в качестве доказательства.\n\n"
-            "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
-            parse_mode="HTML",
-            reply_markup=user_kb,
-        )
         await db_set_confirm_pending(order_id, True)
-        asyncio.create_task(
-            _auto_confirm_receipt(order_id, tg_id, confirm_msg.message_id)
+        try:
+            confirm_msg = await bot.send_message(
+                tg_id,
+                f"🎉 <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+                "⚠️ <b>Перед тем как нажать кнопку — проверьте наличие цифрового товара в игре.</b>\n\n"
+                "✅ Нажмите <b>«Подтвердить получение»</b>, если товар зачислен.\n"
+                "❌ Нажмите <b>«Отклонить»</b>, если товар не поступил. В этом случае потребуется "
+                "прислать скриншот из игры в качестве доказательства.\n\n"
+                "⚠️ <b>Внимание:</b> ложное отклонение может привести к блокировке в боте.",
+                parse_mode="HTML",
+                reply_markup=user_kb,
+            )
+        except Exception:
+            await db_set_confirm_pending(order_id, False)
+        else:
+            try:
+                await db_set_confirm_message_id(order_id, confirm_msg.message_id)
+            except Exception as e:
+                logging.warning(
+                    "Не удалось сохранить id сообщения подтверждения #%s: %s",
+                    order_id, e,
+                )
+            asyncio.create_task(_auto_confirm_receipt(order_id))
+    except Exception as e:
+        logging.warning(
+            "Не удалось подготовить подтверждение заказа #%s: %s",
+            order_id, e,
         )
-    except Exception:
-        pass
 
     await call.answer(f"Заказ #{order_id} отмечен выполненным.", show_alert=True)
     try:
@@ -11063,25 +11589,25 @@ async def msg_mod_refund_reason(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
     order_id: int = data["refund_order_id"]
-    tg_id: int = data["refund_tg_id"]
-    refund_amount: float = data["refund_amount"]
     orig_chat_id: int = data["refund_msg_chat_id"]
     orig_msg_id: int = data["refund_msg_id"]
-    await state.clear()
-
-    # Проверяем — вдруг уже сделан другим модератором
-    order = await db_get_order(order_id)
-    if not order or order.get("status") == "Возврат":
+    refund = await db_refund_order(order_id, reason)
+    if refund["status"] != "refunded":
+        await state.clear()
+        if refund["status"] == "not_found":
+            warning = "⚠️ Заказ не найден; возврат не выполнен."
+        else:
+            warning = "⚠️ Возврат по этому заказу уже был выполнен."
         await _state_edit(
             message, state,
-            "⚠️ Возврат по этому заказу уже был выполнен.",
+            warning,
             InlineKeyboardMarkup(inline_keyboard=[]),
         )
         return
 
-    await db_update_order_status(order_id, "Возврат")
-    await db_credit_balance(tg_id, refund_amount, kind="refund",
-                             reason=f"Возврат по заказу #{order_id}: {reason}")
+    tg_id = refund["tg_id"]
+    refund_amount = refund["amount"]
+    await state.clear()
 
     # Уведомление покупателю с причиной
     try:
@@ -13406,6 +13932,7 @@ async def _preload_local_section_images() -> None:
 async def main() -> None:
     _acquire_single_instance_lock()
     await db_init()
+    await _resume_pending_receipt_timers()
     logging.info("Бот запускается...")
     await _preload_local_section_images()
     await bot.delete_webhook(drop_pending_updates=True)
