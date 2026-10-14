@@ -307,16 +307,6 @@ REFERRAL_LEVELS = {
 REFERRAL_REFS_PER_LEVEL     = 2  # рефералов для перехода на следующий уровень
 REFERRAL_DISCOUNT_PER_LEVEL = 2  # % скидки за каждый уровень
 REFERRAL_PROMOS_PER_LEVELUP = 3  # промокодов за повышение уровня
-CLUB_LEVELS = {
-    1: ("🧀 Новичок", "Значок клуба и прогресс до следующего уровня."),
-    2: ("⭐ Постоянный", "Участие в клубных опросах и предложениях."),
-    3: ("🧪 Pro", "Допуск к тестовым разделам, если их открыл администратор."),
-    4: ("💎 Elite", "Ранний доступ к категориям, выбранным администратором."),
-    5: ("👑 Легенда CHEEZE", "Особый статус и возможность предложить функцию магазину."),
-}
-CLUB_SPEND_THRESHOLDS_SETTING_KEY = "cheese_club_spend_thresholds"
-CATEGORY_ACCESS_MODES = frozenset({"public", "club", "testers"})
-REFERRAL_MILESTONES = (1, 3, 5)
 
 # --- Тексты ---
 WELCOME_TEXT = (
@@ -709,45 +699,8 @@ async def db_init() -> None:
                 id          SERIAL PRIMARY KEY,
                 buyer_id    BIGINT NOT NULL,
                 referrer_id BIGINT NOT NULL,
-                qualifying_order_id BIGINT,
-                is_qualified BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at  TEXT NOT NULL,
                 UNIQUE(buyer_id)
-            )
-        """)
-        await conn.execute(
-            "ALTER TABLE referral_purchases ADD COLUMN IF NOT EXISTS "
-            "qualifying_order_id BIGINT"
-        )
-        await conn.execute(
-            "ALTER TABLE referral_purchases ADD COLUMN IF NOT EXISTS "
-            "is_qualified BOOLEAN NOT NULL DEFAULT TRUE"
-        )
-        await conn.execute("""
-            UPDATE referral_purchases AS rp
-            SET qualifying_order_id = (
-                SELECT o.id FROM orders AS o
-                WHERE o.tg_id = rp.buyer_id
-                  AND o.status IN ($1, 'Выполнен')
-                ORDER BY o.id
-                LIMIT 1
-            )
-            WHERE rp.qualifying_order_id IS NULL
-        """, ORDER_STATUS_COMPLETED)
-        await conn.execute("""
-            UPDATE referral_purchases
-            SET is_qualified = FALSE
-            WHERE is_qualified = TRUE AND qualifying_order_id IS NULL
-        """)
-        await conn.execute("""
-            UPDATE users AS u
-            SET referral_count = (
-                SELECT COUNT(*) FROM referral_purchases AS rp
-                WHERE rp.referrer_id = u.tg_id AND rp.is_qualified = TRUE
-            )
-            WHERE u.referral_count <> (
-                SELECT COUNT(*) FROM referral_purchases AS rp
-                WHERE rp.referrer_id = u.tg_id AND rp.is_qualified = TRUE
             )
         """)
         # Каталог товаров
@@ -794,9 +747,7 @@ async def db_init() -> None:
                 amount_based    BOOLEAN NOT NULL DEFAULT FALSE,
                 amount_unit     TEXT NOT NULL DEFAULT '',
                 amount_rate     NUMERIC(12,4) NOT NULL DEFAULT 1,
-                amount_minimum  INTEGER NOT NULL DEFAULT 1,
-                access_mode     TEXT NOT NULL DEFAULT 'public',
-                min_club_level  INTEGER NOT NULL DEFAULT 0
+                amount_minimum  INTEGER NOT NULL DEFAULT 1
             )
         """)
         await conn.execute("""
@@ -813,11 +764,6 @@ async def db_init() -> None:
                 ('roblox_gamepass', 'Roblox — геймпассом', '🎮', 2, FALSE,
                  'Отправьте ссылку на созданный геймпасс в Roblox.', FALSE),
                 ('tgstars', 'Telegram Stars', '✨', 3, FALSE, NULL, FALSE)
-            ON CONFLICT (key) DO NOTHING
-        """)
-        await conn.execute("""
-            INSERT INTO categories (key, name, emoji, sort_order, disabled)
-            VALUES ('other', 'Другие приложения', '📱', 4, FALSE)
             ON CONFLICT (key) DO NOTHING
         """)
         # Миграция: добавляем встроенные специальные категории если таблица уже была
@@ -837,19 +783,8 @@ async def db_init() -> None:
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS amount_unit TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS amount_rate NUMERIC(12,4) NOT NULL DEFAULT 1",
             "ALTER TABLE categories ADD COLUMN IF NOT EXISTS amount_minimum INTEGER NOT NULL DEFAULT 1",
-            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS access_mode TEXT NOT NULL DEFAULT 'public'",
-            "ALTER TABLE categories ADD COLUMN IF NOT EXISTS min_club_level INTEGER NOT NULL DEFAULT 0",
         ]:
             await conn.execute(col_sql)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS category_access_testers (
-                category_key TEXT NOT NULL REFERENCES categories(key) ON DELETE CASCADE,
-                tg_id        BIGINT NOT NULL,
-                granted_by   BIGINT NOT NULL,
-                created_at   TEXT NOT NULL,
-                PRIMARY KEY (category_key, tg_id)
-            )
-        """)
         # Миграция: добавляем недостающие колонки в products для старых баз
         for col_sql in [
             "ALTER TABLE products ADD COLUMN IF NOT EXISTS delivery TEXT NOT NULL DEFAULT ''",
@@ -1046,37 +981,6 @@ async def db_refund_order(order_id: int, reason: str) -> dict:
                 "UPDATE orders SET status = $1 WHERE id = $2",
                 ORDER_STATUS_REFUNDED, order_id,
             )
-            referral = await conn.fetchrow(
-                "SELECT buyer_id, referrer_id FROM referral_purchases "
-                "WHERE qualifying_order_id = $1 AND is_qualified = TRUE FOR UPDATE",
-                order_id,
-            )
-            if referral:
-                replacement_order_id = await conn.fetchval(
-                    "SELECT id FROM orders WHERE tg_id = $1 AND id <> $2 "
-                    "AND status IN ($3, 'Выполнен') ORDER BY id LIMIT 1",
-                    int(referral["buyer_id"]), order_id, ORDER_STATUS_COMPLETED,
-                )
-                if replacement_order_id:
-                    await conn.execute(
-                        "UPDATE referral_purchases SET qualifying_order_id = $1 "
-                        "WHERE buyer_id = $2 AND is_qualified = TRUE",
-                        int(replacement_order_id), int(referral["buyer_id"]),
-                    )
-                else:
-                    revoked = await conn.fetchval(
-                        "UPDATE referral_purchases "
-                        "SET is_qualified = FALSE, qualifying_order_id = NULL "
-                        "WHERE buyer_id = $1 AND is_qualified = TRUE "
-                        "RETURNING referrer_id",
-                        int(referral["buyer_id"]),
-                    )
-                    if revoked is not None:
-                        await conn.execute(
-                            "UPDATE users SET referral_count = GREATEST(referral_count - 1, 0) "
-                            "WHERE tg_id = $1",
-                            int(revoked),
-                        )
             return {
                 "status": "refunded",
                 "tg_id": tg_id,
@@ -1419,14 +1323,6 @@ async def db_get_product_by_key(key: str) -> tuple | None:
     return (row["key"], row["name"], float(row["price"]), row["delivery"]) if row else None
 
 
-async def db_product_belongs_to_category(product_key: str, category_key: str) -> bool:
-    pool = await get_pool()
-    return bool(await pool.fetchval(
-        "SELECT EXISTS(SELECT 1 FROM products WHERE key = $1 AND category = $2)",
-        product_key, category_key,
-    ))
-
-
 async def db_is_product_active(key: str) -> bool:
     """Проверяет актуальную доступность товара перед показом и оплатой."""
     pool = await get_pool()
@@ -1523,197 +1419,6 @@ async def db_set_setting(key: str, value: str) -> None:
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         key, value,
     )
-
-
-async def db_get_club_thresholds() -> list[Decimal] | None:
-    raw = await db_get_setting(CLUB_SPEND_THRESHOLDS_SETTING_KEY, "")
-    if not raw:
-        return None
-    try:
-        values = json.loads(raw)
-        if not isinstance(values, list) or len(values) != len(CLUB_LEVELS):
-            raise ValueError("Нужно указать пороги для всех уровней.")
-        thresholds = [Decimal(str(value)) for value in values]
-        if any(not value.is_finite() or value <= 0 for value in thresholds):
-            raise ValueError("Пороги должны быть положительными числами.")
-        if any(left >= right for left, right in zip(thresholds, thresholds[1:])):
-            raise ValueError("Пороги должны строго возрастать.")
-        return thresholds
-    except (TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
-        logging.warning("Некорректные пороги CHEEZE CLUB: %s", exc)
-        return None
-
-
-async def db_set_club_thresholds(thresholds: list[Decimal]) -> None:
-    if len(thresholds) != len(CLUB_LEVELS):
-        raise ValueError("Нужно указать пороги для всех пяти уровней.")
-    if any(not value.is_finite() or value <= 0 for value in thresholds):
-        raise ValueError("Пороги должны быть положительными числами.")
-    if any(left >= right for left, right in zip(thresholds, thresholds[1:])):
-        raise ValueError("Пороги должны строго возрастать.")
-    await db_set_setting(
-        CLUB_SPEND_THRESHOLDS_SETTING_KEY,
-        json.dumps([str(value) for value in thresholds]),
-    )
-
-
-async def db_get_club_progress(tg_id: int) -> dict:
-    pool = await get_pool()
-    spend = await pool.fetchval(
-        "SELECT COALESCE(SUM(price), 0) FROM orders "
-        "WHERE tg_id = $1 AND status IN ($2, 'Выполнен')",
-        tg_id, ORDER_STATUS_COMPLETED,
-    )
-    total_spend = Decimal(str(spend or 0))
-    thresholds = await db_get_club_thresholds()
-    level = 0
-    next_threshold = thresholds[0] if thresholds else None
-    if thresholds:
-        for level_number, threshold in enumerate(thresholds, start=1):
-            if total_spend >= threshold:
-                level = level_number
-            else:
-                next_threshold = threshold
-                break
-        else:
-            next_threshold = None
-    return {
-        "level": level,
-        "spend": total_spend,
-        "thresholds": thresholds,
-        "next_threshold": next_threshold,
-        "configured": thresholds is not None,
-    }
-
-
-async def db_set_category_access(
-    key: str, access_mode: str, min_club_level: int = 0
-) -> None:
-    if access_mode not in CATEGORY_ACCESS_MODES:
-        raise ValueError("Неизвестный режим доступа.")
-    if access_mode == "club" and min_club_level not in CLUB_LEVELS:
-        raise ValueError("Выберите уровень клуба от 1 до 5.")
-    if access_mode != "club":
-        min_club_level = 0
-    pool = await get_pool()
-    await pool.execute(
-        "UPDATE categories SET access_mode = $1, min_club_level = $2 "
-        "WHERE key = $3",
-        access_mode, min_club_level, key,
-    )
-
-
-async def db_list_category_testers(category_key: str) -> list[dict]:
-    pool = await get_pool()
-    rows = await pool.fetch(
-        "SELECT tg_id, granted_by, created_at FROM category_access_testers "
-        "WHERE category_key = $1 ORDER BY created_at, tg_id",
-        category_key,
-    )
-    return [dict(row) for row in rows]
-
-
-async def db_get_user_category_test_keys(tg_id: int) -> set[str]:
-    pool = await get_pool()
-    rows = await pool.fetch(
-        "SELECT category_key FROM category_access_testers WHERE tg_id = $1",
-        tg_id,
-    )
-    return {str(row["category_key"]) for row in rows}
-
-
-async def db_add_category_tester(
-    category_key: str, tg_id: int, granted_by: int
-) -> bool:
-    pool = await get_pool()
-    inserted = await pool.fetchval(
-        "INSERT INTO category_access_testers "
-        "(category_key, tg_id, granted_by, created_at) "
-        "VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING "
-        "RETURNING tg_id",
-        category_key, tg_id, granted_by,
-        datetime.now(timezone.utc).isoformat(),
-    )
-    return inserted is not None
-
-
-async def db_remove_category_tester(category_key: str, tg_id: int) -> bool:
-    pool = await get_pool()
-    result = await pool.execute(
-        "DELETE FROM category_access_testers WHERE category_key = $1 AND tg_id = $2",
-        category_key, tg_id,
-    )
-    return result.endswith("1")
-
-
-def _category_access_allowed(
-    category: dict,
-    user_id: int,
-    club_level: int,
-    tester_category_keys: set[str],
-) -> bool:
-    if _is_staff(user_id):
-        return True
-    mode = category.get("access_mode") or "public"
-    if mode == "public":
-        return True
-    if mode == "club":
-        return club_level >= int(category.get("min_club_level") or 0)
-    if mode == "testers":
-        return str(category.get("key", "")) in tester_category_keys
-    return False
-
-
-async def _can_access_category(
-    user_id: int,
-    category_key: str,
-    *,
-    category: dict | None = None,
-    club_level: int | None = None,
-    tester_category_keys: set[str] | None = None,
-) -> bool:
-    if _is_staff(user_id):
-        return True
-    category = category or await db_get_category(category_key)
-    if not category:
-        return False
-    if club_level is None:
-        progress = await db_get_club_progress(user_id)
-        club_level = int(progress["level"])
-    if tester_category_keys is None:
-        tester_category_keys = await db_get_user_category_test_keys(user_id)
-    return _category_access_allowed(
-        category, user_id, club_level, tester_category_keys
-    )
-
-
-async def _category_access_denial(
-    user_id: int,
-    category_key: str,
-    *,
-    category: dict | None = None,
-) -> str | None:
-    if _is_staff(user_id):
-        return None
-    category = category or await db_get_category(category_key)
-    if not category:
-        return "Категория больше недоступна."
-    progress = await db_get_club_progress(user_id)
-    tester_keys = await db_get_user_category_test_keys(user_id)
-    if _category_access_allowed(
-        category, user_id, int(progress["level"]), tester_keys
-    ):
-        return None
-    mode = category.get("access_mode") or "public"
-    if mode == "club":
-        required = int(category.get("min_club_level") or 0)
-        if not progress["configured"]:
-            return "🔒 Ранний доступ пока настраивается. Попробуйте позже."
-        required_name = CLUB_LEVELS.get(required, ("участника клуба", ""))[0]
-        return f"🔒 Категория доступна с уровня клуба «{required_name}»."
-    if mode == "testers":
-        return "🧪 Эта категория доступна только приглашённым тестировщикам."
-    return "Категория сейчас недоступна."
 
 
 async def db_get_starvell_price_preferences() -> tuple[set[str], float]:
@@ -1840,8 +1545,7 @@ async def db_all_categories() -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch(
         "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code, "
-        "amount_based, amount_unit, amount_rate, amount_minimum, "
-        "access_mode, min_club_level "
+        "amount_based, amount_unit, amount_rate, amount_minimum "
         "FROM categories ORDER BY sort_order, key"
     )
     return [dict(r) for r in rows]
@@ -1851,8 +1555,7 @@ async def db_get_category(key: str) -> dict | None:
     pool = await get_pool()
     row = await pool.fetchrow(
         "SELECT key, name, emoji, sort_order, disabled, disabled_reason, login_hint, needs_code, "
-        "amount_based, amount_unit, amount_rate, amount_minimum, "
-        "access_mode, min_club_level "
+        "amount_based, amount_unit, amount_rate, amount_minimum "
         "FROM categories WHERE key = $1", key
     )
     return dict(row) if row else None
@@ -2781,30 +2484,12 @@ async def db_get_user_by_ref_code(ref_code: str) -> dict | None:
     return dict(row) if row else None
 
 
-async def db_set_referred_by(tg_id: int, referrer_id: int) -> bool:
+async def db_set_referred_by(tg_id: int, referrer_id: int) -> None:
     pool = await get_pool()
-    if tg_id == referrer_id:
-        return False
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            user = await conn.fetchrow(
-                "SELECT referred_by FROM users WHERE tg_id = $1 FOR UPDATE",
-                tg_id,
-            )
-            if not user or user["referred_by"] is not None:
-                return False
-            has_orders = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM orders WHERE tg_id = $1)",
-                tg_id,
-            )
-            if has_orders:
-                return False
-            updated = await conn.fetchval(
-                "UPDATE users SET referred_by = $1 "
-                "WHERE tg_id = $2 AND referred_by IS NULL RETURNING tg_id",
-                referrer_id, tg_id,
-            )
-            return updated is not None
+    await pool.execute(
+        "UPDATE users SET referred_by = $1 WHERE tg_id = $2 AND referred_by IS NULL",
+        referrer_id, tg_id,
+    )
 
 
 async def db_set_active_ref_promo(tg_id: int, promo_id: int | None) -> None:
@@ -2815,14 +2500,12 @@ async def db_set_active_ref_promo(tg_id: int, promo_id: int | None) -> None:
     )
 
 
-async def db_process_referral(
-    buyer_id: int, order_id: int
-) -> tuple[int | None, bool, int, bool]:
+async def db_process_referral(buyer_id: int) -> tuple[int | None, bool, int, bool]:
     """
-    Засчитывает первую действующую завершённую покупку приглашённого.
-    referral_level намеренно не меняется: его старый процент зафиксирован.
+    Вызывается когда заказ покупателя выполнен модератором.
+    Если покупатель был приглашён — засчитывает реферал пригласившему.
     Возвращает: (referrer_id | None, level_up: bool, new_level: int, is_first_purchase: bool)
-    Четвёртое значение True только если реферал был засчитан сейчас.
+    is_first_purchase: True если первая покупка приглашённого (нужно выдать ему промокоды)
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -2833,66 +2516,41 @@ async def db_process_referral(
             if not buyer or not buyer["referred_by"]:
                 return None, False, 0, False
 
-            referrer_id = int(buyer["referred_by"])
-            referral = await conn.fetchrow(
-                "SELECT referrer_id, is_qualified FROM referral_purchases "
-                "WHERE buyer_id = $1 FOR UPDATE",
-                buyer_id,
-            )
+            referrer_id = buyer["referred_by"]
 
-            if referral and referral["is_qualified"]:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM referral_purchases WHERE buyer_id = $1", buyer_id
+            )
+            if exists:
                 return None, False, 0, False
 
-            now = datetime.now(timezone.utc).isoformat()
-            if referral:
-                qualified = await conn.fetchval(
-                    "UPDATE referral_purchases "
-                    "SET referrer_id = $2, qualifying_order_id = $3, "
-                    "is_qualified = TRUE, created_at = $4 "
-                    "WHERE buyer_id = $1 AND is_qualified = FALSE "
-                    "RETURNING buyer_id",
-                    buyer_id, referrer_id, order_id, now,
-                )
-                if not qualified:
-                    return None, False, 0, False
-            else:
-                qualified = await conn.fetchval(
-                    "INSERT INTO referral_purchases "
-                    "(buyer_id, referrer_id, qualifying_order_id, is_qualified, created_at) "
-                    "VALUES ($1, $2, $3, TRUE, $4) "
-                    "ON CONFLICT (buyer_id) DO NOTHING RETURNING buyer_id",
-                    buyer_id, referrer_id, order_id, now,
-                )
-                if not qualified:
-                    # A concurrent completion may have created the row.
-                    referral = await conn.fetchrow(
-                        "SELECT is_qualified FROM referral_purchases "
-                        "WHERE buyer_id = $1 FOR UPDATE",
-                        buyer_id,
-                    )
-                    if not referral or referral["is_qualified"]:
-                        return None, False, 0, False
-                    qualified = await conn.fetchval(
-                        "UPDATE referral_purchases "
-                        "SET referrer_id = $2, qualifying_order_id = $3, "
-                        "is_qualified = TRUE, created_at = $4 "
-                        "WHERE buyer_id = $1 AND is_qualified = FALSE "
-                        "RETURNING buyer_id",
-                        buyer_id, referrer_id, order_id, now,
-                    )
-                    if not qualified:
-                        return None, False, 0, False
+            await conn.execute(
+                "INSERT INTO referral_purchases (buyer_id, referrer_id, created_at) "
+                "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                buyer_id, referrer_id,
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
 
-            referrer = await conn.fetchrow(
+            new_row = await conn.fetchrow(
                 "UPDATE users SET referral_count = referral_count + 1 "
-                "WHERE tg_id = $1 RETURNING referral_count, referral_level",
+                "WHERE tg_id = $1 RETURNING referral_level, referral_count",
                 referrer_id,
             )
-            if not referrer:
-                raise ValueError(
-                    f"Реферер {referrer_id} отсутствует при зачёте покупки."
+            if not new_row:
+                return referrer_id, False, 0, True
+
+            new_count = new_row["referral_count"]
+            old_level = new_row["referral_level"]
+            new_level = min(5, new_count // REFERRAL_REFS_PER_LEVEL)
+
+            level_up = new_level > old_level
+            if level_up:
+                await conn.execute(
+                    "UPDATE users SET referral_level = $1 WHERE tg_id = $2",
+                    new_level, referrer_id,
                 )
-            return referrer_id, False, int(referrer["referral_level"] or 0), True
+
+            return referrer_id, level_up, new_level, True
 
 
 async def db_admin_set_ref_level(tg_id: int, new_level: int) -> int:
@@ -3083,7 +2741,6 @@ class ShopStates(StatesGroup):
     waiting_buyer_msg = State()           # покупатель пишет администратору
     waiting_ticket_desc = State()         # покупатель описывает проблему в тикете
     waiting_ticket_chat = State()         # покупатель в активном чате тикета
-    waiting_club_suggestion = State()     # идея товара/функции от CHEEZE CLUB
 
 
 class AdminStates(StatesGroup):
@@ -3116,9 +2773,6 @@ class AdminStates(StatesGroup):
     waiting_cat_disabled_reason = State()  # причина отключения категории
     waiting_cat_login_hint = State()       # текст после оплаты для категории
     waiting_cat_amount_setting = State()   # редактирование параметров зависимой категории
-    waiting_club_thresholds = State()      # пороги пяти уровней клуба
-    waiting_category_tester_id = State()   # ID тестировщика категории
-    confirming_club_thresholds = State()   # подтверждение новых порогов клуба
     waiting_rename_product = State()       # новое название товара
     waiting_rename_cat_name = State()      # новое название категории
     waiting_rename_cat_emoji = State()     # новый эмодзи категории
@@ -3166,18 +2820,9 @@ def kb_main_menu() -> InlineKeyboardMarkup:
     )
 
 
-async def kb_shop_dynamic(user_id: int) -> InlineKeyboardMarkup:
+async def kb_shop_dynamic() -> InlineKeyboardMarkup:
     """Динамическая клавиатура магазина из таблицы categories + хардкод-категории."""
     cats = await db_all_categories()
-    if not _is_staff(user_id):
-        progress = await db_get_club_progress(user_id)
-        tester_keys = await db_get_user_category_test_keys(user_id)
-        cats = [
-            cat for cat in cats
-            if _category_access_allowed(
-                cat, user_id, int(progress["level"]), tester_keys
-            )
-        ]
     rows: list[list[InlineKeyboardButton]] = []
     for cat in cats:
         icon = "⚠️ " if cat["disabled"] else ""
@@ -3185,6 +2830,7 @@ async def kb_shop_dynamic(user_id: int) -> InlineKeyboardMarkup:
             text=f"{icon}{cat['emoji']} {cat['name']}",
             callback_data=f"cat:{cat['key']}",
         )])
+    rows.append([InlineKeyboardButton(text="📱 Другие приложения", callback_data="cat:other")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -3332,7 +2978,6 @@ def kb_profile() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
             [InlineKeyboardButton(text="📦 История заказов", callback_data="orders")],
-            [InlineKeyboardButton(text="🧀 CHEEZE CLUB", callback_data="club_info")],
             [
                 InlineKeyboardButton(
                     text="📜 История транзакций", callback_data="transactions"
@@ -4116,12 +3761,11 @@ async def handle_start(message: Message, state: FSMContext) -> None:
         ref_code = parts[1][4:]
         referrer = await db_get_user_by_ref_code(ref_code)
         if referrer and referrer["tg_id"] != message.from_user.id:
-            # Привязать можно только до первого заказа. DB-функция также
-            # защищает от гонки двух одновременно открытых реферальных ссылок.
-            used_ref_link = await db_set_referred_by(
-                message.from_user.id, int(referrer["tg_id"])
-            )
-            if used_ref_link:
+            used_ref_link = True
+            already_referred = user_row.get("referred_by") is not None
+            await db_set_referred_by(message.from_user.id, referrer["tg_id"])
+            # Выдаём 3 INV-промокода только при первом входе по реф. ссылке
+            if not already_referred:
                 invite_codes = await db_create_invite_promo_codes(message.from_user.id, count=3)
                 if invite_codes:
                     codes_text = "\n".join(f"<code>{c}</code>" for c in invite_codes)
@@ -4761,7 +4405,7 @@ async def cb_shop(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await show_section(
         call, "shop", "<b>Купить донат</b>\n\nВыберите категорию:",
-        await kb_shop_dynamic(call.from_user.id),
+        await kb_shop_dynamic(),
     )
     await call.answer()
 
@@ -4772,12 +4416,6 @@ async def cb_shop(call: CallbackQuery, state: FSMContext) -> None:
 @dp.callback_query(F.data == "cat:roblox_instant")
 async def cb_roblox_instant(call: CallbackQuery) -> None:
     cat = await db_get_category("roblox_instant")
-    denial = await _category_access_denial(
-        call.from_user.id, "roblox_instant", category=cat
-    )
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
     cat_photo = await db_get_image("cat:roblox_instant")
     if cat and cat["disabled"]:
         reason = cat.get("disabled_reason") or "Временно недоступно."
@@ -4801,13 +4439,6 @@ async def cb_roblox_instant(call: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("rbi:"))
 async def cb_roblox_instant_card(call: CallbackQuery) -> None:
     key = call.data.split(":", 1)[1]
-    denial = await _category_access_denial(call.from_user.id, "roblox_instant")
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
-    if not await db_product_belongs_to_category(key, "roblox_instant"):
-        await call.answer("Товар не относится к этой категории.", show_alert=True)
-        return
     product = await db_get_product_by_key(key)
     if not product:
         await call.answer("Товар не найден.", show_alert=True)
@@ -4840,12 +4471,6 @@ async def cb_roblox_instant_card(call: CallbackQuery) -> None:
 @dp.callback_query(F.data == "cat:roblox_gamepass")
 async def cb_roblox_gamepass(call: CallbackQuery, state: FSMContext) -> None:
     cat = await db_get_category("roblox_gamepass")
-    denial = await _category_access_denial(
-        call.from_user.id, "roblox_gamepass", category=cat
-    )
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
     cat_photo = await db_get_image("cat:roblox_gamepass")
     if cat and cat["disabled"]:
         reason = cat.get("disabled_reason") or "Временно недоступно."
@@ -4872,13 +4497,6 @@ async def cb_roblox_gamepass(call: CallbackQuery, state: FSMContext) -> None:
 @dp.message(ShopStates.waiting_robux_amount)
 async def msg_robux_amount(message: Message, state: FSMContext) -> None:
     await _try_delete(message)
-    denial = await _category_access_denial(
-        message.from_user.id, "roblox_gamepass"
-    )
-    if denial:
-        await state.clear()
-        await _state_edit(message, state, denial, kb_back_main("shop"))
-        return
     qty = parse_positive_int(message.text)
     if qty is None:
         await _edit_prompt(
@@ -4930,12 +4548,6 @@ async def msg_robux_amount(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data == "cat:brawl")
 async def cb_brawl(call: CallbackQuery) -> None:
     cat = await db_get_category("brawl")
-    denial = await _category_access_denial(
-        call.from_user.id, "brawl", category=cat
-    )
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
     cat_photo = await db_get_image("cat:brawl")
     if cat and cat["disabled"]:
         reason = cat.get("disabled_reason") or "Временно недоступно."
@@ -4963,10 +4575,6 @@ async def cb_brawl(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "bs:promo")
 async def cb_brawl_promo(call: CallbackQuery) -> None:
-    denial = await _category_access_denial(call.from_user.id, "brawl")
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
     text = (
         "Чтобы узнать об актуальных акциях в категории Brawl Stars, "
         f"напишите в Telegram: {BRAWL_PROMO_USERNAME}"
@@ -4981,13 +4589,6 @@ async def cb_brawl_promo(call: CallbackQuery) -> None:
 async def cb_brawl_card(call: CallbackQuery) -> None:
     key = call.data.split(":", 1)[1]
     if key == "promo":
-        return
-    denial = await _category_access_denial(call.from_user.id, "brawl")
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
-    if not await db_product_belongs_to_category(key, "brawl"):
-        await call.answer("Товар не относится к этой категории.", show_alert=True)
         return
     product = await db_get_product_by_key(key)
     if not product:
@@ -5017,12 +4618,6 @@ async def cb_brawl_card(call: CallbackQuery) -> None:
 @dp.callback_query(F.data == "cat:tgstars")
 async def cb_tgstars(call: CallbackQuery, state: FSMContext) -> None:
     cat = await db_get_category("tgstars")
-    denial = await _category_access_denial(
-        call.from_user.id, "tgstars", category=cat
-    )
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
     cat_photo = await db_get_image("cat:tgstars")
     if cat and cat["disabled"]:
         reason = cat.get("disabled_reason") or "Временно недоступно."
@@ -5050,11 +4645,6 @@ async def cb_tgstars(call: CallbackQuery, state: FSMContext) -> None:
 @dp.message(ShopStates.waiting_stars_amount)
 async def msg_stars_amount(message: Message, state: FSMContext) -> None:
     await _try_delete(message)
-    denial = await _category_access_denial(message.from_user.id, "tgstars")
-    if denial:
-        await state.clear()
-        await _state_edit(message, state, denial, kb_back_main("shop"))
-        return
     qty = parse_positive_int(message.text)
     if qty is None:
         await _edit_prompt(state,
@@ -5088,13 +4678,6 @@ async def msg_stars_amount(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "cat:other")
 async def cb_other(call: CallbackQuery) -> None:
-    cat = await db_get_category("other")
-    denial = await _category_access_denial(
-        call.from_user.id, "other", category=cat
-    )
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
     text = (
         "Для получения информации по донату в других приложениях "
         f"напишите в Telegram: {OTHER_APPS_USERNAME}"
@@ -5121,17 +4704,11 @@ async def cb_cat_generic(call: CallbackQuery, state: FSMContext) -> None:
     key = call.data.split(":", 1)[1]
     if key in _BUILTIN_CAT_KEYS:
         return  # обрабатывается отдельными хендлерами выше
+    await call.answer()
     cat = await db_get_category(key)
     if not cat:
         await call.answer("Категория не найдена.", show_alert=True)
         return
-    denial = await _category_access_denial(
-        call.from_user.id, key, category=cat
-    )
-    if denial:
-        await call.answer(denial, show_alert=True)
-        return
-    await call.answer()
     name = f"{cat['emoji']} {cat['name']}"
     if cat["disabled"]:
         reason = cat.get("disabled_reason") or "Временно недоступно."
@@ -6959,31 +6536,42 @@ async def cb_order_done(call: CallbackQuery) -> None:
     )
 
     # Обработка реферальной программы
-    referrer_id, _level_up, _new_level, is_qualified = await db_process_referral(
-        target_id, order_id
-    )
+    referrer_id, level_up, new_level, _ = await db_process_referral(target_id)
 
-    if referrer_id and is_qualified:
+    if referrer_id:
         ref_row = await db_find_user(referrer_id)
         ref_count = ref_row["referral_count"] if ref_row else 0
-        next_milestone = next(
-            (target for target in REFERRAL_MILESTONES if target > ref_count),
-            None,
-        )
-        progress = (
-            f"\nДо следующего достижения: <b>{next_milestone - ref_count}</b>."
-            if next_milestone else "\nВсе достижения за приглашения открыты."
-        )
-        try:
-            await bot.send_message(
-                referrer_id,
-                "✅ <b>Друг по вашей ссылке завершил первую покупку.</b>\n\n"
-                f"Активных приглашённых: <b>{ref_count}</b>.{progress}\n"
-                "Статус CHEEZE CLUB зависит отдельно от ваших покупок.",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logging.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
+        next_level_refs = (new_level + 1) * REFERRAL_REFS_PER_LEVEL if new_level < 5 else None
+        refs_left = (next_level_refs - ref_count) if next_level_refs else None
+
+        if level_up:
+            level_name = _ref_level_name(new_level)
+            discount = _ref_discount_pct(new_level)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 <b>Поздравляем! Вы достигли нового уровня!</b>\n\n"
+                    f"🏆 Ваш новый статус: <b>{level_name}</b>\n"
+                    f"💰 Скидка на подходящие заказы: <b>{discount}%</b>\n\n"
+                    "Скидка применяется автоматически при покупке.\n"
+                    "<i>Не действует на Telegram Stars, Roblox-геймпасс "
+                    "и категории с вводом количества.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить о повышении уровня {referrer_id}: {e}")
+        else:
+            progress = f"\nДо следующего уровня: ещё <b>{refs_left}</b> реферал(ов)." if refs_left else ""
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"✅ <b>+1 реферал засчитан!</b>\n\n"
+                    f"Ваш приглашённый совершил первую покупку.\n"
+                    f"Всего рефералов: <b>{ref_count}</b>.{progress}",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
 
     try:
         old = call.message.text or call.message.caption or ""
@@ -7914,9 +7502,7 @@ def kb_product_manage(prod_key: str, cat_key: str) -> InlineKeyboardMarkup:
 
 
 # Встроенные категории без списка товаров — только открытие/закрытие и текст после оплаты
-_SPECIAL_CAT_KEYS: frozenset[str] = frozenset(
-    {"roblox_gamepass", "tgstars", "other"}
-)
+_SPECIAL_CAT_KEYS: frozenset[str] = frozenset({"roblox_gamepass", "tgstars"})
 
 
 def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
@@ -7951,12 +7537,6 @@ def kb_cat_config(cat: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"adm:catname:{key}"),
         InlineKeyboardButton(text="🖼 Эмодзи",        callback_data=f"adm:catemoji:{key}"),
     ])
-    rows.append([
-        InlineKeyboardButton(
-            text="🔐 Управлять доступом",
-            callback_data=f"adm:cataccess:view:{key}",
-        )
-    ])
     rows.append([InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"adm:catdel:ask:{key}")])
     back_label = "⬅️ К каталогу" if cat.get("amount_based") else "⬅️ К товарам"
     back_callback = "adm:catalog" if cat.get("amount_based") else f"adm:catalog:cat:{key}"
@@ -7975,12 +7555,6 @@ def kb_cat_config_builtin(cat: dict) -> InlineKeyboardMarkup:
     else:
         rows.append([InlineKeyboardButton(text="🔴 Отключить категорию", callback_data=f"adm:catdis:start:{key}")])
     rows.append([InlineKeyboardButton(text="📝 Изменить текст после оплаты", callback_data=f"adm:catlogin:{key}")])
-    rows.append([
-        InlineKeyboardButton(
-            text="🔐 Управлять доступом",
-            callback_data=f"adm:cataccess:view:{key}",
-        )
-    ])
     rows.append([InlineKeyboardButton(text="⬅️ К каталогу", callback_data="adm:catalog")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -7990,73 +7564,6 @@ def _cat_config_kb(cat: dict) -> InlineKeyboardMarkup:
     if cat["key"] in _SPECIAL_CAT_KEYS:
         return kb_cat_config_builtin(cat)
     return kb_cat_config(cat)
-
-
-def _category_access_summary(category: dict) -> str:
-    mode = category.get("access_mode") or "public"
-    if mode == "club":
-        level = int(category.get("min_club_level") or 0)
-        return f"CHEEZE CLUB: уровень «{CLUB_LEVELS.get(level, ('не задан', ''))[0]}»"
-    if mode == "testers":
-        return "только выбранные тестировщики"
-    return "всем пользователям"
-
-
-def kb_cat_access(
-    category: dict,
-    testers: list[dict],
-    *,
-    thresholds_configured: bool,
-) -> InlineKeyboardMarkup:
-    key = category["key"]
-    rows = [
-        [InlineKeyboardButton(
-            text="🌍 Открыть всем",
-            callback_data=f"adm:cataccess:public:{key}",
-        )],
-        [InlineKeyboardButton(
-            text="🔐 Ограничить уровнем клуба",
-            callback_data=f"adm:cataccess:choose_level:{key}",
-        )],
-        [InlineKeyboardButton(
-            text="🧪 Доступ только тестировщикам",
-            callback_data=f"adm:cataccess:testers:{key}",
-        )],
-    ]
-    if category.get("access_mode") == "club":
-        if thresholds_configured:
-            for level, (name, _perks) in CLUB_LEVELS.items():
-                current = int(category.get("min_club_level") or 0) == level
-                rows.append([InlineKeyboardButton(
-                    text=f"{'✅ ' if current else ''}С уровня {name}",
-                    callback_data=f"adm:cataccess:set_level:{key}:{level}",
-                )])
-        else:
-            rows.append([InlineKeyboardButton(
-                text="⚠️ Сначала задайте пороги клуба",
-                callback_data="adm:club",
-            )])
-    if category.get("access_mode") == "testers":
-        for tester in testers[:15]:
-            tg_id = int(tester["tg_id"])
-            rows.append([InlineKeyboardButton(
-                text=f"❌ Удалить тестировщика {tg_id}",
-                callback_data=f"adm:cataccess:remove:{key}:{tg_id}",
-            )])
-        if len(testers) > 15:
-            rows.append([InlineKeyboardButton(
-                text=f"Показаны первые 15 из {len(testers)}",
-                callback_data=f"adm:cataccess:view:{key}",
-            )])
-        rows.append([InlineKeyboardButton(
-            text="➕ Добавить по Telegram ID",
-            callback_data=f"adm:cataccess:add:{key}",
-        )])
-    rows.append([InlineKeyboardButton(
-        text="⬅️ К настройкам категории",
-        callback_data=f"adm:catcfg:{key}",
-    )])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_settings_list(settings: list[dict]) -> InlineKeyboardMarkup:
@@ -11847,27 +11354,13 @@ async def cb_mod_done(call: CallbackQuery) -> None:
     order["status"] = ORDER_STATUS_COMPLETED
     await _refresh_buyer_order_card(order)
 
-    referrer_id, _level_up, _new_level, is_qualified = await db_process_referral(
-        tg_id, order_id
-    )
-    if is_qualified and referrer_id:
+    referrer_id, level_up, new_level, is_first = await db_process_referral(tg_id)
+    if is_first and referrer_id:
         try:
-            referrer = await db_find_user(referrer_id)
-            referral_count = int((referrer or {}).get("referral_count") or 0)
-            next_milestone = next(
-                (target for target in REFERRAL_MILESTONES if target > referral_count),
-                None,
-            )
-            progress = (
-                f"До следующего достижения: {next_milestone - referral_count}."
-                if next_milestone else "Все достижения за приглашения открыты."
-            )
             await bot.send_message(
                 referrer_id,
-                "✅ Друг по вашей ссылке завершил первую покупку.\n\n"
-                f"Активных приглашённых: {referral_count}.\n"
-                f"{progress}\n"
-                "Уровень CHEEZE CLUB считается отдельно по вашим покупкам.",
+                f"🎉 По вашей реферальной ссылке совершена первая покупка!\n"
+                f"{'📈 Ваш уровень повышен до ' + str(new_level) + '!' if level_up else ''}",
             )
         except Exception:
             pass
